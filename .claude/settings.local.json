@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(superpowers:dispatching-parallel-agents)",
+      "Bash(New-Item -ItemType Directory -Force \"D:\\\\proj\\\\IoT-Helmet\\\\fatigue-helmet\\\\firmware\\\\src\")",
+      "Bash(Out-Null)",
+      "Bash(New-Item -ItemType Directory -Force \"D:\\\\proj\\\\IoT-Helmet\\\\fatigue-helmet\\\\python\")",
+      "Bash(Write-Host \"Directories created.\")",
+      "PowerShell(Get-ChildItem -Recurse \"D:\\\\proj\\\\IoT-Helmet\\\\fatigue-helmet\" | ForEach-Object { \"$\\($_.FullName\\) \\($\\($_.Length\\) bytes\\)\" })"
+    ]
+  }
+}
