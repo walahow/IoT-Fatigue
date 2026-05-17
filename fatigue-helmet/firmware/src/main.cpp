@@ -260,6 +260,22 @@ void loop() {
     int hr_out = (lastSignalQuality == 1 && currentBPM > 0) ? (int)currentBPM : 0;
 
     // ── CSV output — 11 fields ────────────────────────────────────────────
+    // ── Pretty display (# prefix = diabaikan Python logger) ──────────────
+    Serial.println(F("#------------------------------------"));
+    Serial.print(F("# t:")); Serial.print(now); Serial.print(F("ms  |  HR: "));
+    if (hr_out > 0) { Serial.print(hr_out); Serial.print(F(" BPM")); }
+    else              { Serial.print(F("-- BPM")); }
+    Serial.print(F("  PULSE:")); Serial.print(lastPulseRaw);
+    Serial.println(lastSignalQuality ? F("  [OK]") : F("  [NO CONTACT]"));
+    Serial.print(F("# AX:")); Serial.print(ax_g,3);
+    Serial.print(F("  AY:")); Serial.print(ay_g,3);
+    Serial.print(F("  AZ:")); Serial.print(az_g,3);
+    Serial.print(F("  MOV:")); Serial.print(head_movement,3); Serial.println(F("g"));
+    Serial.print(F("# GX:")); Serial.print(gx_dp,1);
+    Serial.print(F("  GY:")); Serial.print(gy_dp,1);
+    Serial.print(F("  GZ:")); Serial.println(gz_dp,1);
+
+    // ── CSV line untuk Python logger ──────────────────────────────────────
     Serial.print(now);              Serial.print(',');
     Serial.print(hr_out);           Serial.print(',');
     Serial.print(lastPulseRaw);     Serial.print(',');
