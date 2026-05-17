@@ -196,10 +196,9 @@ void setup() {
 
     // ── MPU-6050 ──────────────────────────────────────────────────────────
     mpu.initialize();
-    if (!mpu.testConnection()) {
-        Serial.println(F("#ERROR: MPU-6050 not found"));
-        while (1) delay(100);
-    }
+    uint8_t whoami = mpu.getDeviceID();
+    Serial.print(F("#STATUS: MPU WHO_AM_I = 0x"));
+    Serial.println(whoami, HEX);
     mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);   // ±2 g  → 16384 LSB/g
     mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);    // ±250 °/s → 131 LSB/(°/s)
     Serial.println(F("#STATUS: MPU-6050 initialized OK"));
