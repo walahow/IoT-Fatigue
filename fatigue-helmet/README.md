@@ -1,9 +1,9 @@
-# IoT Helmet — Fatigue Detection System (Phase 1)
+# IoT Helmet — Fatigue Detection System
 
-Phase 1 covers the sensor firmware and Python data-pipeline.
-No camera is involved yet — that comes in Phase 2.
+This project covers the full integrated sensor firmware and Python data-pipeline. 
+We are using an **ESP32-S3-CAM** (Freenove WROOM CAM) to simultaneously capture both physiological data (heart rate + head movement) and camera data.
 
-**Goal:** Record labelled physiological data (heart rate + head movement)
+**Goal:** Record synchronized physiological data and facial/eye imagery
 from a motorcycle helmet to train a fatigue-detection model.
 
 ---
@@ -26,7 +26,7 @@ from a motorcycle helmet to train a fatigue-detection model.
 
 | Part | Description | Interface |
 |------|-------------|-----------|
-| ESP32-S3 dev board | Main microcontroller | — |
+| Freenove ESP32-S3 WROOM CAM | Main microcontroller + OV2640 Camera | — |
 | Analog Pulse Sensor | Heart rate (optical, 3-pin) | ADC — GPIO 1 |
 | MPU-6050 GY-521 | 3-axis accelerometer + gyroscope | I2C — 0x68 |
 
@@ -35,28 +35,28 @@ MPU-6050 uses I2C; the Pulse Sensor is a simple 3-pin analog device. Total compo
 ### Wiring Diagram
 
 ```
-                    ┌─────────────────────────────┐
-                    │       ESP32-S3 Dev Board     │
+                    ┌──────────────────────────────┐
+                    │  Freenove ESP32-S3 WROOM CAM │
                     │                              │
-               ┌────┤ 3.3V ──────┬─────────────── │
-               │    │            │                 │
-               │    │ GND ───────┼─────────────── ─│─ GND rail
-               │    │            │                 │
-               │    │ GPIO 8 ────┤ SDA (I2C) ───── │─ MPU-6050 only
-               │    │   (SDA)    │                 │
-               │    │ GPIO 9 ────┤ SCL (I2C) ───── │─ MPU-6050 only
-               │    │   (SCL)    │                 │
-               │    │ GPIO 1 ────┤ Signal (analog) │─ Pulse Sensor S pin
-               │    │   (ADC1)   │                 │
-               │    └─────────────────────────────┘
+               ┌────┤ 3.3V                         │
+               │    │                              │
+               │    │ GND ─────────────────────────┼─ GND rail
+               │    │                              │
+               │    │ GPIO 2 (IO2) ───┤ SDA (I2C) ─│─ MPU-6050 only
+               │    │                 │            │
+               │    │ GPIO 3 (IO3) ───┤ SCL (I2C) ─│─ MPU-6050 only
+               │    │                 │            │
+               │    │ GPIO 1 (IO1) ───┤ Signal     │─ Pulse Sensor S pin
+               │    │                 │            │
+               │    └──────────────────────────────┘
                │
                │    ┌───────────────────┐   ┌───────────────────┐
-               │    │  Analog Pulse     │   │    MPU-6050        │
+               │    │  Analog Pulse     │   │    MPU-6050       │
                │    │  Sensor (3-pin)   │   │  (Accel + Gyro)   │
-               └────┤ + (VCC)          │   │ VCC ──────────────┤
-                    │ - (GND) ─────────┼───┤ GND               │
-                    │ S → GPIO 1       │   │ SDA → GPIO 8      │
-                    └───────────────────┘   │ SCL → GPIO 9      │
+               └────┤ + (VCC)           │   │ VCC ──────────────┤
+                    │ - (GND) ──────────┼───┤ GND               │
+                    │ S → GPIO 1        │   │ SDA → GPIO 2      │
+                    └───────────────────┘   │ SCL → GPIO 3      │
                                             │ AD0 → GND (0x68)  │
                                             └───────────────────┘
 ```
@@ -69,13 +69,13 @@ MPU-6050 uses I2C; the Pulse Sensor is a simple 3-pin analog device. Total compo
 
 ### Pin Summary
 
-| ESP32-S3 GPIO | Connected to |
-|---------------|-------------|
+| Freenove ESP32-S3 GPIO | Connected to |
+|------------------------|--------------|
 | 3.3V | Pulse Sensor + (VCC), MPU-6050 VCC |
 | GND | Pulse Sensor − (GND), MPU-6050 GND |
 | GPIO 1 (ADC1) | Pulse Sensor S (Signal) — analog in |
-| GPIO 8 (SDA) | MPU-6050 SDA |
-| GPIO 9 (SCL) | MPU-6050 SCL |
+| GPIO 2 | MPU-6050 SDA |
+| GPIO 3 | MPU-6050 SCL |
 
 ---
 

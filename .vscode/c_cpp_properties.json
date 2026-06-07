@@ -1,0 +1,12 @@
+{
+    "configurations": [
+        {
+            "name": "PlatformIO",
+            "compilerPath": "C:/Users/latif/.platformio/packages/toolchain-xtensa-esp32s3/bin/xtensa-esp32s3-elf-gcc.exe",
+            "compileCommands": "${workspaceFolder}/fatigue-helmet/firmware/compile_commands.json",
+            "cStandard": "gnu99",
+            "cppStandard": "gnu++11"
+        }
+    ],
+    "version": 4
+}
