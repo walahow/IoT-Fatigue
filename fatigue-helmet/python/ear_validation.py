@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-EAR Validation Script — VALIDATION ONLY
-========================================
-This script validates that the Eye Aspect Ratio (EAR) calculation and
-blink-detection algorithm work correctly on a live webcam feed BEFORE
-applying the same logic to recorded video from the ESP32-S3-CAM in
-Phase 2 dataset processing.
+EAR Validation Script
+======================
+Two modes of operation:
 
-It is NOT a real-time fatigue detector — it is a calibration and
-sanity-check tool. Run it to confirm MediaPipe FaceMesh is working
-correctly on your hardware before committing to a recording session.
+1. LIVE (default, no arguments)
+   Validates EAR calculation on a live webcam feed BEFORE applying the same
+   logic to recorded video from the ESP32-S3-CAM.
+   This is a calibration / sanity-check tool, NOT a real-time fatigue detector.
+   Press 'q' in the video window to quit.
+
+2. OFFLINE (--input <frames_dir>)
+   Processes extracted JPEG frames from unpack_session.py output.
+   Reads frames sorted by filename (= timestamp_ms), runs FaceMesh + EAR/blink
+   on each, and writes camera_features.csv to the parent session directory.
+   This is the post-processing step for Phase 2B dataset collection.
 
 Usage:
-    python ear_validation.py
-    Press 'q' in the video window to quit.
+    python ear_validation.py                              # live webcam
+    python ear_validation.py --input sessions/session_001/frames/
+    python ear_validation.py --input sessions/session_001/frames/ --verbose
 """
 
+import argparse
+import csv
+import os
 import time
 from collections import deque
 
@@ -199,5 +208,148 @@ def main():
     print(f"\nSession ended. Total blinks counted: {blink_count}")
 
 
+# ── Offline mode ──────────────────────────────────────────────────────────────
+
+def process_folder(frame_folder: str, verbose: bool) -> None:
+    """
+    Offline processing of extracted JPEG frames.
+    Reads frames sorted by filename (timestamp_ms), runs the same
+    FaceMesh + EAR + blink detection logic as the live mode.
+    Writes camera_features.csv to the parent session directory.
+    """
+    session_dir = os.path.dirname(os.path.abspath(frame_folder))
+    output_csv  = os.path.join(session_dir, "camera_features.csv")
+
+    # Collect and sort JPEG files by timestamp (integer filename)
+    frame_files = sorted(
+        [f for f in os.listdir(frame_folder) if f.lower().endswith(".jpg")],
+        key=lambda x: int(os.path.splitext(x)[0])  # sort by timestamp_ms
+    )
+
+    if not frame_files:
+        print(f"[ERROR] No .jpg files found in {frame_folder}")
+        return
+
+    print(f"[OFFLINE] Frame folder : {frame_folder}")
+    print(f"[OFFLINE] Frames found : {len(frame_files)}")
+    print(f"[OFFLINE] Output CSV   : {output_csv}")
+
+    mp_mesh   = mp.solutions.face_mesh
+    face_mesh = mp_mesh.FaceMesh(
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+
+    blink_count     = 0
+    blink_frame_ctr = 0
+    no_face_count   = 0
+    processed       = 0
+
+    CSV_COLUMNS = [
+        "timestamp_ms", "ear", "left_ear", "right_ear",
+        "is_blink_frame", "blink_count", "face_detected"
+    ]
+
+    with open(output_csv, "w", newline="") as csvf:
+        writer = csv.DictWriter(csvf, fieldnames=CSV_COLUMNS)
+        writer.writeheader()
+
+        for fname in frame_files:
+            timestamp_ms = int(os.path.splitext(fname)[0])
+            img_path     = os.path.join(frame_folder, fname)
+            img          = cv2.imread(img_path)
+
+            if img is None:
+                print(f"[WARN] Cannot read {fname} — skipping.")
+                no_face_count += 1
+                continue
+
+            h, w = img.shape[:2]
+            rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb)
+
+            row = {
+                "timestamp_ms"   : timestamp_ms,
+                "ear"            : "",
+                "left_ear"       : "",
+                "right_ear"      : "",
+                "is_blink_frame" : 0,
+                "blink_count"    : blink_count,
+                "face_detected"  : 0,
+            }
+
+            if results.multi_face_landmarks:
+                lm        = results.multi_face_landmarks[0].landmark
+                left_ear  = compute_ear(lm, LEFT_EYE_IDX,  w, h)
+                right_ear = compute_ear(lm, RIGHT_EYE_IDX, w, h)
+                ear       = (left_ear + right_ear) / 2.0
+
+                is_blink_frame = int(ear < EAR_BLINK_THRESH)
+
+                # Blink counting: require BLINK_CONSEC_MIN consecutive blink frames
+                if ear < EAR_BLINK_THRESH:
+                    blink_frame_ctr += 1
+                else:
+                    if blink_frame_ctr >= BLINK_CONSEC_MIN:
+                        blink_count += 1
+                    blink_frame_ctr = 0
+
+                row.update({
+                    "ear"           : round(ear, 4),
+                    "left_ear"      : round(left_ear, 4),
+                    "right_ear"     : round(right_ear, 4),
+                    "is_blink_frame": is_blink_frame,
+                    "blink_count"   : blink_count,
+                    "face_detected" : 1,
+                })
+
+                if verbose:
+                    status = "BLINK" if is_blink_frame else "OPEN"
+                    print(f"[{timestamp_ms:>10}ms]  EAR={ear:.3f}  {status}  "
+                          f"blinks={blink_count}")
+            else:
+                no_face_count += 1
+                if verbose:
+                    print(f"[{timestamp_ms:>10}ms]  NO FACE")
+
+            writer.writerow(row)
+            processed += 1
+
+    face_mesh.close()
+
+    face_rate = (processed - no_face_count) / processed * 100 if processed else 0
+    print(f"\n[OFFLINE] Processed   : {processed} frames")
+    print(f"[OFFLINE] Face detected: {processed - no_face_count}  "
+          f"({face_rate:.1f}%)")
+    print(f"[OFFLINE] No face      : {no_face_count}")
+    print(f"[OFFLINE] Total blinks : {blink_count}")
+    print(f"[OFFLINE] Output       : {output_csv}")
+    print(f"\n[NEXT]  Run merge_session.py to combine with sensor_data.csv")
+
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
-    main()
+    import sys
+    parser = argparse.ArgumentParser(
+        description="EAR validation — live webcam or offline JPEG folder"
+    )
+    parser.add_argument(
+        "--input", default=None, metavar="FRAMES_DIR",
+        help="Path to extracted frames folder for offline processing. "
+             "If omitted, live webcam mode is used."
+    )
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Print one line per frame in offline mode."
+    )
+    args = parser.parse_args()
+
+    if args.input:
+        if not os.path.isdir(args.input):
+            sys.exit(f"[ERROR] --input directory not found: {args.input}")
+        process_folder(args.input, args.verbose)
+    else:
+        main()
