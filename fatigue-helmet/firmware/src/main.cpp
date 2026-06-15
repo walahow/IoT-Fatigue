@@ -35,6 +35,7 @@
 
 #include "MPU6050.h" // electroniccats/MPU6050
 #include "esp_camera.h"
+#include "esp_task_wdt.h"  // TWDT reset to prevent Core 1 reboot
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -690,12 +691,16 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ── Pulse sensor: 500 Hz ─────────────────────────────────────────────
+  // ── Pulse sensor: 500 Hz — must ALWAYS run, never skip ───────────────
+  // Keep this first and outside any mutex so it is never starved.
   static unsigned long lastSampleTime = 0;
   if (now - lastSampleTime >= SAMPLE_RATE_MS) {
     lastSampleTime = now;
     readPulseSensor();
   }
+
+  // ── Feed task watchdog so Core 1 is never considered hung ────────────
+  esp_task_wdt_reset();
 
   // ── CSV output: 1 Hz ─────────────────────────────────────────────────
   static unsigned long lastOutputTime = 0;
@@ -703,10 +708,10 @@ void loop() {
     return;
   lastOutputTime = now;
 
-  // Warn on prolonged no-contact
+  // Warn on prolonged no-contact (non-blocking: skip if mutex busy)
   if (lastSignalQuality == 0) {
     if (++noContactStreak >= NO_CONTACT_WARN_N) {
-      if (xSemaphoreTake(g_serialMutex, portMAX_DELAY) == pdTRUE) {
+      if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         Serial.println(F("#WARNING: Pulse signal low — check sensor contact"));
         xSemaphoreGive(g_serialMutex);
       }
@@ -731,7 +736,8 @@ void loop() {
   int hr_out = (lastSignalQuality == 1 && currentBPM > 0) ? (int)currentBPM : 0;
 
   // ── Serial output (human-readable, both modes) ────────────────────────
-  if (xSemaphoreTake(g_serialMutex, portMAX_DELAY) == pdTRUE) {
+  // Non-blocking: skip this tick if camera task holds the serial mutex.
+  if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
     Serial.println(F("#------------------------------------"));
     Serial.print(F("# t:"));
     Serial.print(now);
@@ -790,9 +796,11 @@ void loop() {
   }
 
   // ── SD mode: write CSV row to SD card ────────────────────────────────
+  // Non-blocking: 20 ms timeout. If camera task is mid-write, skip this
+  // tick — we will write the next row in 1 second. Never block forever.
 #if defined(STORAGE_MODE_SD)
   if (g_sdReady && g_csvFile) {
-    if (xSemaphoreTake(g_sdMutex, portMAX_DELAY) == pdTRUE) {
+    if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       g_csvFile.printf("%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n", now,
                        hr_out, lastPulseRaw, ax_g, ay_g, az_g, gx_dp, gy_dp,
                        gz_dp, head_movement, lastSignalQuality);

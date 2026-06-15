@@ -3,7 +3,7 @@
 merge_session.py — Merge camera EAR features with sensor CSV by nearest timestamp.
 ====================================================================================
 Combines:
-  - sensor_data.csv    (10 Hz, from ESP32 SD card)
+  - sensor_data.csv    (1 Hz, from ESP32 SD card — LOOP_MS=1000 in firmware)
   - camera_features.csv (30 FPS, from ear_validation.py --input)
 
 into a single dataset_merged.csv aligned by nearest timestamp_ms.
@@ -17,8 +17,8 @@ Usage:
     python merge_session.py --session sessions/session_001 --tolerance 150
 
 Sync accuracy note:
-    Sensor logs at 10 Hz (100ms intervals).
-    Camera captures at 30 FPS (33ms intervals).
+    Sensor logs at 1 Hz (1000ms intervals).
+    Camera captures at ~17-20 FPS.
     Default tolerance=100ms: each sensor row is matched to the closest camera
     frame within ±50ms — well within any meaningful fatigue detection window.
 """
@@ -92,7 +92,7 @@ def merge(session_path: str, tolerance_ms: int) -> None:
     camera_df = camera_df.sort_values("timestamp_ms").reset_index(drop=True)
 
     print(f"[MERGE] Sensor rows  : {len(sensor_df)}  "
-          f"(~{len(sensor_df) / 10 / 60:.1f} min at 10 Hz)")
+          f"(~{len(sensor_df) / 1 / 60:.1f} min at 1 Hz)")
     print(f"[MERGE] Camera frames: {len(camera_df)}  "
           f"(~{len(camera_df) / 30 / 60:.1f} min at 30 FPS)")
     print(f"[MERGE] Tolerance    : +/-{tolerance_ms // 2} ms  "
