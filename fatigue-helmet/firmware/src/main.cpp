@@ -42,6 +42,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
+#include "FuzzyFatigue.h"  // Mamdani FIS (heap-free, STL-free, header-only)
 
 // ── Camera resolution / FPS defaults ─────────────────────────────────────
 // Override via build_flags in platformio.ini, e.g.:
@@ -96,8 +97,27 @@
 #define SIGNAL_HIGH_THRESH 3900 // ADC > this → sensor saturated
 #define MIN_BEAT_INTERVAL 500   // ms → 120 BPM max (prevents double-triggers)
 #define MAX_BEAT_INTERVAL 2000  // ms → 30 BPM min
+
+// ── Alert output ──────────────────────────────────────────────────────────────
+// GPIO 14 confirmed free: no conflict with camera (4-18), I2C (2,3), SD (38-40),
+// or pulse sensor (1). See fuzzy_walkthrough.md §7 for full GPIO audit.
+#define BUZZER_PIN 14
 #define MIN_AMPLITUDE 20        // min peak-to-valley swing
 #define BEAT_TIMEOUT_MS 5000    // ms with no beat → reset BPM
+
+
+
+// ── Session Control ──────────────────────────────────────────────────────────
+#define BUTTON_PIN 21
+#if defined(STORAGE_MODE_USB)
+bool g_sessionActive = true;  // Start streaming immediately in USB debug mode
+#else
+bool g_sessionActive = false; // Start paused in SD card mode
+#endif
+bool g_lastButtonState = HIGH;
+unsigned long g_lastDebounceTime = 0;
+int g_sessionBeepState = 0;
+unsigned long g_sessionBeepTimer = 0;
 
 // ── I2C & output timing constants ────────────────────────────────────────
 const uint8_t PIN_SDA = 2;
@@ -139,6 +159,7 @@ const int NO_CONTACT_WARN_N = 10;
 
 // ── MPU-6050 ─────────────────────────────────────────────────────────────
 MPU6050 mpu(MPU_ADDR);
+bool g_mpuEnabled = false;
 int16_t ax_off = 0, ay_off = 0, az_off = 0;
 int16_t gx_off = 0, gy_off = 0, gz_off = 0;
 
@@ -161,6 +182,167 @@ bool g_sdReady = false;
 static const uint8_t FRAME_SOF[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 static const uint8_t FRAME_EOF[4] = {0xDD, 0xCC, 0xBB, 0xAA};
 #endif
+
+// ─────────────────────────────────────────────────────────────────────────
+// Nodding Oscillation Detector
+// 6-second rolling pitch buffer at 10 Hz → 60 samples.
+// Algorithm: detrend → ZCR → slope gate → clamp(ZCR/4, 0, 1).
+// Engineering assumption: nodding frequency 0.5–2 Hz.
+// See fuzzy_walkthrough.md §2.3 for full rationale.
+// ─────────────────────────────────────────────────────────────────────────
+struct NodDetector {
+    static const uint8_t N = 60;   // 6 s × 10 Hz
+    float   buf[N];
+    uint8_t head;
+    uint8_t count;   // saturates at N
+
+    NodDetector() : head(0), count(0) { memset(buf, 0, sizeof(buf)); }
+
+    void push(float pitch_deg) {
+        buf[head] = pitch_deg;
+        head      = (head + 1) % N;
+        if (count < N) count++;
+    }
+
+    // Returns nodding_score [0..1].
+    // Chronological index: count<N → oldest at buf[0]; count==N → oldest at buf[head].
+    float score() const {
+        if (count < 6) return 0.0f;
+
+        // Mean for detrending
+        float mean = 0.0f;
+        for (uint8_t i = 0; i < count; i++) {
+            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
+            mean += buf[idx];
+        }
+        mean /= (float)count;
+
+        // Zero crossings of detrended signal
+        int zcr = 0;
+        uint8_t idx0 = (count < N) ? 0 : head;
+        float prev = buf[idx0] - mean;
+        for (uint8_t i = 1; i < count; i++) {
+            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
+            float v = buf[idx] - mean;
+            if ((prev < 0.0f) != (v < 0.0f)) zcr++;
+            prev = v;
+        }
+        float zcr_per_s = (float)zcr / ((float)count / 10.0f);
+
+        // Linear regression slope of raw pitch buffer.
+        // slope > 0: pitch trending upward = head drooping forward.
+        // (fuzzy_walkthrough.md spec uses slope < 0 with opposite sign convention;
+        //  here pitch_deg = acos(...) >= 0, so drooping = increasing. Flip to
+        //  slope < 0.0f if hardware tests show inverted behaviour.)
+        float fn  = (float)count;
+        float sx  = fn * (fn - 1.0f) / 2.0f;
+        float sx2 = fn * (fn - 1.0f) * (2.0f * fn - 1.0f) / 6.0f;
+        float sy  = 0.0f, sxy = 0.0f;
+        for (uint8_t i = 0; i < count; i++) {
+            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
+            sy  += buf[idx];
+            sxy += (float)i * buf[idx];
+        }
+        float denom = fn * sx2 - sx * sx;
+        float slope = (fabsf(denom) > 1e-9f) ? (fn * sxy - sx * sy) / denom : 0.0f;
+        float gate  = (slope > 0.0f) ? 1.0f : 0.0f;
+
+        float s = zcr_per_s / 4.0f;
+        if (s < 0.0f) s = 0.0f;
+        if (s > 1.0f) s = 1.0f;
+        return s * gate;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// Gyro Variance Rolling Buffer
+// 10-second rolling buffer of head_movement magnitude at 10 Hz → 100 samples.
+// variance() feeds gyro_Stable / gyro_Fidgety input MFs of the FIS.
+// ─────────────────────────────────────────────────────────────────────────
+struct GyroVarBuf {
+    static const uint8_t N = 100;   // 10 s × 10 Hz
+    float   buf[N];
+    uint8_t head;
+    uint8_t count;
+
+    GyroVarBuf() : head(0), count(0) { memset(buf, 0, sizeof(buf)); }
+
+    void push(float v) {
+        buf[head] = v;
+        head      = (head + 1) % N;
+        if (count < N) count++;
+    }
+
+    float variance() const {
+        if (count < 2) return 0.0f;
+        float mean = 0.0f;
+        for (uint8_t i = 0; i < count; i++) {
+            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
+            mean += buf[idx];
+        }
+        mean /= (float)count;
+        float var = 0.0f;
+        for (uint8_t i = 0; i < count; i++) {
+            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
+            float d = buf[idx] - mean;
+            var += d * d;
+        }
+        return var / (float)count;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────
+// FIS globals
+// ─────────────────────────────────────────────────────────────────────────
+
+FuzzyFatigue g_fis;
+float g_riskScore  = 0.0f;
+int   g_alertLevel = ALERT_SAFE;
+
+// ── Baseline HR (count-based, frozen after N_BASELINE_SAMPLES valid readings) ─
+// "valid" = signal_quality==1 AND currentBPM>0 (implicitly 30–120 BPM by
+// beat detection: MIN_BEAT_INTERVAL=500 ms, MAX_BEAT_INTERVAL=2000 ms).
+// Frozen — not rolling — so progressive drowsiness is NOT normalised out.
+static const uint8_t N_BASELINE_SAMPLES = 20;   // ~20 s at 1 Hz with good contact
+float    g_baselineSum    = 0.0f;
+uint8_t  g_baselineCount  = 0;
+float    g_baselineBPM    = 0.0f;
+bool     g_baselineFormed = false;
+
+// ── BLINK serial receive state ─────────────────────────────────────────────
+// Parser drains UART ring buffer at each 1 Hz tick. Format: "BLINK:<float>\n"
+// Default 13.0 bl/min = centre of Normal MF flat-top (8–18) → no false Warning.
+// Sticky fallback: hold last valid after BLINK_TIMEOUT_MS of silence.
+static const uint32_t BLINK_TIMEOUT_MS = 5000;
+float    g_blinkRate        = 13.0f;
+float    g_lastValidBlink   = 13.0f;
+uint32_t g_lastBlinkRxTime  = 0;
+bool     g_blinkEverRx      = false;
+char     g_serialLineBuf[32];
+uint8_t  g_serialLineBufLen = 0;
+
+// ── Calibration gravity vector (raw ADC units, captured after calibrateMPU) ─
+// dot-product pitch formula:
+//   pitch = acos(dot(g_calibGrav, g_now) / (|g_calibGrav| × |g_now|)) × (180/π)
+// Default assumes vertical Z axis; overwritten by calibrateMPU().
+float g_calibGrav[3] = {0.0f, 0.0f, 16384.0f};
+
+// ── Cached 10 Hz IMU snapshot (written by 10 Hz block, read at 1 Hz FIS tick) ─
+float g_imu_ax_g      = 0.0f;
+float g_imu_ay_g      = 0.0f;
+float g_imu_az_g      = 0.0f;
+float g_imu_gx_dp     = 0.0f;
+float g_imu_gy_dp     = 0.0f;
+float g_imu_gz_dp     = 0.0f;
+float g_imu_head_mov  = 0.0f;
+float g_imu_pitch_deg = 0.0f;
+float g_imu_gyro_var  = 0.0f;
+float g_imu_nod_score = 0.0f;
+
+// ── 10 Hz ring buffer instances ───────────────────────────────────────────────
+NodDetector g_nodDet;    //  60 samples × 4 B =  240 B BSS
+GyroVarBuf  g_gyroVar;   // 100 samples × 4 B =  400 B BSS
+                          // Total: ~640 B — negligible on ESP32-S3 (512 KB SRAM)
 
 // ─────────────────────────────────────────────────────────────────────────
 // CRC-32 (standard Ethernet polynomial 0xEDB88320)
@@ -318,7 +500,7 @@ void closeSession() {
 // Called from cameraTask on Core 0. Never opens or closes a file per frame.
 // ─────────────────────────────────────────────────────────────────────────
 void saveJpegToSD(const uint8_t *data, size_t len, uint32_t timestamp_ms) {
-  if (!g_sdReady || !g_mjpegFile || !g_idxFile)
+  if (!g_sdReady || !g_mjpegFile || !g_idxFile || !g_sessionActive)
     return;
   static int flushCounter = 0;
 
@@ -367,13 +549,24 @@ void saveJpegToSD(const uint8_t *data, size_t len, uint32_t timestamp_ms) {
 
 #if defined(STORAGE_MODE_USB)
 void sendJpegFrame(const uint8_t *data, size_t len, uint32_t timestamp_ms) {
+  if (!g_sessionActive) return;
   uint32_t length32 = (uint32_t)len;
   // Timeout 20ms: if sensor output holds the mutex, skip this frame
   if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
     Serial.write(FRAME_SOF, 4);
     Serial.write((const uint8_t *)&timestamp_ms, 4);
     Serial.write((const uint8_t *)&length32, 4);
-    Serial.write(data, len);
+    
+    // Send in 1024-byte chunks and yield to let the USB CDC task run on Core 0
+    size_t offset = 0;
+    const size_t chunkSize = 1024;
+    while (offset < len) {
+      size_t toWrite = (len - offset < chunkSize) ? (len - offset) : chunkSize;
+      Serial.write(data + offset, toWrite);
+      offset += toWrite;
+      vTaskDelay(1); // Yields CPU for 1ms
+    }
+    
     Serial.write(FRAME_EOF, 4);
     xSemaphoreGive(g_serialMutex);
   }
@@ -556,6 +749,15 @@ void calibrateMPU() {
   Serial.print(gy_off);
   Serial.print(F(" gz="));
   Serial.println(gz_off);
+
+  // Capture calibration gravity vector (raw ADC units) for pitch computation.
+  // ax_off/ay_off/az_off are the mean raw readings at calibration pose, which
+  // include the gravity component — exactly the reference vector we need.
+  g_calibGrav[0] = (float)ax_off;
+  g_calibGrav[1] = (float)ay_off;
+  g_calibGrav[2] = (float)az_off;
+  Serial.printf("#STATUS: Calib gravity vector: [%.0f, %.0f, %.0f] raw ADC\n",
+                g_calibGrav[0], g_calibGrav[1], g_calibGrav[2]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -633,16 +835,32 @@ void setup() {
   analogReadResolution(12);
   Serial.println(F("#STATUS: Pulse sensor GPIO 1 (ADC1) — analog mode"));
 
+  // Session Button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  Serial.println(F("#STATUS: Button GPIO 21 initialized (INPUT_PULLUP)"));
+
+  // Buzzer: GPIO 14 (confirmed free — see fuzzy_walkthrough.md §7 GPIO audit)
+  // NOTE: do NOT use LED_BUILTIN (GPIO 2) after Wire.begin() — conflicts with I2C SDA.
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+  Serial.println(F("#STATUS: Buzzer GPIO 14 initialized"));
+
   Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setTimeOut(10); // 10ms timeout to prevent hanging on I2C errors
   mpu.initialize();
   uint8_t whoami = mpu.getDeviceID();
   Serial.print(F("#STATUS: MPU WHO_AM_I = 0x"));
   Serial.println(whoami, HEX);
-  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-  Serial.println(F("#STATUS: MPU-6050 initialized OK"));
-
-  calibrateMPU();
+  if (whoami == 0x68 || whoami == 0x69 || whoami == 0x38) {
+    g_mpuEnabled = true;
+    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+    Serial.println(F("#STATUS: MPU-6050 initialized OK"));
+    calibrateMPU();
+  } else {
+    g_mpuEnabled = false;
+    Serial.println(F("#WARN: MPU-6050 not detected — running with IMU disabled"));
+  }
 
   // ── SD card initialization (production mode) ─────────────────────────
 #if defined(STORAGE_MODE_SD)
@@ -661,7 +879,8 @@ void setup() {
 
   Serial.println(
       F("#HEADER:timestamp_ms,hr_bpm,pulse_raw,"
-        "ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,head_movement,signal_quality"));
+        "ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,head_movement,signal_quality,"
+        "blink_rate,pitch_deg,gyro_var,nod_score,risk_pct,alert_level"));
   Serial.println(F("#STATUS: Logging started"));
 
 #if defined(STORAGE_MODE_USB)
@@ -685,11 +904,58 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────
 // Main loop — Core 1
 //   500 Hz → readPulseSensor()
-//     1 Hz → CSV output to SD (and/or Serial)
+//   10 Hz → IMU sampling / processing
+//     1 Hz → CSV output to SD (and/or Serial) + FIS inference
 // ─────────────────────────────────────────────────────────────────────────
 
 void loop() {
   unsigned long now = millis();
+
+  // ── Session Button Logic (Non-blocking) ──────────────────────────────
+  int reading = digitalRead(BUTTON_PIN);
+  if (reading != g_lastButtonState) {
+    g_lastDebounceTime = now;
+  }
+  if ((now - g_lastDebounceTime) > 50) {
+    static int buttonState = HIGH;
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) { // pressed
+        g_sessionActive = !g_sessionActive;
+        if (g_sessionActive) {
+          Serial.println(F("\n#STATUS: Session STARTED (Recording active)"));
+          g_sessionBeepState = 1; // 1 long beep
+          g_sessionBeepTimer = now;
+          digitalWrite(BUZZER_PIN, HIGH);
+        } else {
+          Serial.println(F("\n#STATUS: Session PAUSED (Recording stopped)"));
+          g_sessionBeepState = 3; // 2 short beeps
+          g_sessionBeepTimer = now;
+          digitalWrite(BUZZER_PIN, HIGH);
+        }
+      }
+    }
+  }
+  g_lastButtonState = reading;
+
+  // Handle session start/stop beeps without delay()
+  if (g_sessionBeepState > 0) {
+    if (g_sessionBeepState == 1 && (now - g_sessionBeepTimer >= 300)) {
+      digitalWrite(BUZZER_PIN, LOW);
+      g_sessionBeepState = 0;
+    } else if (g_sessionBeepState == 3 && (now - g_sessionBeepTimer >= 100)) {
+      digitalWrite(BUZZER_PIN, LOW);
+      g_sessionBeepState = 4;
+      g_sessionBeepTimer = now;
+    } else if (g_sessionBeepState == 4 && (now - g_sessionBeepTimer >= 100)) {
+      digitalWrite(BUZZER_PIN, HIGH);
+      g_sessionBeepState = 5;
+      g_sessionBeepTimer = now;
+    } else if (g_sessionBeepState == 5 && (now - g_sessionBeepTimer >= 100)) {
+      digitalWrite(BUZZER_PIN, LOW);
+      g_sessionBeepState = 0;
+    }
+  }
 
   // ── Pulse sensor: 500 Hz — must ALWAYS run, never skip ───────────────
   // Keep this first and outside any mutex so it is never starved.
@@ -702,13 +968,111 @@ void loop() {
   // ── Feed task watchdog so Core 1 is never considered hung ────────────
   esp_task_wdt_reset();
 
-  // ── CSV output: 1 Hz ─────────────────────────────────────────────────
+  // ── 10 Hz IMU ring buffer fill ────────────────────────────────────────────────────
+  // Pitch, gyro variance, and nodding detector require 10 Hz IMU data.
+  // Results cached in g_imu_* are consumed at the 1 Hz FIS tick + CSV output.
+  // No mutex needed: both this block and the 1 Hz block run on Core 1 (loop).
+  static unsigned long lastImuTime = 0;
+  if (now - lastImuTime >= 100) {   // 100 ms = 10 Hz
+    lastImuTime = now;
+
+    // Initialize to calibration offsets. If the I2C bus crashes due to buzzer EMI,
+    // getMotion6 will fail and leave these untouched. By defaulting to calibration values,
+    // the system sees "0 movement, 0 pitch" instead of getting stuck on old data,
+    // immediately breaking the buzzer "Death Loop".
+    int16_t ax_r10 = (int16_t)ax_off, ay_r10 = (int16_t)ay_off, az_r10 = (int16_t)az_off;
+    int16_t gx_r10 = (int16_t)gx_off, gy_r10 = (int16_t)gy_off, gz_r10 = (int16_t)gz_off;
+    if (g_mpuEnabled) {
+      static int i2cErrorCount = 0;
+      Wire.beginTransmission(MPU_ADDR);
+      if (Wire.endTransmission() != 0) {
+        i2cErrorCount++;
+        if (i2cErrorCount >= 3) {
+          g_mpuEnabled = false;
+          Serial.println(F("#WARN: MPU-6050 connection lost — disabling IMU features"));
+        }
+      } else {
+        i2cErrorCount = 0;
+        mpu.getMotion6(&ax_r10, &ay_r10, &az_r10, &gx_r10, &gy_r10, &gz_r10);
+      }
+    }
+
+    float ax_g10  = (ax_r10 - ax_off) / ACCEL_SCALE;
+    float ay_g10  = (ay_r10 - ay_off) / ACCEL_SCALE;
+    float az_g10  = (az_r10 - az_off) / ACCEL_SCALE;
+    float gx_dp10 = (gx_r10 - gx_off) / GYRO_SCALE;
+    float gy_dp10 = (gy_r10 - gy_off) / GYRO_SCALE;
+    float gz_dp10 = (gz_r10 - gz_off) / GYRO_SCALE;
+    float head_mov10 = sqrtf(gx_dp10*gx_dp10 + gy_dp10*gy_dp10 + gz_dp10*gz_dp10);
+
+    // Pitch: dot-product angle between current accel and calibration gravity.
+    // Uses raw (un-offsetted) readings so the calibration reference frame is intact.
+    float gx_raw = (float)ax_r10;
+    float gy_raw = (float)ay_r10;
+    float gz_raw = (float)az_r10;
+    float dot    = g_calibGrav[0]*gx_raw + g_calibGrav[1]*gy_raw + g_calibGrav[2]*gz_raw;
+    float mag_c  = sqrtf(g_calibGrav[0]*g_calibGrav[0] +
+                         g_calibGrav[1]*g_calibGrav[1] +
+                         g_calibGrav[2]*g_calibGrav[2]);
+    float mag_n  = sqrtf(gx_raw*gx_raw + gy_raw*gy_raw + gz_raw*gz_raw);
+    float cos_a  = (mag_c > 1e-3f && mag_n > 1e-3f) ? dot / (mag_c * mag_n) : 1.0f;
+    if (cos_a >  1.0f) cos_a =  1.0f;
+    if (cos_a < -1.0f) cos_a = -1.0f;
+    float pitch10 = acosf(cos_a) * (180.0f / (float)M_PI);
+
+    // Push into ring buffers
+    g_nodDet.push(pitch10);
+    g_gyroVar.push(head_mov10);
+
+    // Cache latest snapshot for 1 Hz FIS tick and CSV
+    g_imu_ax_g      = ax_g10;
+    g_imu_ay_g      = ay_g10;
+    g_imu_az_g      = az_g10;
+    g_imu_gx_dp     = gx_dp10;
+    g_imu_gy_dp     = gy_dp10;
+    g_imu_gz_dp     = gz_dp10;
+    g_imu_head_mov  = head_mov10;
+    g_imu_pitch_deg = pitch10;
+    g_imu_gyro_var  = g_gyroVar.variance();
+    g_imu_nod_score = g_nodDet.score();
+  }
+
+  // ── CSV output: 1 Hz ───────────────────────────────────────────────────────────
   static unsigned long lastOutputTime = 0;
   if (now - lastOutputTime < LOOP_MS)
     return;
   lastOutputTime = now;
 
-  // Warn on prolonged no-contact (non-blocking: skip if mutex busy)
+  // ── Serial BLINK parser (drains UART buffer each 1 Hz tick) ──────────────────
+  // Format: "BLINK:<float>\n"  Rate: 1 Hz from Python pipeline.
+  // Valid range: 0–60 bl/min. Invalid / out-of-range lines silently discarded.
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') {
+      g_serialLineBuf[g_serialLineBufLen] = '\0';
+      float blink_val = 0.0f;
+      if (sscanf(g_serialLineBuf, "BLINK:%f", &blink_val) == 1
+          && blink_val >= 0.0f && blink_val <= 60.0f) {
+        g_blinkRate       = blink_val;
+        g_lastValidBlink  = blink_val;
+        g_lastBlinkRxTime = now;
+        g_blinkEverRx     = true;
+      }
+      g_serialLineBufLen = 0;
+    } else if (g_serialLineBufLen < (uint8_t)(sizeof(g_serialLineBuf) - 1)) {
+      g_serialLineBuf[g_serialLineBufLen++] = c;
+    } else {
+      g_serialLineBufLen = 0;   // line too long — discard
+    }
+  }
+  // Fallback: sticky last-valid after timeout; 13.0 if pipeline never connected
+  if (g_blinkEverRx && (now - g_lastBlinkRxTime > BLINK_TIMEOUT_MS)) {
+    g_blinkRate = g_lastValidBlink;
+  } else if (!g_blinkEverRx) {
+    g_blinkRate = 13.0f;
+  }
+
+  // ── Warn on prolonged no-contact (non-blocking: skip if mutex busy) ────────
   if (lastSignalQuality == 0) {
     if (++noContactStreak >= NO_CONTACT_WARN_N) {
       if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
@@ -721,23 +1085,85 @@ void loop() {
     noContactStreak = 0;
   }
 
-  // ── MPU-6050 ──────────────────────────────────────────────────────────
-  int16_t ax_r, ay_r, az_r, gx_r, gy_r, gz_r;
-  mpu.getMotion6(&ax_r, &ay_r, &az_r, &gx_r, &gy_r, &gz_r);
-
-  float ax_g = (ax_r - ax_off) / ACCEL_SCALE;
-  float ay_g = (ay_r - ay_off) / ACCEL_SCALE;
-  float az_g = (az_r - az_off) / ACCEL_SCALE;
-  float gx_dp = (gx_r - gx_off) / GYRO_SCALE;
-  float gy_dp = (gy_r - gy_off) / GYRO_SCALE;
-  float gz_dp = (gz_r - gz_off) / GYRO_SCALE;
-  float head_movement = sqrt(gx_dp * gx_dp + gy_dp * gy_dp + gz_dp * gz_dp);
-
+  // ── Baseline HR accumulation ───────────────────────────────────────────────────
+  // Count-based (not time-based): only valid readings count.
+  // Frozen after formed — not rolling — so progressive drowsiness is not
+  // normalised out. Resets only on power cycle (new session).
   int hr_out = (lastSignalQuality == 1 && currentBPM > 0) ? (int)currentBPM : 0;
 
-  // ── Serial output (human-readable, both modes) ────────────────────────
-  // Non-blocking: skip this tick if camera task holds the serial mutex.
+  if (!g_baselineFormed && lastSignalQuality == 1 && currentBPM > 0) {
+    g_baselineSum += currentBPM;
+    g_baselineCount++;
+    if (g_baselineCount >= N_BASELINE_SAMPLES) {
+      g_baselineBPM    = g_baselineSum / (float)g_baselineCount;
+      g_baselineFormed = true;
+      if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        Serial.printf("#STATUS: Baseline HR formed: %.1f BPM (%u samples)\n",
+                      g_baselineBPM, (unsigned)g_baselineCount);
+        xSemaphoreGive(g_serialMutex);
+      }
+    }
+  }
+
+  // ── FIS update (1 Hz) ──────────────────────────────────────────────────────────
+  // hr_diff_pct = 0.0 while baseline forming → hr_Stable peaks → FIS relies
+  // only on blink + IMU signals during warmup. No false alarms from HR alone.
+  float hr_diff_pct = 0.0f;
+  if (g_baselineFormed && hr_out > 0) {
+    hr_diff_pct = (currentBPM - g_baselineBPM) / g_baselineBPM * 100.0f;
+  }
+
+  g_fis.update(hr_diff_pct,
+               g_blinkRate,
+               g_imu_gyro_var,
+               g_imu_pitch_deg,
+               g_imu_nod_score,
+               g_riskScore,
+               g_alertLevel);
+
+  // ── Buzzer alert output (GPIO 14) ─────────────────────────────────────────────
+  if (g_sessionBeepState == 0) { // Don't interfere with start/stop beeps
+    if (g_sessionActive) {
+#if defined(TEST_MODE_HARDWARE)
+      // Test mode: Beep buzzer for 200ms every 5 seconds
+      static uint32_t lastTestBeep = 0;
+      if (now - lastTestBeep >= 5000) {
+        digitalWrite(BUZZER_PIN, HIGH);
+        lastTestBeep = now;
+      } else if (now - lastTestBeep >= 200) {
+        digitalWrite(BUZZER_PIN, LOW);
+      }
+#else
+      // CRITICAL : continuous buzzer on.
+      // WARNING  : single 200 ms beep every 3 s (non-blocking state machine).
+      // SAFE     : buzzer off.
+      static uint8_t  warnBeepPhase = 0;   // 0=idle, 1=beep-on
+      static uint32_t warnBeepTime  = 0;
+      static uint32_t lastAlertTick = 0;
+
+      if (g_alertLevel == ALERT_CRITICAL) {
+        digitalWrite(BUZZER_PIN, LOW);
+        warnBeepPhase = 0;
+      } else if (g_alertLevel == ALERT_WARNING) {
+        digitalWrite(BUZZER_PIN, LOW);
+        warnBeepPhase = 0;
+      } else {   // ALERT_SAFE
+        digitalWrite(BUZZER_PIN, LOW);
+        warnBeepPhase = 0;
+        lastAlertTick = 0;
+      }
+#endif
+    } else {
+      // Keep buzzer quiet while paused (except for the start/stop beeps handled above)
+      digitalWrite(BUZZER_PIN, LOW);
+    }
+  }
+
+  // ── Serial output (human-readable, both modes) ──────────────────────────────
+  // Uses cached 10 Hz IMU snapshot (g_imu_*) — no extra I2C read at 1 Hz.
   if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+    const char *alertStr = (g_alertLevel == ALERT_CRITICAL) ? "CRITICAL" :
+                           (g_alertLevel == ALERT_WARNING)  ? "WARNING"  : "safe";
     Serial.println(F("#------------------------------------"));
     Serial.print(F("# t:"));
     Serial.print(now);
@@ -745,6 +1171,11 @@ void loop() {
     if (hr_out > 0) {
       Serial.print(hr_out);
       Serial.print(F(" BPM"));
+      if (g_baselineFormed) {
+        Serial.printf("  (diff %.1f%%)", hr_diff_pct);
+      } else {
+        Serial.print(F("  (baseline forming...)"));
+      }
     } else {
       Serial.print(F("-- BPM"));
     }
@@ -752,59 +1183,68 @@ void loop() {
     Serial.print(lastPulseRaw);
     Serial.println(lastSignalQuality ? F("  [OK]") : F("  [NO CONTACT]"));
     Serial.print(F("# AX:"));
-    Serial.print(ax_g, 3);
+    Serial.print(g_imu_ax_g, 3);
     Serial.print(F("  AY:"));
-    Serial.print(ay_g, 3);
+    Serial.print(g_imu_ay_g, 3);
     Serial.print(F("  AZ:"));
-    Serial.print(az_g, 3);
+    Serial.print(g_imu_az_g, 3);
     Serial.print(F("  MOV:"));
-    Serial.print(head_movement, 3);
+    Serial.print(g_imu_head_mov, 3);
     Serial.println(F("g"));
     Serial.print(F("# GX:"));
-    Serial.print(gx_dp, 1);
+    Serial.print(g_imu_gx_dp, 1);
     Serial.print(F("  GY:"));
-    Serial.print(gy_dp, 1);
+    Serial.print(g_imu_gy_dp, 1);
     Serial.print(F("  GZ:"));
-    Serial.println(gz_dp, 1);
+    Serial.println(g_imu_gz_dp, 1);
+    Serial.printf("# BLINK:%.1f  PITCH:%.1fdeg  GVAR:%.0f  NOD:%.2f\n",
+                  g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var, g_imu_nod_score);
+    Serial.printf("# RISK:%.1f%%  ALERT:%s\n", g_riskScore, alertStr);
 
 #if defined(STORAGE_MODE_USB)
-    // USB mode: CSV line for debug_recorder.py
-    Serial.print(now);
-    Serial.print(',');
-    Serial.print(hr_out);
-    Serial.print(',');
-    Serial.print(lastPulseRaw);
-    Serial.print(',');
-    Serial.print(ax_g, 4);
-    Serial.print(',');
-    Serial.print(ay_g, 4);
-    Serial.print(',');
-    Serial.print(az_g, 4);
-    Serial.print(',');
-    Serial.print(gx_dp, 4);
-    Serial.print(',');
-    Serial.print(gy_dp, 4);
-    Serial.print(',');
-    Serial.print(gz_dp, 4);
-    Serial.print(',');
-    Serial.print(head_movement, 4);
-    Serial.print(',');
-    Serial.println(lastSignalQuality);
+    // USB CSV line for debug_recorder.py
+    if (g_sessionActive) {
+      // Columns: timestamp_ms, hr_bpm, pulse_raw,
+      //          ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, head_movement, signal_quality,
+      //          blink_rate, pitch_deg, gyro_var, nod_score, risk_pct, alert_level
+      Serial.print(now);                Serial.print(',');
+      Serial.print(hr_out);             Serial.print(',');
+      Serial.print(lastPulseRaw);       Serial.print(',');
+      Serial.print(g_imu_ax_g, 4);     Serial.print(',');
+      Serial.print(g_imu_ay_g, 4);     Serial.print(',');
+      Serial.print(g_imu_az_g, 4);     Serial.print(',');
+      Serial.print(g_imu_gx_dp, 4);    Serial.print(',');
+      Serial.print(g_imu_gy_dp, 4);    Serial.print(',');
+      Serial.print(g_imu_gz_dp, 4);    Serial.print(',');
+      Serial.print(g_imu_head_mov, 4); Serial.print(',');
+      Serial.print(lastSignalQuality); Serial.print(',');
+      Serial.print(g_blinkRate, 2);    Serial.print(',');
+      Serial.print(g_imu_pitch_deg, 2); Serial.print(',');
+      Serial.print(g_imu_gyro_var, 1); Serial.print(',');
+      Serial.print(g_imu_nod_score, 3); Serial.print(',');
+      Serial.print(g_riskScore, 2);    Serial.print(',');
+      Serial.println(g_alertLevel);
+    }
 #endif
 
     xSemaphoreGive(g_serialMutex);
   }
 
-  // ── SD mode: write CSV row to SD card ────────────────────────────────
-  // Non-blocking: 20 ms timeout. If camera task is mid-write, skip this
-  // tick — we will write the next row in 1 second. Never block forever.
+  // ── SD mode: write CSV row to SD card ───────────────────────────────────────
+  // Column order matches USB CSV above for dataset compatibility.
+  // Non-blocking: 20 ms timeout. Skip tick if camera task holds SD mutex.
 #if defined(STORAGE_MODE_SD)
-  if (g_sdReady && g_csvFile) {
+  if (g_sdReady && g_csvFile && g_sessionActive) {
     if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-      g_csvFile.printf("%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d\n", now,
-                       hr_out, lastPulseRaw, ax_g, ay_g, az_g, gx_dp, gy_dp,
-                       gz_dp, head_movement, lastSignalQuality);
-      g_csvFile.flush(); // flush every row so data survives power loss
+      g_csvFile.printf(
+        "%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.2f,%.1f,%.3f,%.2f,%d\n",
+        now, hr_out, lastPulseRaw,
+        g_imu_ax_g, g_imu_ay_g, g_imu_az_g,
+        g_imu_gx_dp, g_imu_gy_dp, g_imu_gz_dp,
+        g_imu_head_mov, lastSignalQuality,
+        g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var,
+        g_imu_nod_score, g_riskScore, (int)g_alertLevel);
+      g_csvFile.flush();
       xSemaphoreGive(g_sdMutex);
     }
   }

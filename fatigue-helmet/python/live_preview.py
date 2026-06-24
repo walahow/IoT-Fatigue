@@ -27,6 +27,17 @@ MAGIC_EOF   = bytes([0xDD, 0xCC, 0xBB, 0xAA])
 HEADER_LEN  = 12
 MAX_FRAME_B = 500_000   # Increased to 500 KB to support VGA resolution!
 
+def print_text_clean(data: bytes):
+    for line in data.split(b'\n'):
+        if not line:
+            continue
+        try:
+            text = line.decode('ascii')
+            if text.startswith('#') or text.startswith('[') or (text and text[0].isdigit()):
+                print(text)
+        except UnicodeDecodeError:
+            pass
+
 def main():
     parser = argparse.ArgumentParser(description='Live Camera Placement Preview')
     parser.add_argument('--port', default='COM4', help='Serial port (default: COM4)')
@@ -69,12 +80,12 @@ def main():
 
                 # Print text/noise before SOF to console
                 if sof_idx > 0:
-                    print(buf[:sof_idx].decode('ascii', errors='ignore'), end='', flush=True)
+                    print_text_clean(buf[:sof_idx])
                     buf = buf[sof_idx:]
                 elif sof_idx == -1:
                     nl = buf.rfind(b'\n')
                     if nl >= 0:
-                        print(buf[:nl + 1].decode('ascii', errors='ignore'), end='', flush=True)
+                        print_text_clean(buf[:nl + 1])
                         buf = buf[nl + 1:]
                     break
 
@@ -84,8 +95,12 @@ def main():
                 timestamp_ms, jpeg_len = struct.unpack_from('<II', buf, 4)
 
                 if jpeg_len > MAX_FRAME_B:
-                    print(f"[WARN] Frame too large ({jpeg_len} B) - dropping 1 byte to resync")
-                    buf = buf[1:]
+                    # Silently resync if frame length is invalid
+                    next_sof = buf.find(MAGIC_SOF, 1)
+                    if next_sof != -1:
+                        buf = buf[next_sof:]
+                    else:
+                        buf = b''
                     continue
 
                 total_needed = HEADER_LEN + jpeg_len + 4
@@ -95,28 +110,36 @@ def main():
                 jpeg_data = buf[HEADER_LEN : HEADER_LEN + jpeg_len]
                 eof_marker = buf[HEADER_LEN + jpeg_len : total_needed]
 
-                if eof_marker == MAGIC_EOF:
-                    # Decode the JPEG
-                    np_arr = np.frombuffer(jpeg_data, np.uint8)
-                    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                if eof_marker != MAGIC_EOF:
+                    # Silently resync if EOF marker is invalid
+                    next_sof = buf.find(MAGIC_SOF, 1)
+                    if next_sof != -1:
+                        buf = buf[next_sof:]
+                    else:
+                        buf = b''
+                    continue
+
+                # Decode the JPEG
+                np_arr = np.frombuffer(jpeg_data, np.uint8)
+                img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                
+                if img is not None:
+                    # Rotate 180 degrees (since camera is mounted upside down)
+                    img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
                     
-                    if img is not None:
-                        # Rotate 180 degrees (since camera is mounted upside down)
-                        img = cv2.rotate(img, cv2.ROTATE_180)
-                        
-                        # Run quick eye detection for placement help
-                        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                        eyes = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(20,10))
-                        
-                        for (x, y, w, h) in eyes:
-                            # Draw a green box around the detected eye
-                            cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 100), 2)
-                            cv2.putText(img, "EYE DETECTED", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 100), 2)
-                        
-                        cv2.putText(img, "Live Placement Preview", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
-                        
-                        cv2.imshow("Helmet Camera Setup", img)
-                        
+                    # Run quick eye detection for placement help
+                    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    eyes = cascade.detectMultiScale(gray, scaleFactor=1.05, minNeighbors=3, minSize=(20,10))
+                    
+                    for (x, y, w, h) in eyes:
+                        # Draw a green box around the detected eye
+                        cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 100), 2)
+                        cv2.putText(img, "EYE DETECTED", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 100), 2)
+                    
+                    cv2.putText(img, "Live Placement Preview", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                    
+                    cv2.imshow("Helmet Camera Setup", img)
+                    
                 buf = buf[total_needed:]
 
             # Keep the OpenCV window responsive even if no frames arrive

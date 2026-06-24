@@ -51,4 +51,10 @@ Thumbs.db
 
 # Project specific
 fatigue-helmet/firmware/sessions/
+fatigue-helmet/firmware/test_session/
 fatigue-helmet/python/sessions/
+*.mjpeg
+*.mp4
+*.idx
+*.zip
+dataset & teory/
