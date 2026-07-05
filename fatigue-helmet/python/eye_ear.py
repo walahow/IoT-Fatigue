@@ -153,7 +153,7 @@ def process_folder(
     ear_blink_thresh: float  = EAR_BLINK_THRESH_DEFAULT,
     ear_blink_drop: float    = 0.0,
     blink_consec_min: int    = BLINK_CONSEC_MIN_DEFAULT,
-    rotate_180: bool  = False,
+    rotate_deg: int   = 0,
     show: bool        = False,
     output_video: bool = False,
     verbose: bool     = False,
@@ -198,7 +198,9 @@ def process_folder(
     for fname in frame_files[:lock_frames_to_use]:
         img = cv2.imread(os.path.join(frame_folder, fname))
         if img is None: continue
-        if rotate_180: img = cv2.rotate(img, cv2.ROTATE_180)
+        if rotate_deg == 90: img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate_deg == 180: img = cv2.rotate(img, cv2.ROTATE_180)
+        elif rotate_deg == 270: img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
         img = adjust_gamma(img, gamma=2.0)
         enh  = img if no_enhance else enhance_frame(img, clahe)
         gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
@@ -243,7 +245,9 @@ def process_folder(
 
             img = cv2.imread(os.path.join(frame_folder, fname))
             if img is None: continue
-            if rotate_180: img = cv2.rotate(img, cv2.ROTATE_180)
+            if rotate_deg == 90: img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+            elif rotate_deg == 180: img = cv2.rotate(img, cv2.ROTATE_180)
+            elif rotate_deg == 270: img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
             h, w = img.shape[:2]
 
             if output_video and video_out is None:
@@ -373,8 +377,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ear-blink-drop",   type=float, default=0.0, metavar="F",
                    help="Minimum EAR velocity drop required to count a blink (default: 0.0).")
     p.add_argument("--blink-consec-min", type=int, default=BLINK_CONSEC_MIN_DEFAULT, metavar="N")
+    p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
+                   help="Rotate frames by N degrees clockwise before processing.")
     p.add_argument("--rotate-180", action="store_true",
-                   help="Rotate 180 degrees before processing (upside-down camera).")
+                   help="Legacy alias for --rotate 180.")
     p.add_argument("--show",         action="store_true", help="Show live preview window.")
     p.add_argument("--output-video", action="store_true", help="Save processed_video.mp4.")
     p.add_argument("--no-enhance",   action="store_true", help="Skip CLAHE enhancement.")
@@ -397,7 +403,7 @@ def main() -> None:
         ear_blink_thresh=args.ear_blink_thresh,
         ear_blink_drop=args.ear_blink_drop,
         blink_consec_min=args.blink_consec_min,
-        rotate_180=args.rotate_180,
+        rotate_deg=180 if args.rotate_180 else args.rotate,
         show=args.show,
         output_video=args.output_video,
         verbose=args.verbose,

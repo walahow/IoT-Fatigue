@@ -62,7 +62,8 @@ def merge(session_path: str, tolerance_ms: int) -> None:
     expected_sensor_cols = [
         "timestamp_ms", "hr_bpm", "pulse_raw",
         "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
-        "head_movement", "signal_quality"
+        "head_movement", "signal_quality", "blink_rate",
+        "pitch_deg", "gyro_var", "nod_score", "risk_pct", "alert_level"
     ]
     
     # Read the first line to check if it contains headers
@@ -76,6 +77,8 @@ def merge(session_path: str, tolerance_ms: int) -> None:
         
     if has_header:
         sensor_df = pd.read_csv(sensor_path)
+        # Fix columns if the firmware wrote "#HEADER:"
+        sensor_df.columns = [col.replace("#HEADER:", "").strip() for col in sensor_df.columns]
     else:
         print("[MERGE] sensor_data.csv appears to be headerless. Assigning default headers.")
         sensor_df = pd.read_csv(sensor_path, names=expected_sensor_cols)

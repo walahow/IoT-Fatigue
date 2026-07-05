@@ -26,6 +26,8 @@ import sys
 import glob
 
 import cv2
+import numpy as np
+import pandas as pd
 
 # ── Colour / font constants ───────────────────────────────────────────────────
 OSD_FONT       = cv2.FONT_HERSHEY_SIMPLEX
@@ -51,10 +53,14 @@ def parse_args() -> argparse.Namespace:
                    help="Upscale factor (default: 2 = 640x480). Use 1 for native 320x240.")
     p.add_argument("--no-timestamp", action="store_true",
                    help="Disable timestamp OSD overlay")
+    p.add_argument("--overlay-data", action="store_true",
+                   help="Overlay sensor data HUD at the bottom of the video")
     p.add_argument("--no-fill-gaps", action="store_true",
                    help="Skip duplicate-frame gap filling; just encode frames as-is")
     p.add_argument("--codec", default="avc1",
                    help="FourCC codec string (default: avc1 H.264). Fallback: mp4v.")
+    p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
+                   help="Rotate frames by N degrees clockwise before processing.")
     return p.parse_args()
 
 
@@ -105,18 +111,181 @@ def draw_osd(frame, timestamp_ms: int, frame_num: int, total: int):
 
     # Shadow pass
     cv2.putText(frame, text,
-                (OSD_MARGIN + 1, frame.shape[0] - OSD_MARGIN - 1),
+                (OSD_MARGIN + 1, OSD_MARGIN + 15 + 1),
                 OSD_FONT, OSD_SCALE, OSD_SHADOW, OSD_THICKNESS + 1,
                 cv2.LINE_AA)
     # Main text
     cv2.putText(frame, text,
-                (OSD_MARGIN, frame.shape[0] - OSD_MARGIN),
+                (OSD_MARGIN, OSD_MARGIN + 15),
                 OSD_FONT, OSD_SCALE, OSD_COLOR, OSD_THICKNESS,
                 cv2.LINE_AA)
 
 
+def load_session_data(session_path: str):
+    merged_path = os.path.join(session_path, "dataset_merged.csv")
+    if os.path.exists(merged_path):
+        return pd.read_csv(merged_path).sort_values("timestamp_ms")
+    
+    sensor_path = os.path.join(session_path, "sensor_data.csv")
+    if os.path.exists(sensor_path):
+        df = pd.read_csv(sensor_path)
+        if len(df.columns) > 0 and df.columns[0].startswith("#HEADER:"):
+            df.columns = [c.replace("#HEADER:", "").strip() for c in df.columns]
+        return df.sort_values("timestamp_ms")
+    
+    return None
+
+
+def draw_data_hud(hud, ts, df):
+    h, w = hud.shape[:2]
+    cv2.rectangle(hud, (0, 0), (w, h), (20, 20, 25), -1) 
+    
+    idx = np.searchsorted(df['timestamp_ms'].values, ts)
+    if idx >= len(df):
+        idx = len(df) - 1
+    elif idx > 0 and abs(ts - df['timestamp_ms'].iloc[idx-1]) < abs(df['timestamp_ms'].iloc[idx] - ts):
+        idx = idx - 1
+        
+    row = df.iloc[idx]
+    
+    # 1. Physiology (Left)
+    hr = row.get("hr_bpm", 0)
+    sq = row.get("signal_quality", 0)
+    cv2.putText(hud, f"HR: {hr:.0f} BPM", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    sq_col = (0, 255, 0) if sq == 1 else (0, 0, 255)
+    cv2.putText(hud, f"SQ: {'OK' if sq==1 else 'BAD'}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, sq_col, 1)
+    
+    # 2. IMU State (Center-Left)
+    pitch = row.get("pitch_deg", 0)
+    gyro = row.get("gyro_var", 0)
+    nod = row.get("nod_score", 0)
+    cv2.putText(hud, f"Pitch: {pitch:.1f} deg", (150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(hud, f"GyroVar: {gyro:.0f}", (150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(hud, f"Nod: {nod:.2f}", (150, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # 3. Fuzzy Logic Output (Right)
+    risk = row.get("risk_pct", 0)
+    alert = row.get("alert_level", 0)
+    if alert == 2:
+        alert_str = "CRITICAL"
+        alert_col = (0, 0, 255) 
+    elif alert == 1:
+        alert_str = "WARNING"
+        alert_col = (0, 255, 255)
+    else:
+        alert_str = "SAFE"
+        alert_col = (0, 255, 0)
+        
+    cv2.putText(hud, f"RISK: {risk:.1f}%", (w - 200, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+    cv2.putText(hud, f"{alert_str}", (w - 200, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, alert_col, 2)
+    
+    lbl = row.get("label", "")
+    if pd.notna(lbl) and str(lbl).strip():
+        cv2.putText(hud, f"LBL: {lbl}", (w - 200, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,100,100), 2)
+
+    # 4. Eye Blinking Chart (Center-Right)
+    chart_x1 = 280
+    chart_y1 = 15
+    chart_x2 = w - 220
+    chart_y2 = h - 15
+    cv2.rectangle(hud, (chart_x1, chart_y1), (chart_x2, chart_y2), (40, 40, 40), -1)
+    
+    start_idx = max(0, idx - 60)
+    window = df.iloc[start_idx:idx+1]
+    
+    if len(window) > 1:
+        blink_max = 30.0
+        def get_pt(val, i, max_val):
+            x = chart_x1 + int((i / (len(window) - 1)) * (chart_x2 - chart_x1))
+            y = chart_y2 - int(min(1.0, max(0.0, val / max_val)) * (chart_y2 - chart_y1))
+            return (x, y)
+        
+        br_pts = []
+        for i in range(len(window)):
+            v = window.iloc[i].get("blink_rate", 0)
+            br_pts.append(get_pt(v, i, blink_max))
+        
+        cv2.polylines(hud, [np.array(br_pts, dtype=np.int32)], False, (255, 200, 0), 2)
+        cv2.putText(hud, "Blink", (chart_x1+5, chart_y1+15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 200, 0), 1)
+
+        if "ear" in window.columns and window["ear"].notna().any():
+            ear_max = 0.5
+            ear_pts = []
+            for i in range(len(window)):
+                v = window.iloc[i].get("ear", 0)
+                if pd.isna(v): v = 0
+                ear_pts.append(get_pt(v, i, ear_max))
+            cv2.polylines(hud, [np.array(ear_pts, dtype=np.int32)], False, (0, 200, 255), 1)
+            cv2.putText(hud, "EAR", (chart_x1+5, chart_y1+30), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
+
+
+def draw_pip_ellipse(img, row, scale):
+    """Draw a black and white PiP at the top right showing the thresholded eye and fitted ellipse."""
+    if "eye_x" not in row or pd.isna(row["eye_x"]) or str(row["eye_x"]).strip() == "":
+        return
+    
+    try:
+        ex = int(float(row["eye_x"]) * scale)
+        ey = int(float(row["eye_y"]) * scale)
+        ew = int(float(row["eye_w"]) * scale)
+        eh = int(float(row["eye_h"]) * scale)
+        mx = int(8 * scale) # ROI margin
+    except (ValueError, TypeError):
+        return
+        
+    h, w = img.shape[:2]
+    x1 = max(0, ex - mx)
+    y1 = max(0, ey - mx)
+    x2 = min(w, ex + ew + mx)
+    y2 = min(h, ey + eh + mx)
+    
+    crop = img[y1:y2, x1:x2]
+    if crop.size == 0:
+        return
+        
+    gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    
+    # Process like eye_ear.py
+    crop_rs = cv2.resize(gray_crop, (64, 64), interpolation=cv2.INTER_LINEAR)
+    blur = cv2.GaussianBlur(crop_rs, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)
+        for cnt in contours:
+            if len(cnt) < 5 or cv2.contourArea(cnt) < 30:
+                continue
+            try:
+                ellipse = cv2.fitEllipse(cnt)
+                if ellipse[1][1] < 1e-6:
+                    continue
+                cv2.ellipse(thresh_bgr, ellipse, (0, 0, 255), 2)
+                break
+            except cv2.error:
+                continue
+
+    # Scale the 64x64 up to e.g. 128x128 for PiP (scaled by video scale)
+    pip_size = int(64 * scale)
+    pip = cv2.resize(thresh_bgr, (pip_size, pip_size), interpolation=cv2.INTER_NEAREST)
+    
+    cv2.rectangle(pip, (0, 0), (pip_size-1, pip_size-1), (255, 255, 255), 1)
+    
+    # Overlay on top-right
+    pip_y = 10
+    pip_x = w - pip_size - 10
+    
+    # ensure it fits
+    if pip_y + pip_size <= h and pip_x >= 0:
+        img[pip_y:pip_y+pip_size, pip_x:pip_x+pip_size] = pip
+
+
 def encode(session_path: str, fps: float, out_path: str, scale: float,
-           show_timestamp: bool, fill_gaps: bool, codec: str) -> None:  # noqa
+           show_timestamp: bool, fill_gaps: bool, codec: str, overlay_data: bool, rotate_deg: int) -> None:  # noqa
 
     frames_dir = os.path.join(session_path, "frames")
     if not os.path.isdir(frames_dir):
@@ -131,6 +300,11 @@ def encode(session_path: str, fps: float, out_path: str, scale: float,
     first_img = cv2.imread(frames[0][1])
     if first_img is None:
         sys.exit(f"[ERROR] Cannot read first frame: {frames[0][1]}")
+        
+    if rotate_deg == 90: first_img = cv2.rotate(first_img, cv2.ROTATE_90_CLOCKWISE)
+    elif rotate_deg == 180: first_img = cv2.rotate(first_img, cv2.ROTATE_180)
+    elif rotate_deg == 270: first_img = cv2.rotate(first_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    
     h, w = first_img.shape[:2]
 
     # ── Apply upscale ─────────────────────────────────────────────────────────
@@ -146,9 +320,19 @@ def encode(session_path: str, fps: float, out_path: str, scale: float,
     print(f"[INFO] Output      : {out_path}")
     print(f"[INFO] Gap fill    : {'yes' if fill_gaps else 'no'}")
 
+    session_data = None
+    hud_h = 0
+    if overlay_data:
+        session_data = load_session_data(session_path)
+        if session_data is not None:
+            hud_h = 120
+            print(f"[INFO] HUD Overlay : Enabled ({len(session_data)} data rows)")
+        else:
+            print(f"[WARN] HUD Overlay : Failed (No CSV data found)")
+
     # ── Set up VideoWriter ────────────────────────────────────────────────────
     fourcc = cv2.VideoWriter_fourcc(*codec)
-    writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
+    writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h + hud_h))
     if not writer.isOpened():
         # avc1 may not be available on all Windows builds; fall back to mp4v
         print(f"[WARN] Codec '{codec}' unavailable, falling back to mp4v.")
@@ -171,19 +355,58 @@ def encode(session_path: str, fps: float, out_path: str, scale: float,
             print(f"[WARN] Cannot read {path} - skipping.")
             continue
 
+        if rotate_deg == 90: img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate_deg == 180: img = cv2.rotate(img, cv2.ROTATE_180)
+        elif rotate_deg == 270: img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+
         # Upscale
         if scale != 1.0:
             img = cv2.resize(img, (out_w, out_h), interpolation=interp)
+
+        # Draw bounding box if we have session data
+        if session_data is not None:
+            idx = np.searchsorted(session_data['timestamp_ms'].values, ts)
+            if idx >= len(session_data):
+                idx = len(session_data) - 1
+            elif idx > 0 and abs(ts - session_data['timestamp_ms'].iloc[idx-1]) < abs(session_data['timestamp_ms'].iloc[idx] - ts):
+                idx = idx - 1
+            row = session_data.iloc[idx]
+            
+            if "eye_x" in row and pd.notna(row["eye_x"]) and row["eye_x"] != "":
+                try:
+                    ex = int(float(row["eye_x"]) * scale)
+                    ey = int(float(row["eye_y"]) * scale)
+                    ew = int(float(row["eye_w"]) * scale)
+                    eh = int(float(row["eye_h"]) * scale)
+                    
+                    is_blink = int(row.get("is_blink_frame", 0)) == 1
+                    color = (0, 0, 255) if is_blink else (0, 255, 100)
+                    cv2.rectangle(img, (ex, ey), (ex+ew, ey+eh), color, 2)
+                    
+                    ear = row.get("ear", 0.0)
+                    cv2.putText(img, f"EAR:{float(ear):.2f}", (ex, max(0, ey - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45 * scale, color, max(1, int(1*scale)))
+                    if is_blink:
+                        cv2.putText(img, "BLINK", (ex, max(0, ey - int(24*scale))), cv2.FONT_HERSHEY_SIMPLEX, 0.7 * scale, (0, 0, 255), max(1, int(2*scale)))
+                except (ValueError, TypeError):
+                    pass
+            
+            draw_pip_ellipse(img, row, scale)
+
+        # Build HUD if needed
+        if hud_h > 0 and session_data is not None:
+            hud_canvas = np.zeros((hud_h, out_w, 3), dtype=np.uint8)
+            draw_data_hud(hud_canvas, ts, session_data)
+            img = np.vstack((img, hud_canvas))
 
         # Fill timing gap with previous frame duplicated
         if fill_gaps and prev_frame is not None:
             gap_ms       = ts - prev_ts
             extra_frames = max(0, round(gap_ms / ms_per_frame) - 1)
             if extra_frames > 0:
-                fill_img = prev_frame.copy()
-                if show_timestamp:
-                    draw_osd(fill_img, prev_ts, written + 1, total)
                 for _ in range(extra_frames):
+                    fill_img = prev_frame.copy()
+                    if show_timestamp:
+                        draw_osd(fill_img, prev_ts, written + 1, total)
                     writer.write(fill_img)
                     written     += 1
                     gap_filled  += 1
@@ -238,6 +461,8 @@ def main() -> None:
         show_timestamp = not args.no_timestamp,
         fill_gaps      = not args.no_fill_gaps,
         codec          = args.codec,
+        overlay_data   = args.overlay_data,
+        rotate_deg     = args.rotate,
     )
 
 
