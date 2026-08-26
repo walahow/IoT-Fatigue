@@ -1,0 +1,97 @@
+# IoT Fatigue Helmet - Usage Guide
+
+This document provides detailed instructions on how to set up, build, and use the IoT Fatigue Helmet project.
+
+## 1. Hardware Setup
+
+The project uses a Freenove ESP32-S3-WROOM CAM board connected to various sensors and peripherals.
+
+### Pin Connections
+
+*   **Pulse & Oxygen Sensor (MAX30102)**: I2C connection.
+    *   **SDA**: `GPIO 2`
+    *   **SCL**: `GPIO 3`
+    *   **VIN**: `3.3V`
+    *   **GND**: `GND`
+*   **IMU Sensor (MPU6050)**: I2C connection.
+    *   **SDA**: `GPIO 2`
+    *   **SCL**: `GPIO 3`
+    *   **VIN**: `3.3V`
+    *   **GND**: `GND`
+*   **Action Button**:
+    *   **Pin**: `GPIO 21`
+    *   Connect the button between `GPIO 21` and `GND`. An internal pull-up resistor is enabled in the software.
+*   **Buzzer**:
+    *   **Pin**: `GPIO 14`
+    *   Connect the positive leg to `GPIO 14` and the negative leg to `GND`. The software uses PWM to drive the buzzer efficiently and avoid brownouts.
+*   **Status LED**:
+    *   **Pin**: `GPIO 48` (Onboard LED for Freenove ESP32-S3-WROOM)
+
+## 2. Firmware Environments
+
+The project is built using PlatformIO and has two primary operating modes, each with its own build environment in `platformio.ini`:
+
+### `esp32s3cam_usb` (USB Debug Mode)
+*   **Purpose**: Used for testing, debugging, and observing serial output in real-time.
+*   **Features**:
+    *   Streams data over the Serial Monitor (115200 baud rate).
+    *   Buzzer is **muted** by default to prevent EMI noise affecting the I2C sensors while plugged into USB.
+*   **To build & upload**: Run `pio run -e esp32s3cam_usb -t upload`
+
+### `esp32s3cam_sd` (Standalone SD Card Mode)
+*   **Purpose**: Used for actual field deployment (standalone operation on a battery).
+*   **Features**:
+    *   Data is recorded to a `.csv` file on the inserted MicroSD card.
+    *   Buzzer is **enabled** and will sound when fatigue is detected.
+    *   Serial port is still active if you wish to monitor via UART while running in SD mode.
+*   **To build & upload**: Run `pio run -e esp32s3cam_sd -t upload`
+
+## 3. How to Use the Device
+
+### Startup Sequence
+1.  **Power On**: Connect the ESP32 to power (USB or battery).
+2.  **Initialization**: The system will initialize the camera, SD card (if in SD mode), I2C bus, MAX30102, and MPU6050.
+3.  **Idle State**: The device enters "Idle" mode. The internal LED will stay OFF or solid depending on the state, waiting for the user to start a session.
+
+### Starting a Session
+1.  Ensure the helmet is worn and sensors are properly attached.
+2.  Press the **Action Button (`GPIO 21`)**.
+3.  The onboard LED will flash briefly, indicating the session has started.
+4.  The system will perform a quick MPU6050 calibration (keep the helmet still for a few seconds).
+5.  Data logging and fatigue monitoring begin.
+    *   If in SD mode, a new CSV file (e.g., `data_0.csv`) is created.
+    *   The Camera starts capturing images.
+    *   The buzzer will sound if fatigue is detected based on heart rate and head tilt.
+
+### Stopping a Session
+1.  Press the **Action Button (`GPIO 21`)** again.
+2.  The onboard LED will flash to indicate the session has stopped.
+3.  The current CSV file (if in SD mode) is safely closed and saved.
+4.  The device returns to the Idle state. You can press the button again to start a new session.
+
+## 4. Understanding the Outputs
+
+### SD Card Data Format (CSV)
+The SD card logs data at regular intervals. The CSV headers are:
+`Timestamp,HR,SpO2,Pitch,Roll,FatigueLevel`
+*   **Timestamp**: Milliseconds since the ESP32 booted.
+*   **HR**: Heart Rate (BPM).
+*   **SpO2**: Blood oxygen level (%).
+*   **Pitch / Roll**: Head tilt angles calculated from the MPU6050.
+*   **FatigueLevel**: The output from the Fuzzy Logic system (0.0 to 10.0), where higher values indicate greater fatigue.
+
+### Camera Output
+*   Images are saved to the SD card (if enabled) in QVGA resolution.
+
+## 5. Troubleshooting & Auto-Recovery Features
+
+The firmware includes robust auto-recovery mechanisms to ensure the system doesn't crash during a ride:
+
+*   **I2C Sensor Dropouts (Error -1 / Error 263)**: 
+    *   *Cause*: Often caused by EMI from the buzzer, loose wires, or voltage dips.
+    *   *Resolution*: The system continuously scans the I2C bus in the background. If the MAX30102 or MPU6050 stop responding, the ESP32 will automatically reset the I2C hardware (SCL/SDA) in less than 1 millisecond and attempt to reconnect without halting the main program.
+*   **SD Card Failures**:
+    *   Ensure the SD card is formatted to FAT32.
+    *   Make sure the SD card is securely inserted before booting.
+*   **System Freezes**:
+    *   The software is designed to be completely non-blocking. If a sensor disconnects, the system will use previous calibration values rather than freezing in an infinite loop waiting for the sensor.

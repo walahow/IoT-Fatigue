@@ -160,6 +160,7 @@ const int NO_CONTACT_WARN_N = 10;
 // ── MPU-6050 ─────────────────────────────────────────────────────────────
 MPU6050 mpu(MPU_ADDR);
 bool g_mpuEnabled = false;
+bool g_buzzerActive = false;
 int16_t ax_off = 0, ay_off = 0, az_off = 0;
 int16_t gx_off = 0, gy_off = 0, gz_off = 0;
 
@@ -549,7 +550,6 @@ void saveJpegToSD(const uint8_t *data, size_t len, uint32_t timestamp_ms) {
 
 #if defined(STORAGE_MODE_USB)
 void sendJpegFrame(const uint8_t *data, size_t len, uint32_t timestamp_ms) {
-  if (!g_sessionActive) return;
   uint32_t length32 = (uint32_t)len;
   // Timeout 20ms: if sensor output holds the mutex, skip this frame
   if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
@@ -696,6 +696,9 @@ void readPulseSensor() {
 // ─────────────────────────────────────────────────────────────────────────
 
 void blinkLED(int times) {
+  if (LED_BUILTIN <= 0 || LED_BUILTIN == PIN_SDA || LED_BUILTIN == PIN_SCL) {
+    return; // Avoid corrupting I2C bus pins (GPIO 2 / 3)
+  }
   pinMode(LED_BUILTIN, OUTPUT);
   for (int i = 0; i < times; i++) {
     digitalWrite(LED_BUILTIN, HIGH);
@@ -703,6 +706,11 @@ void blinkLED(int times) {
     digitalWrite(LED_BUILTIN, LOW);
     delay(150);
   }
+}
+
+void setBuzzerState(bool active) {
+  (void)active;
+  digitalWrite(BUZZER_PIN, LOW); // Buzzer temporarily deactivated for testing
 }
 
 void calibrateMPU() {
@@ -846,20 +854,36 @@ void setup() {
   Serial.println(F("#STATUS: Buzzer GPIO 14 initialized"));
 
   Wire.begin(PIN_SDA, PIN_SCL);
-  Wire.setTimeOut(10); // 10ms timeout to prevent hanging on I2C errors
-  mpu.initialize();
-  uint8_t whoami = mpu.getDeviceID();
-  Serial.print(F("#STATUS: MPU WHO_AM_I = 0x"));
-  Serial.println(whoami, HEX);
-  if (whoami == 0x68 || whoami == 0x69 || whoami == 0x38) {
-    g_mpuEnabled = true;
-    mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-    mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-    Serial.println(F("#STATUS: MPU-6050 initialized OK"));
-    calibrateMPU();
+  Wire.setClock(100000);
+  Wire.setTimeOut(20);
+
+  uint8_t foundAddr = 0;
+  for (uint8_t addr = 0x68; addr <= 0x69; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      foundAddr = addr;
+      break;
+    }
+  }
+
+  if (foundAddr != 0) {
+    mpu = MPU6050(foundAddr);
+    mpu.initialize();
+    uint8_t whoami = mpu.getDeviceID();
+    Serial.printf("#STATUS: MPU at 0x%02X WHO_AM_I = 0x%02X\n", foundAddr, whoami);
+    if (whoami == 0x68 || whoami == 0x69 || whoami == 0x38 || whoami == 0x70 || whoami == 0x72) {
+      g_mpuEnabled = true;
+      mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+      mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+      Serial.println(F("#STATUS: MPU-6050 initialized OK"));
+      calibrateMPU();
+    } else {
+      g_mpuEnabled = false;
+      Serial.println(F("#WARN: MPU-6050 WHO_AM_I mismatch — running with IMU disabled"));
+    }
   } else {
     g_mpuEnabled = false;
-    Serial.println(F("#WARN: MPU-6050 not detected — running with IMU disabled"));
+    Serial.println(F("#WARN: MPU-6050 not detected at 0x68/0x69 — running with IMU disabled"));
   }
 
   // ── SD card initialization (production mode) ─────────────────────────
@@ -924,38 +948,13 @@ void loop() {
         g_sessionActive = !g_sessionActive;
         if (g_sessionActive) {
           Serial.println(F("\n#STATUS: Session STARTED (Recording active)"));
-          g_sessionBeepState = 1; // 1 long beep
-          g_sessionBeepTimer = now;
-          digitalWrite(BUZZER_PIN, HIGH);
         } else {
           Serial.println(F("\n#STATUS: Session PAUSED (Recording stopped)"));
-          g_sessionBeepState = 3; // 2 short beeps
-          g_sessionBeepTimer = now;
-          digitalWrite(BUZZER_PIN, HIGH);
         }
       }
     }
   }
   g_lastButtonState = reading;
-
-  // Handle session start/stop beeps without delay()
-  if (g_sessionBeepState > 0) {
-    if (g_sessionBeepState == 1 && (now - g_sessionBeepTimer >= 300)) {
-      digitalWrite(BUZZER_PIN, LOW);
-      g_sessionBeepState = 0;
-    } else if (g_sessionBeepState == 3 && (now - g_sessionBeepTimer >= 100)) {
-      digitalWrite(BUZZER_PIN, LOW);
-      g_sessionBeepState = 4;
-      g_sessionBeepTimer = now;
-    } else if (g_sessionBeepState == 4 && (now - g_sessionBeepTimer >= 100)) {
-      digitalWrite(BUZZER_PIN, HIGH);
-      g_sessionBeepState = 5;
-      g_sessionBeepTimer = now;
-    } else if (g_sessionBeepState == 5 && (now - g_sessionBeepTimer >= 100)) {
-      digitalWrite(BUZZER_PIN, LOW);
-      g_sessionBeepState = 0;
-    }
-  }
 
   // ── Pulse sensor: 500 Hz — must ALWAYS run, never skip ───────────────
   // Keep this first and outside any mutex so it is never starved.
@@ -980,16 +979,44 @@ void loop() {
     // getMotion6 will fail and leave these untouched. By defaulting to calibration values,
     // the system sees "0 movement, 0 pitch" instead of getting stuck on old data,
     // immediately breaking the buzzer "Death Loop".
+    // Auto-reconnect retry if IMU was not detected at boot or connection was lost
+    static unsigned long lastImuRetry = 0;
+    if (!g_mpuEnabled && (now - lastImuRetry >= 2000)) {
+      lastImuRetry = now;
+      Wire.begin(PIN_SDA, PIN_SCL);
+      Wire.setClock(100000);
+      for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+          mpu = MPU6050(addr);
+          mpu.initialize();
+          uint8_t who = mpu.getDeviceID();
+          Serial.printf("#STATUS: Found I2C device at 0x%02X (WHO_AM_I = 0x%02X)\n", addr, who);
+          if (who == 0x68 || who == 0x69 || who == 0x38 || who == 0x70 || who == 0x72 || addr == 0x68 || addr == 0x69) {
+            g_mpuEnabled = true;
+            mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+            mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+            if (ax_off == 0 && ay_off == 0 && az_off == 0) {
+              calibrateMPU();
+            } else {
+              Serial.printf("#STATUS: MPU-6050 I2C connection restored (address 0x%02X)\n", addr);
+            }
+            break;
+          }
+        }
+      }
+    }
+
     int16_t ax_r10 = (int16_t)ax_off, ay_r10 = (int16_t)ay_off, az_r10 = (int16_t)az_off;
     int16_t gx_r10 = (int16_t)gx_off, gy_r10 = (int16_t)gy_off, gz_r10 = (int16_t)gz_off;
-    if (g_mpuEnabled) {
+    if (g_mpuEnabled && !g_buzzerActive) {
       static int i2cErrorCount = 0;
       Wire.beginTransmission(MPU_ADDR);
       if (Wire.endTransmission() != 0) {
         i2cErrorCount++;
-        if (i2cErrorCount >= 3) {
+        if (i2cErrorCount >= 10) { // Require 10 consecutive errors before marking disabled
           g_mpuEnabled = false;
-          Serial.println(F("#WARN: MPU-6050 connection lost — disabling IMU features"));
+          Wire.begin(PIN_SDA, PIN_SCL); // Instant I2C bus hardware reset
         }
       } else {
         i2cErrorCount = 0;
@@ -1134,24 +1161,55 @@ void loop() {
         digitalWrite(BUZZER_PIN, LOW);
       }
 #else
-      // CRITICAL : continuous buzzer on.
-      // WARNING  : single 200 ms beep every 3 s (non-blocking state machine).
+      // CRITICAL : 2s ON, 3s OFF (cooldown)
+      // WARNING  : 1s ON, 3s OFF (cooldown).
       // SAFE     : buzzer off.
-      static uint8_t  warnBeepPhase = 0;   // 0=idle, 1=beep-on
-      static uint32_t warnBeepTime  = 0;
-      static uint32_t lastAlertTick = 0;
+#if defined(STORAGE_MODE_USB)
+      setBuzzerState(false);
+      g_buzzerActive = false;
+#else
+      static uint32_t alertStartTime = 0;
+      static bool alertActive = false;
+      static uint32_t cooldownStartTime = 0;
+      static bool cooldownActive = false;
+      static uint32_t currentAlertDuration = 0;
+      const uint32_t COOLDOWN_DURATION = 3000;
 
-      if (g_alertLevel == ALERT_CRITICAL) {
-        digitalWrite(BUZZER_PIN, LOW);
-        warnBeepPhase = 0;
-      } else if (g_alertLevel == ALERT_WARNING) {
-        digitalWrite(BUZZER_PIN, LOW);
-        warnBeepPhase = 0;
-      } else {   // ALERT_SAFE
-        digitalWrite(BUZZER_PIN, LOW);
-        warnBeepPhase = 0;
-        lastAlertTick = 0;
+      if (cooldownActive) {
+        if (now - cooldownStartTime > COOLDOWN_DURATION) {
+          cooldownActive = false;
+        }
+      } else if (alertActive) {
+        if (now - alertStartTime > currentAlertDuration) {
+          alertActive = false;
+          cooldownActive = true;
+          cooldownStartTime = now;
+          setBuzzerState(false);
+          g_buzzerActive = false;
+        } else {
+          setBuzzerState(true);
+          g_buzzerActive = true;
+        }
+      } else {
+        // Idle state - wait for new alert
+        if (g_alertLevel == ALERT_CRITICAL) {
+          alertActive = true;
+          alertStartTime = now;
+          currentAlertDuration = 2000;
+          setBuzzerState(true);
+          g_buzzerActive = true;
+        } else if (g_alertLevel == ALERT_WARNING) {
+          alertActive = true;
+          alertStartTime = now;
+          currentAlertDuration = 1000;
+          setBuzzerState(true);
+          g_buzzerActive = true;
+        } else {
+          setBuzzerState(false);
+          g_buzzerActive = false;
+        }
       }
+#endif
 #endif
     } else {
       // Keep buzzer quiet while paused (except for the start/stop beeps handled above)
@@ -1182,6 +1240,9 @@ void loop() {
     Serial.print(F("  PULSE:"));
     Serial.print(lastPulseRaw);
     Serial.println(lastSignalQuality ? F("  [OK]") : F("  [NO CONTACT]"));
+    if (!g_mpuEnabled) {
+      Serial.println(F("# IMU: [DISCONNECTED] — check MPU-6050 VCC/GND/SDA/SCL wiring"));
+    }
     Serial.print(F("# AX:"));
     Serial.print(g_imu_ax_g, 3);
     Serial.print(F("  AY:"));

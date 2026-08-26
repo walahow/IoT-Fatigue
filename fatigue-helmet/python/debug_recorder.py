@@ -44,7 +44,7 @@ except ImportError:
 MAGIC_SOF   = bytes([0xAA, 0xBB, 0xCC, 0xDD])
 MAGIC_EOF   = bytes([0xDD, 0xCC, 0xBB, 0xAA])
 HEADER_LEN  = 12   # SOF(4) + timestamp(4) + length(4)
-MAX_FRAME_B = 80_000  # safety cap: reject frames > 80 KB (corrupt length field)
+MAX_FRAME_B = 500_000  # safety cap: 500 KB to support VGA resolution frames
 
 # ── Session directory  ────────────────────────────────────────────────────────
 SESSIONS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions')
@@ -111,7 +111,13 @@ def run(args) -> None:
     print(f'[RECORDER] Opening {args.port} @ {args.baud} baud ...')
 
     try:
-        ser = serial.Serial(args.port, args.baud, timeout=0.05)
+        ser = serial.Serial()
+        ser.port = args.port
+        ser.baudrate = args.baud
+        ser.dtr = False
+        ser.rts = False
+        ser.timeout = 0.05
+        ser.open()
     except serial.SerialException as e:
         print(f'[ERROR] Cannot open {args.port}: {e}')
         sys.exit(1)
