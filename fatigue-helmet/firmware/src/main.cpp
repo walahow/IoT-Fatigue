@@ -212,10 +212,11 @@ static float g_earLockSamplesX[EAR_LOCK_SAMPLES];
 static float g_earLockSamplesY[EAR_LOCK_SAMPLES];
 static int   g_earLockSampleCount = 0;
 static bool  g_earLockDone = false;
+static bool  g_earDisabled = false;  // set true after a failed buffer allocation; never retried
 
 EyeBlinkEAR::RoiLock      g_earRoi;
 EyeBlinkEAR::BlinkDetector g_earBlink;
-float g_onDeviceBlinkRate = 13.0f;  // read by the g_blinkRate fallback below
+volatile float g_onDeviceBlinkRate = 13.0f;  // read by the g_blinkRate fallback below
 
 // Converts a rectangular region of an RGB888 buffer to grayscale (simple
 // average of R,G,B) into a caller-provided buffer sized regionW*regionH.
@@ -248,7 +249,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   int w = (int)fb->width;
   int h = (int)fb->height;
 
-  if (!g_earRgbBuf) {
+  if (!g_earRgbBuf && !g_earDisabled) {
     g_earRgbBuf  = (uint8_t *)heap_caps_malloc((size_t)w * h * 3, MALLOC_CAP_SPIRAM);
     g_earGrayBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
     g_earMaskBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
@@ -256,9 +257,11 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     g_earFullH = h;
     if (!g_earRgbBuf || !g_earGrayBuf || !g_earMaskBuf) {
       Serial.println(F("#ERROR: EAR buffer alloc failed -- on-device blink detection disabled"));
+      g_earDisabled = true;
       return;
     }
   }
+  if (g_earDisabled) return;
   if (w != g_earFullW || h != g_earFullH) return;  // frame size changed mid-session, skip
 
   if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, g_earRgbBuf)) {
