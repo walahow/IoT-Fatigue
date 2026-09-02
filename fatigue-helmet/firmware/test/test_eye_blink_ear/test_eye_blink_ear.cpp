@@ -79,6 +79,33 @@ void test_centroid_of_empty_mask_fails(void) {
     TEST_ASSERT_FALSE(found);
 }
 
+void test_lock_roi_ignores_outlier_via_median(void) {
+    float xs[5] = {10, 12, 11, 50, 11};  // index 3 is a bad single-frame misread
+    float ys[5] = {10, 9, 11, 50, 10};
+
+    EyeBlinkEAR::RoiLock roi;
+    bool ok = EyeBlinkEAR::lockRoiFromSamples(xs, ys, 5, 20, 100, 100, roi);
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(roi.locked);
+    // median x = 11, median y = 10 -> roi (size 20) centered there -> x=1, y=0
+    TEST_ASSERT_EQUAL_INT(1, roi.x);
+    TEST_ASSERT_EQUAL_INT(0, roi.y);
+    TEST_ASSERT_EQUAL_INT(20, roi.size);
+}
+
+void test_lock_roi_clamps_to_frame_bounds(void) {
+    float xs[3] = {2, 2, 2};
+    float ys[3] = {2, 2, 2};
+
+    EyeBlinkEAR::RoiLock roi;
+    bool ok = EyeBlinkEAR::lockRoiFromSamples(xs, ys, 3, 20, 100, 100, roi);
+
+    TEST_ASSERT_TRUE(ok);
+    TEST_ASSERT_TRUE(roi.x >= 0);
+    TEST_ASSERT_TRUE(roi.y >= 0);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
@@ -87,5 +114,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_ear_empty_mask_is_invalid);
     RUN_TEST(test_centroid_of_offset_blob);
     RUN_TEST(test_centroid_of_empty_mask_fails);
+    RUN_TEST(test_lock_roi_ignores_outlier_via_median);
+    RUN_TEST(test_lock_roi_clamps_to_frame_bounds);
     return UNITY_END();
 }

@@ -122,4 +122,49 @@ inline bool centroid(const uint8_t *mask, int w, int h, float &outCx, float &out
     return true;
 }
 
+struct RoiLock {
+    int x = 0;
+    int y = 0;
+    int size = 64;
+    bool locked = false;
+};
+
+// Median-based ROI lock: xs/ys are full-frame-coordinate centroid samples
+// gathered across several frames (some may be bad single-frame misreads --
+// the median absorbs those, unlike a mean). Mutates xs/ys in place (sorts
+// them) -- pass copies, not shared state. Clamps the resulting ROI to stay
+// within [0, frameW) x [0, frameH).
+inline bool lockRoiFromSamples(float *xs, float *ys, int n, int roiSize,
+                                int frameW, int frameH, RoiLock &out) {
+    if (n <= 0) return false;
+
+    for (int i = 1; i < n; i++) {
+        float kx = xs[i];
+        int j = i - 1;
+        while (j >= 0 && xs[j] > kx) { xs[j + 1] = xs[j]; j--; }
+        xs[j + 1] = kx;
+    }
+    for (int i = 1; i < n; i++) {
+        float ky = ys[i];
+        int j = i - 1;
+        while (j >= 0 && ys[j] > ky) { ys[j + 1] = ys[j]; j--; }
+        ys[j + 1] = ky;
+    }
+    float medCx = xs[n / 2];
+    float medCy = ys[n / 2];
+
+    int rx = (int)(medCx - roiSize / 2.0f);
+    int ry = (int)(medCy - roiSize / 2.0f);
+    if (rx + roiSize > frameW) rx = frameW - roiSize;
+    if (ry + roiSize > frameH) ry = frameH - roiSize;
+    if (rx < 0) rx = 0;
+    if (ry < 0) ry = 0;
+
+    out.x = rx;
+    out.y = ry;
+    out.size = roiSize;
+    out.locked = true;
+    return true;
+}
+
 }  // namespace EyeBlinkEAR
