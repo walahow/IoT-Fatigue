@@ -101,4 +101,25 @@ inline EarResult computeEAR(const uint8_t *mask, int w, int h) {
     return r;
 }
 
+// Centroid (center of mass) of the "on" pixels in a mask. Returns false
+// if the mask is empty. Coordinates are local to the given buffer (0..w,
+// 0..h) -- the caller maps them back to full-frame coordinates if the
+// buffer represents a sub-region.
+inline bool centroid(const uint8_t *mask, int w, int h, float &outCx, float &outCy) {
+    double m00 = 0, m10 = 0, m01 = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (mask[y * w + x]) {
+                m00 += 1.0;
+                m10 += x;
+                m01 += y;
+            }
+        }
+    }
+    if (m00 < 1.0) return false;
+    outCx = (float)(m10 / m00);
+    outCy = (float)(m01 / m00);
+    return true;
+}
+
 }  // namespace EyeBlinkEAR

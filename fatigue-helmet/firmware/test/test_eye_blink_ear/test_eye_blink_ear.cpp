@@ -57,11 +57,35 @@ void test_ear_empty_mask_is_invalid(void) {
     TEST_ASSERT_FALSE(r.valid);
 }
 
+void test_centroid_of_offset_blob(void) {
+    uint8_t mask[20 * 20];
+    fillEllipseMask(mask, 20, 20, 15, 5, 3, 3);
+
+    float cx = -1, cy = -1;
+    bool found = EyeBlinkEAR::centroid(mask, 20, 20, cx, cy);
+
+    TEST_ASSERT_TRUE(found);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 15.0f, cx);
+    TEST_ASSERT_FLOAT_WITHIN(0.5f, 5.0f, cy);
+}
+
+void test_centroid_of_empty_mask_fails(void) {
+    uint8_t mask[20 * 20];
+    memset(mask, 0, sizeof(mask));
+
+    float cx, cy;
+    bool found = EyeBlinkEAR::centroid(mask, 20, 20, cx, cy);
+
+    TEST_ASSERT_FALSE(found);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
     RUN_TEST(test_ear_round_blob_is_near_one);
     RUN_TEST(test_ear_squashed_blob_is_near_zero);
     RUN_TEST(test_ear_empty_mask_is_invalid);
+    RUN_TEST(test_centroid_of_offset_blob);
+    RUN_TEST(test_centroid_of_empty_mask_fails);
     return UNITY_END();
 }
