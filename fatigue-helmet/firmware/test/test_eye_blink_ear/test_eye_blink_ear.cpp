@@ -106,6 +106,24 @@ void test_lock_roi_clamps_to_frame_bounds(void) {
     TEST_ASSERT_TRUE(roi.y >= 0);
 }
 
+void test_drift_blend_accepts_small_shift(void) {
+    float outCx, outCy;
+    bool moved = EyeBlinkEAR::driftBlend(100.0f, 100.0f, 105.0f, 100.0f,
+                                          20.0f, 0.3f, outCx, outCy);
+
+    TEST_ASSERT_TRUE(moved);
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 101.5f, outCx);  // 100*0.7 + 105*0.3
+    TEST_ASSERT_FLOAT_WITHIN(0.01f, 100.0f, outCy);
+}
+
+void test_drift_blend_rejects_large_shift(void) {
+    float outCx, outCy;
+    bool moved = EyeBlinkEAR::driftBlend(100.0f, 100.0f, 200.0f, 100.0f,
+                                          20.0f, 0.3f, outCx, outCy);
+
+    TEST_ASSERT_FALSE(moved);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
@@ -116,5 +134,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_centroid_of_empty_mask_fails);
     RUN_TEST(test_lock_roi_ignores_outlier_via_median);
     RUN_TEST(test_lock_roi_clamps_to_frame_bounds);
+    RUN_TEST(test_drift_blend_accepts_small_shift);
+    RUN_TEST(test_drift_blend_rejects_large_shift);
     return UNITY_END();
 }

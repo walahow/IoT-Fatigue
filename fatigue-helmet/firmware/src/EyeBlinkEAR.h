@@ -167,4 +167,23 @@ inline bool lockRoiFromSamples(float *xs, float *ys, int n, int roiSize,
     return true;
 }
 
+// Given the ROI's current full-frame center and a freshly-measured
+// full-frame centroid, decides whether to nudge the ROI. Returns false
+// (caller should leave the ROI alone) if the shift is large enough to
+// look like noise (a blink, a shadow) rather than real drift -- otherwise
+// outCx/outCy are the EMA-blended new center for the caller to clamp and
+// apply.
+inline bool driftBlend(float curCx, float curCy, float newCx, float newCy,
+                        float maxDriftPx, float alpha,
+                        float &outCx, float &outCy) {
+    float dx = newCx - curCx;
+    float dy = newCy - curCy;
+    float shift = sqrtf(dx * dx + dy * dy);
+    if (shift >= maxDriftPx) return false;
+
+    outCx = curCx * (1.0f - alpha) + newCx * alpha;
+    outCy = curCy * (1.0f - alpha) + newCy * alpha;
+    return true;
+}
+
 }  // namespace EyeBlinkEAR
