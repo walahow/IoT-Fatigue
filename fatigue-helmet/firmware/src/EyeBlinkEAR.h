@@ -186,4 +186,93 @@ inline bool driftBlend(float curCx, float curCy, float newCx, float newCy,
     return true;
 }
 
+// Adaptive-baseline blink detector + 60s rolling rate. Mirrors
+// eye_ear.py's blink logic: baseline = 75th percentile of recent EAR,
+// blink fires when EAR drops below baseline * EAR_RATIO_THRESH, gated by
+// a warm-up period and a cooldown so one blink isn't counted twice.
+struct BlinkDetector {
+    static const int BASELINE_WINDOW = 30;
+    static const int COOLDOWN_SAMPLES = 6;
+    static const int WARMUP_SAMPLES = 24;
+    static constexpr float EAR_RATIO_THRESH = 0.70f;
+    static const int MAX_BLINKS_TRACKED = 60;
+
+    float history[BASELINE_WINDOW] = {0};
+    int historyCount = 0;
+    int historyHead = 0;
+    int sampleIndex = 0;
+    int cooldownRemaining = 0;
+    bool inBlinkRun = false;
+
+    uint32_t blinkTimestamps[MAX_BLINKS_TRACKED] = {0};
+    int blinkCount = 0;
+
+    float baseline() const {
+        if (historyCount == 0) return 1.0f;
+        float sorted[BASELINE_WINDOW];
+        int n = historyCount;
+        memcpy(sorted, history, n * sizeof(float));
+        for (int i = 1; i < n; i++) {
+            float key = sorted[i];
+            int j = i - 1;
+            while (j >= 0 && sorted[j] > key) { sorted[j + 1] = sorted[j]; j--; }
+            sorted[j + 1] = key;
+        }
+        int idx = (int)(n * 0.75f);
+        if (idx >= n) idx = n - 1;
+        return sorted[idx];
+    }
+
+    void pushBlinkTimestamp(uint32_t nowMs) {
+        if (blinkCount < MAX_BLINKS_TRACKED) {
+            blinkTimestamps[blinkCount++] = nowMs;
+        } else {
+            memmove(blinkTimestamps, blinkTimestamps + 1,
+                    (MAX_BLINKS_TRACKED - 1) * sizeof(uint32_t));
+            blinkTimestamps[MAX_BLINKS_TRACKED - 1] = nowMs;
+        }
+    }
+
+    // Returns true if this sample completed a blink event.
+    bool update(float ear, uint32_t nowMs) {
+        sampleIndex++;
+        float base = baseline();
+
+        history[historyHead] = ear;
+        historyHead = (historyHead + 1) % BASELINE_WINDOW;
+        if (historyCount < BASELINE_WINDOW) historyCount++;
+
+        bool blinkEvent = false;
+        if (sampleIndex > WARMUP_SAMPLES) {
+            if (cooldownRemaining > 0) {
+                cooldownRemaining--;
+            } else {
+                bool trigger = ear < base * EAR_RATIO_THRESH;
+                if (trigger && !inBlinkRun) {
+                    inBlinkRun = true;
+                } else if (!trigger && inBlinkRun) {
+                    inBlinkRun = false;
+                    blinkEvent = true;
+                    cooldownRemaining = COOLDOWN_SAMPLES;
+                    pushBlinkTimestamp(nowMs);
+                }
+            }
+        }
+        return blinkEvent;
+    }
+
+    // 60-second rolling rate in blinks/minute (one blink event per minute
+    // of trailing window == that many blinks/min by definition).
+    float rollingRateBpm(uint32_t nowMs) {
+        int evict = 0;
+        while (evict < blinkCount && (nowMs - blinkTimestamps[evict]) > 60000) evict++;
+        if (evict > 0) {
+            memmove(blinkTimestamps, blinkTimestamps + evict,
+                    (blinkCount - evict) * sizeof(uint32_t));
+            blinkCount -= evict;
+        }
+        return (float)blinkCount;
+    }
+};
+
 }  // namespace EyeBlinkEAR

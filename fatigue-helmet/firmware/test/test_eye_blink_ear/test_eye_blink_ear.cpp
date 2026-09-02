@@ -124,6 +124,64 @@ void test_drift_blend_rejects_large_shift(void) {
     TEST_ASSERT_FALSE(moved);
 }
 
+void test_baseline_is_75th_percentile(void) {
+    EyeBlinkEAR::BlinkDetector det;
+    float values[5] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f};
+    for (int i = 0; i < 5; i++) det.update(values[i], (uint32_t)(i * 100));
+
+    // sorted == same order here; idx = int(5*0.75) = 3 -> 0.4
+    TEST_ASSERT_FLOAT_WITHIN(0.001f, 0.4f, det.baseline());
+}
+
+void test_blink_detected_on_dip_and_recovery(void) {
+    EyeBlinkEAR::BlinkDetector det;
+    uint32_t t = 0;
+
+    // Warm up with stable "eye open" EAR so the baseline settles near 0.9.
+    for (int i = 0; i <= EyeBlinkEAR::BlinkDetector::WARMUP_SAMPLES; i++) {
+        bool evt = det.update(0.9f, t);
+        TEST_ASSERT_FALSE(evt);
+        t += 50;
+    }
+
+    bool duringDip = det.update(0.2f, t);  // below 0.9*0.7 = 0.63
+    t += 50;
+    TEST_ASSERT_FALSE(duringDip);  // blink run started, not yet completed
+
+    bool afterRecovery = det.update(0.9f, t);  // back above threshold
+    TEST_ASSERT_TRUE(afterRecovery);  // blink completes on recovery
+}
+
+void test_cooldown_prevents_double_count(void) {
+    EyeBlinkEAR::BlinkDetector det;
+    uint32_t t = 0;
+
+    for (int i = 0; i <= EyeBlinkEAR::BlinkDetector::WARMUP_SAMPLES; i++) {
+        det.update(0.9f, t);
+        t += 50;
+    }
+    det.update(0.2f, t); t += 50;
+    bool firstBlink = det.update(0.9f, t); t += 50;
+    TEST_ASSERT_TRUE(firstBlink);
+
+    // Dip again immediately, well within the cooldown window.
+    det.update(0.2f, t); t += 50;
+    bool secondAttempt = det.update(0.9f, t); t += 50;
+    TEST_ASSERT_FALSE(secondAttempt);  // suppressed by cooldown
+}
+
+void test_rolling_rate_evicts_old_blinks(void) {
+    EyeBlinkEAR::BlinkDetector det;
+    det.pushBlinkTimestamp(1000);
+    det.pushBlinkTimestamp(2000);
+
+    float rateNow = det.rollingRateBpm(30000);  // both within last 60s
+    TEST_ASSERT_EQUAL_FLOAT(2.0f, rateNow);
+
+    float rateLater = det.rollingRateBpm(70000);  // both now older than 60s
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, rateLater);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
@@ -136,5 +194,9 @@ int main(int argc, char **argv) {
     RUN_TEST(test_lock_roi_clamps_to_frame_bounds);
     RUN_TEST(test_drift_blend_accepts_small_shift);
     RUN_TEST(test_drift_blend_rejects_large_shift);
+    RUN_TEST(test_baseline_is_75th_percentile);
+    RUN_TEST(test_blink_detected_on_dip_and_recovery);
+    RUN_TEST(test_cooldown_prevents_double_count);
+    RUN_TEST(test_rolling_rate_evicts_old_blinks);
     return UNITY_END();
 }
