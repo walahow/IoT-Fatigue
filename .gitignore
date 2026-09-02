@@ -58,3 +58,6 @@ fatigue-helmet/python/sessions/
 *.idx
 *.zip
 dataset & teory/
+
+# Local git worktrees (superpowers:using-git-worktrees)
+.worktrees/
