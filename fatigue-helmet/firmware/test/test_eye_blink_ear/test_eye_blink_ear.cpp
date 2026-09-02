@@ -17,8 +17,51 @@ void test_otsu_separates_two_clusters(void) {
     for (int i = 50; i < 100; i++) TEST_ASSERT_TRUE(img[i] > threshold);
 }
 
+static void fillEllipseMask(uint8_t *mask, int w, int h, int cx, int cy, int rx, int ry) {
+    memset(mask, 0, (size_t)w * h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            double nx = (x - cx) / (double)rx;
+            double ny = (y - cy) / (double)ry;
+            if (nx * nx + ny * ny <= 1.0) mask[y * w + x] = 1;
+        }
+    }
+}
+
+void test_ear_round_blob_is_near_one(void) {
+    uint8_t mask[40 * 40];
+    fillEllipseMask(mask, 40, 40, 20, 20, 15, 15);
+
+    EyeBlinkEAR::EarResult r = EyeBlinkEAR::computeEAR(mask, 40, 40);
+
+    TEST_ASSERT_TRUE(r.valid);
+    TEST_ASSERT_TRUE(r.ear > 0.9f);
+}
+
+void test_ear_squashed_blob_is_near_zero(void) {
+    uint8_t mask[40 * 40];
+    fillEllipseMask(mask, 40, 40, 20, 20, 15, 4);
+
+    EyeBlinkEAR::EarResult r = EyeBlinkEAR::computeEAR(mask, 40, 40);
+
+    TEST_ASSERT_TRUE(r.valid);
+    TEST_ASSERT_TRUE(r.ear < 0.35f);
+}
+
+void test_ear_empty_mask_is_invalid(void) {
+    uint8_t mask[40 * 40];
+    memset(mask, 0, sizeof(mask));
+
+    EyeBlinkEAR::EarResult r = EyeBlinkEAR::computeEAR(mask, 40, 40);
+
+    TEST_ASSERT_FALSE(r.valid);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
+    RUN_TEST(test_ear_round_blob_is_near_one);
+    RUN_TEST(test_ear_squashed_blob_is_near_zero);
+    RUN_TEST(test_ear_empty_mask_is_invalid);
     return UNITY_END();
 }

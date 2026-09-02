@@ -43,4 +43,62 @@ inline uint8_t otsuThreshold(const uint8_t *gray, int w, int h) {
     return threshold;
 }
 
+struct EarResult {
+    bool valid;
+    float ear;    // sqrt(lambda_minor) / sqrt(lambda_major), 0..1
+    float major;  // sqrt(lambda_major), for diagnostics
+    float minor;  // sqrt(lambda_minor)
+};
+
+// EAR from second-order image moments of a binary mask (w*h, nonzero =
+// "on"/blob pixel) -- the minor/major axis ratio of the ellipse with the
+// same second moments as the blob. Equivalent to fitting an ellipse to
+// the blob's contour, without needing contour tracing at all.
+inline EarResult computeEAR(const uint8_t *mask, int w, int h) {
+    EarResult r = {false, 0.0f, 0.0f, 0.0f};
+
+    double m00 = 0, m10 = 0, m01 = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (mask[y * w + x]) {
+                m00 += 1.0;
+                m10 += x;
+                m01 += y;
+            }
+        }
+    }
+    if (m00 < 1.0) return r;  // empty mask
+
+    double cx = m10 / m00;
+    double cy = m01 / m00;
+
+    double mu20 = 0, mu02 = 0, mu11 = 0;
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            if (mask[y * w + x]) {
+                double dx = x - cx;
+                double dy = y - cy;
+                mu20 += dx * dx;
+                mu02 += dy * dy;
+                mu11 += dx * dy;
+            }
+        }
+    }
+    mu20 /= m00;
+    mu02 /= m00;
+    mu11 /= m00;
+
+    double trace = mu20 + mu02;
+    double diff = sqrt((mu20 - mu02) * (mu20 - mu02) + 4.0 * mu11 * mu11);
+    double lambdaMajor = (trace + diff) / 2.0;
+    double lambdaMinor = (trace - diff) / 2.0;
+    if (lambdaMinor < 0.0) lambdaMinor = 0.0;
+
+    r.major = (float)sqrt(lambdaMajor);
+    r.minor = (float)sqrt(lambdaMinor);
+    r.valid = true;
+    r.ear = (r.major > 1e-6f) ? (r.minor / r.major) : 0.0f;
+    return r;
+}
+
 }  // namespace EyeBlinkEAR
