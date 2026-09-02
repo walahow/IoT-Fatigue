@@ -46,6 +46,15 @@ MAGIC_EOF   = bytes([0xDD, 0xCC, 0xBB, 0xAA])
 HEADER_LEN  = 12   # SOF(4) + timestamp(4) + length(4)
 MAX_FRAME_B = 500_000  # safety cap: 500 KB to support VGA resolution frames
 
+# ── Sensor CSV ───────────────────────────────────────────────────────────────
+# Firmware currently emits 17 columns (see #HEADER: line in main.cpp):
+#   timestamp_ms, hr_bpm, pulse_raw, ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps,
+#   head_movement, signal_quality, blink_rate, pitch_deg, gyro_var, nod_score,
+#   risk_pct, alert_level
+# Rows are accepted on a MINIMUM count so that adding a firmware column does
+# not silently discard every row; the timestamp field must also be numeric.
+MIN_CSV_COLUMNS = 11
+
 # ── Session directory  ────────────────────────────────────────────────────────
 SESSIONS_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions')
 
@@ -88,9 +97,13 @@ def process_text(raw: bytes, csv_file, stats: dict) -> None:
         if line.startswith('#'):
             print(f'[ESP32] {line}')
         else:
-            # Validate CSV row format (11 columns) to reject startup/serial noise
+            # Validate CSV row to reject startup/serial noise.
+            # Checked by shape, not an exact column count: a hardcoded count
+            # silently drops every row whenever the firmware adds a field
+            # (this check read == 11 while the firmware emitted 17, so USB
+            # sessions recorded no sensor rows at all).
             parts = line.split(',')
-            if len(parts) == 11:
+            if len(parts) >= MIN_CSV_COLUMNS and parts[0].isdigit():
                 print(f'[DATA]  {line}')
                 csv_file.write(line + '\n')
                 csv_file.flush()

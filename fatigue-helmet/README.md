@@ -158,22 +158,41 @@ pip install -r requirements.txt
 
 ## 4. Recording a Session
 
+Recording depends on which firmware environment is flashed.
+
+**USB debug mode** (`esp32s3cam`) — sensor CSV *and* camera frames stream to the PC:
+
 ```bash
-python serial_logger.py
-# → prompts you to pick a COM port if --port is omitted
+python debug_recorder.py
+# → defaults to COM4 @ 921600 baud
 
-# Or specify everything:
-python serial_logger.py --port COM3 --output rested_morning_01.csv
+# Or specify:
+python debug_recorder.py --port COM3 --baud 921600
 ```
 
-The script prints live stats every 5 seconds:
+Each run creates its own session folder:
 
 ```
-[   30s]  lines=   300  HR= 72 BPM  pulse_raw=2341  signal=OK  duration=0.5 min
-[   35s]  lines=   350  HR= 73 BPM  pulse_raw=2489  signal=OK  duration=0.6 min
+sessions/session_001/
+    metadata.txt
+    sensor_data.csv
+    frames/{timestamp_ms}.jpg
 ```
 
-Stop recording with **Ctrl+C** — the CSV is flushed and closed cleanly.
+Stop with **Ctrl+C** — files are flushed and closed, then a summary prints:
+
+```
+[RECORDER] Session ended after 312.4s
+[RECORDER] CSV rows  : 312
+[RECORDER] Frames    : 6240
+[RECORDER] Bad frames: 0
+[RECORDER] Saved to  : sessions/session_001
+```
+
+**SD card mode** (`esp32s3cam_sd`) — no PC needed. The ESP32 writes
+`sensor_data.csv`, `video.mjpeg`, and `video.idx` straight to the card; press the
+GPIO 21 button to start/stop a session. Pull the card afterwards and use
+`unpack_session.py` or `mjpeg_to_mp4.py` to extract the video.
 
 ---
 
@@ -260,9 +279,16 @@ notes file with timestamps if the condition changed mid-session.
 
 ### Labelling Procedure
 
-1. After `serial_logger.py` finishes, open the CSV in a spreadsheet or text editor.
-2. Add the KSS score (or descriptive label) to the `label` column for all rows.
+1. After a session finishes, open its `sensor_data.csv` in a spreadsheet or text editor.
+2. Add a `label` column and fill in the KSS score (or descriptive label) for all rows.
+   The firmware does not emit this column — it is added by hand after recording.
 3. Save. The file is now ready for model training.
+
+**Note:** drop rows where `imu_valid` is `0` before computing IMU statistics. Those
+rows carry frozen last-known-good values held while IMU reads were suspended
+(buzzer sounding, or bus down), not fresh measurements — counting them treats one
+reading as several. Sessions recorded before that column existed have 17 columns
+and no validity flag.
 
 ### Recommended Dataset Size
 

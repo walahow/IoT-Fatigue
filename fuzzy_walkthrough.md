@@ -6,8 +6,10 @@ It is a companion document to [`thresholds_walkthrough.md`](thresholds_walkthrou
 
 **Implementation files:**
 - Python reference model: [`fatigue-helmet/python/fuzzy_model.py`](fatigue-helmet/python/fuzzy_model.py)
-- C++ firmware class: [`fatigue-helmet/firmware/src/FuzzyFatigue.h`](fatigue-helmet/firmware/src/FuzzyFatigue.h) *(in progress)*
-- Numerical verification: [`fatigue-helmet/python/scratch/fis_sim.py`](fatigue-helmet/python/scratch/fis_sim.py), [`fis_r4_diagnosis.py`](fatigue-helmet/python/scratch/fis_r4_diagnosis.py)
+- C++ firmware class: [`fatigue-helmet/firmware/src/FuzzyFatigue.h`](fatigue-helmet/firmware/src/FuzzyFatigue.h)
+- Numerical verification: `fatigue-helmet/python/scratch/fis_sim.py`, `fis_r4_diagnosis.py`
+  *(scratch scripts — not committed; the R4 FuzzyNOT result they produced is
+  recorded in §4 and in the rule-table comments in `FuzzyFatigue.h`)*
 
 ---
 

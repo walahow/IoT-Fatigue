@@ -59,11 +59,20 @@ def merge(session_path: str, tolerance_ms: int) -> None:
             )
 
     # ── Load CSVs ────────────────────────────────────────────────────────────
+    # NOTE: SD-card sessions are written headerless, so these names are matched
+    # POSITIONALLY. Keep in sync with the #HEADER: line in firmware/src/main.cpp,
+    # and only ever append new columns at the end.
+    #
+    # imu_valid (added after the 17-column sessions) marks whether that row's IMU
+    # fields are a live sample (1) or frozen last-known-good values held while
+    # reads were suspended (0) -- drop imu_valid == 0 rows before computing IMU
+    # statistics, or one held reading gets counted as several measurements.
     expected_sensor_cols = [
         "timestamp_ms", "hr_bpm", "pulse_raw",
         "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
         "head_movement", "signal_quality", "blink_rate",
-        "pitch_deg", "gyro_var", "nod_score", "risk_pct", "alert_level"
+        "pitch_deg", "gyro_var", "nod_score", "risk_pct", "alert_level",
+        "imu_valid"
     ]
     
     # Read the first line to check if it contains headers
@@ -82,7 +91,22 @@ def merge(session_path: str, tolerance_ms: int) -> None:
     else:
         print("[MERGE] sensor_data.csv appears to be headerless. Assigning default headers.")
         sensor_df = pd.read_csv(sensor_path, names=expected_sensor_cols)
-        
+
+    # Pre-imu_valid sessions (17 columns) leave imu_valid entirely NaN. That
+    # firmware signalled a failed IMU read by writing literal zeros rather than
+    # freezing the last-known-good sample, so the flag is recoverable: a row
+    # whose six IMU axes AND head_movement are all exactly 0 was not a live
+    # sample. Backfill it so old sessions match the 18-column schema and the
+    # "drop imu_valid == 0" rule above applies to them too.
+    if "imu_valid" in sensor_df.columns and sensor_df["imu_valid"].isna().all():
+        imu_axes = ["ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
+                    "head_movement"]
+        dead = (sensor_df[imu_axes] == 0).all(axis=1)
+        sensor_df["imu_valid"] = (~dead).astype(int)
+        print(f"[MERGE] imu_valid absent (pre-18-column session) - backfilled "
+              f"from all-zero IMU rows: {int(dead.sum())} invalid / "
+              f"{len(sensor_df)} rows")
+
     camera_df = pd.read_csv(camera_path)
 
     if "timestamp_ms" not in sensor_df.columns:

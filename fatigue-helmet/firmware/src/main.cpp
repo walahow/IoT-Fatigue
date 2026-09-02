@@ -161,6 +161,10 @@ const int NO_CONTACT_WARN_N = 10;
 MPU6050 mpu(MPU_ADDR);
 bool g_mpuEnabled = false;
 bool g_buzzerActive = false;
+// Mute the physical buzzer without breaking the I2C-suspend-during-EMI logic:
+// setBuzzerState() ANDs this in, so g_buzzerActive only goes true when the
+// pin is actually driven HIGH. Flip to false for real deployment.
+bool g_buzzerMuted = true;
 int16_t ax_off = 0, ay_off = 0, az_off = 0;
 int16_t gx_off = 0, gy_off = 0, gz_off = 0;
 
@@ -339,6 +343,11 @@ float g_imu_head_mov  = 0.0f;
 float g_imu_pitch_deg = 0.0f;
 float g_imu_gyro_var  = 0.0f;
 float g_imu_nod_score = 0.0f;
+// Freshness of the cached snapshot above: false while reads are suspended
+// (buzzer active) or the bus is down, meaning g_imu_* are frozen last-known-good
+// values rather than a live reading.
+bool     g_imuSampleValid   = false;
+uint32_t g_lastImuValidTime = 0;
 
 // ── 10 Hz ring buffer instances ───────────────────────────────────────────────
 NodDetector g_nodDet;    //  60 samples × 4 B =  240 B BSS
@@ -709,8 +718,11 @@ void blinkLED(int times) {
 }
 
 void setBuzzerState(bool active) {
-  (void)active;
-  digitalWrite(BUZZER_PIN, LOW); // Buzzer temporarily deactivated for testing
+  // g_buzzerMuted silences the pin for quiet testing, but g_buzzerActive still
+  // reflects real hardware state -- it only goes true when the buzzer is
+  // actually drawing power, which is exactly when I2C reads must be suspended.
+  g_buzzerActive = active && !g_buzzerMuted;
+  digitalWrite(BUZZER_PIN, g_buzzerActive ? HIGH : LOW);
 }
 
 void calibrateMPU() {
@@ -766,6 +778,39 @@ void calibrateMPU() {
   g_calibGrav[2] = (float)az_off;
   Serial.printf("#STATUS: Calib gravity vector: [%.0f, %.0f, %.0f] raw ADC\n",
                 g_calibGrav[0], g_calibGrav[1], g_calibGrav[2]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// tryInitMPU() — probe the two addresses an MPU-6050 can be strapped to
+// (0x68/0x69), validate WHO_AM_I, and configure ranges on success.
+// Returns the detected address, or 0 if not found / WHO_AM_I mismatch.
+// Does NOT calibrate — caller decides whether a (re)calibration is needed.
+// ─────────────────────────────────────────────────────────────────────────
+
+uint8_t tryInitMPU() {
+  uint8_t foundAddr = 0;
+  for (uint8_t addr = 0x68; addr <= 0x69; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      foundAddr = addr;
+      break;
+    }
+  }
+  if (foundAddr == 0) return 0;
+
+  mpu = MPU6050(foundAddr);
+  mpu.initialize();
+  uint8_t whoami = mpu.getDeviceID();
+  Serial.printf("#STATUS: MPU at 0x%02X WHO_AM_I = 0x%02X\n", foundAddr, whoami);
+  if (whoami != 0x68 && whoami != 0x69 && whoami != 0x38 &&
+      whoami != 0x70 && whoami != 0x72) {
+    return 0;
+  }
+
+  g_mpuEnabled = true;
+  mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
+  mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
+  return foundAddr;
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -857,33 +902,12 @@ void setup() {
   Wire.setClock(100000);
   Wire.setTimeOut(20);
 
-  uint8_t foundAddr = 0;
-  for (uint8_t addr = 0x68; addr <= 0x69; addr++) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) {
-      foundAddr = addr;
-      break;
-    }
-  }
-
-  if (foundAddr != 0) {
-    mpu = MPU6050(foundAddr);
-    mpu.initialize();
-    uint8_t whoami = mpu.getDeviceID();
-    Serial.printf("#STATUS: MPU at 0x%02X WHO_AM_I = 0x%02X\n", foundAddr, whoami);
-    if (whoami == 0x68 || whoami == 0x69 || whoami == 0x38 || whoami == 0x70 || whoami == 0x72) {
-      g_mpuEnabled = true;
-      mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-      mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-      Serial.println(F("#STATUS: MPU-6050 initialized OK"));
-      calibrateMPU();
-    } else {
-      g_mpuEnabled = false;
-      Serial.println(F("#WARN: MPU-6050 WHO_AM_I mismatch — running with IMU disabled"));
-    }
+  if (tryInitMPU() != 0) {
+    Serial.println(F("#STATUS: MPU-6050 initialized OK"));
+    calibrateMPU();
   } else {
     g_mpuEnabled = false;
-    Serial.println(F("#WARN: MPU-6050 not detected at 0x68/0x69 — running with IMU disabled"));
+    Serial.println(F("#WARN: MPU-6050 not detected/validated at 0x68/0x69 — running with IMU disabled"));
   }
 
   // ── SD card initialization (production mode) ─────────────────────────
@@ -904,7 +928,7 @@ void setup() {
   Serial.println(
       F("#HEADER:timestamp_ms,hr_bpm,pulse_raw,"
         "ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,head_movement,signal_quality,"
-        "blink_rate,pitch_deg,gyro_var,nod_score,risk_pct,alert_level"));
+        "blink_rate,pitch_deg,gyro_var,nod_score,risk_pct,alert_level,imu_valid"));
   Serial.println(F("#STATUS: Logging started"));
 
 #if defined(STORAGE_MODE_USB)
@@ -975,40 +999,42 @@ void loop() {
   if (now - lastImuTime >= 100) {   // 100 ms = 10 Hz
     lastImuTime = now;
 
-    // Initialize to calibration offsets. If the I2C bus crashes due to buzzer EMI,
-    // getMotion6 will fail and leave these untouched. By defaulting to calibration values,
-    // the system sees "0 movement, 0 pitch" instead of getting stuck on old data,
-    // immediately breaking the buzzer "Death Loop".
     // Auto-reconnect retry if IMU was not detected at boot or connection was lost
     static unsigned long lastImuRetry = 0;
     if (!g_mpuEnabled && (now - lastImuRetry >= 2000)) {
       lastImuRetry = now;
       Wire.begin(PIN_SDA, PIN_SCL);
       Wire.setClock(100000);
-      for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0) {
-          mpu = MPU6050(addr);
-          mpu.initialize();
-          uint8_t who = mpu.getDeviceID();
-          Serial.printf("#STATUS: Found I2C device at 0x%02X (WHO_AM_I = 0x%02X)\n", addr, who);
-          if (who == 0x68 || who == 0x69 || who == 0x38 || who == 0x70 || who == 0x72 || addr == 0x68 || addr == 0x69) {
-            g_mpuEnabled = true;
-            mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_2);
-            mpu.setFullScaleGyroRange(MPU6050_GYRO_FS_250);
-            if (ax_off == 0 && ay_off == 0 && az_off == 0) {
-              calibrateMPU();
-            } else {
-              Serial.printf("#STATUS: MPU-6050 I2C connection restored (address 0x%02X)\n", addr);
-            }
-            break;
-          }
+      uint8_t foundAddr = tryInitMPU();
+      if (foundAddr != 0) {
+        if (ax_off == 0 && ay_off == 0 && az_off == 0) {
+          calibrateMPU();
+        } else {
+          Serial.printf("#STATUS: MPU-6050 I2C connection restored (address 0x%02X)\n", foundAddr);
         }
       }
     }
 
-    int16_t ax_r10 = (int16_t)ax_off, ay_r10 = (int16_t)ay_off, az_r10 = (int16_t)az_off;
-    int16_t gx_r10 = (int16_t)gx_off, gy_r10 = (int16_t)gy_off, gz_r10 = (int16_t)gz_off;
+    // IMU reads are suspended while the buzzer draws current (EMI corrupts the
+    // I2C bus). Rather than substituting calibration offsets -- which resolve to
+    // an exact "0 deg pitch, 0 movement" upright-and-still reading -- we mark the
+    // sample invalid and FREEZE: no ring-buffer push, no g_imu_* update.
+    //
+    // Why not substitute zeros: a 2 s CRITICAL beep injects 20 fake samples into
+    // the 60-sample nod buffer (1/3 of it), collapsing pitch_Limp and suppressing
+    // the ZCR that drives nod_score. R3 -- the head-drop rule that fired the alarm
+    // -- then reads ~0, so the alarm erases its own trigger and self-cancels while
+    // the rider is still drooping. It also writes that fiction into the CSV at
+    // exactly the fatigue events the dataset exists to capture.
+    //
+    // Freezing is safe against the "death loop" the zeros were guarding against:
+    // the alert state machine caps buzzer on-time (2 s CRITICAL / 1 s WARNING) and
+    // forces a 3 s cooldown during which g_buzzerActive is false, so ~30 real
+    // samples land before any re-fire decision. A stuck alarm is structurally
+    // impossible regardless of what the frozen values held.
+    int16_t ax_r10 = 0, ay_r10 = 0, az_r10 = 0;
+    int16_t gx_r10 = 0, gy_r10 = 0, gz_r10 = 0;
+    bool imuSampleValid = false;
     if (g_mpuEnabled && !g_buzzerActive) {
       static int i2cErrorCount = 0;
       Wire.beginTransmission(MPU_ADDR);
@@ -1021,47 +1047,58 @@ void loop() {
       } else {
         i2cErrorCount = 0;
         mpu.getMotion6(&ax_r10, &ay_r10, &az_r10, &gx_r10, &gy_r10, &gz_r10);
+        imuSampleValid = true;
       }
     }
 
-    float ax_g10  = (ax_r10 - ax_off) / ACCEL_SCALE;
-    float ay_g10  = (ay_r10 - ay_off) / ACCEL_SCALE;
-    float az_g10  = (az_r10 - az_off) / ACCEL_SCALE;
-    float gx_dp10 = (gx_r10 - gx_off) / GYRO_SCALE;
-    float gy_dp10 = (gy_r10 - gy_off) / GYRO_SCALE;
-    float gz_dp10 = (gz_r10 - gz_off) / GYRO_SCALE;
-    float head_mov10 = sqrtf(gx_dp10*gx_dp10 + gy_dp10*gy_dp10 + gz_dp10*gz_dp10);
+    // Freeze on invalid sample: leave ring buffers and g_imu_* holding the last
+    // real reading. Buffers then contain 100% real data spanning a slightly
+    // longer wall-clock window, instead of real data diluted with fabrications.
+    if (imuSampleValid) {
+      float ax_g10  = (ax_r10 - ax_off) / ACCEL_SCALE;
+      float ay_g10  = (ay_r10 - ay_off) / ACCEL_SCALE;
+      float az_g10  = (az_r10 - az_off) / ACCEL_SCALE;
+      float gx_dp10 = (gx_r10 - gx_off) / GYRO_SCALE;
+      float gy_dp10 = (gy_r10 - gy_off) / GYRO_SCALE;
+      float gz_dp10 = (gz_r10 - gz_off) / GYRO_SCALE;
+      float head_mov10 = sqrtf(gx_dp10*gx_dp10 + gy_dp10*gy_dp10 + gz_dp10*gz_dp10);
 
-    // Pitch: dot-product angle between current accel and calibration gravity.
-    // Uses raw (un-offsetted) readings so the calibration reference frame is intact.
-    float gx_raw = (float)ax_r10;
-    float gy_raw = (float)ay_r10;
-    float gz_raw = (float)az_r10;
-    float dot    = g_calibGrav[0]*gx_raw + g_calibGrav[1]*gy_raw + g_calibGrav[2]*gz_raw;
-    float mag_c  = sqrtf(g_calibGrav[0]*g_calibGrav[0] +
-                         g_calibGrav[1]*g_calibGrav[1] +
-                         g_calibGrav[2]*g_calibGrav[2]);
-    float mag_n  = sqrtf(gx_raw*gx_raw + gy_raw*gy_raw + gz_raw*gz_raw);
-    float cos_a  = (mag_c > 1e-3f && mag_n > 1e-3f) ? dot / (mag_c * mag_n) : 1.0f;
-    if (cos_a >  1.0f) cos_a =  1.0f;
-    if (cos_a < -1.0f) cos_a = -1.0f;
-    float pitch10 = acosf(cos_a) * (180.0f / (float)M_PI);
+      // Pitch: dot-product angle between current accel and calibration gravity.
+      // Uses raw (un-offsetted) readings so the calibration reference frame is intact.
+      float gx_raw = (float)ax_r10;
+      float gy_raw = (float)ay_r10;
+      float gz_raw = (float)az_r10;
+      float dot    = g_calibGrav[0]*gx_raw + g_calibGrav[1]*gy_raw + g_calibGrav[2]*gz_raw;
+      float mag_c  = sqrtf(g_calibGrav[0]*g_calibGrav[0] +
+                           g_calibGrav[1]*g_calibGrav[1] +
+                           g_calibGrav[2]*g_calibGrav[2]);
+      float mag_n  = sqrtf(gx_raw*gx_raw + gy_raw*gy_raw + gz_raw*gz_raw);
+      float cos_a  = (mag_c > 1e-3f && mag_n > 1e-3f) ? dot / (mag_c * mag_n) : 1.0f;
+      if (cos_a >  1.0f) cos_a =  1.0f;
+      if (cos_a < -1.0f) cos_a = -1.0f;
+      float pitch10 = acosf(cos_a) * (180.0f / (float)M_PI);
 
-    // Push into ring buffers
-    g_nodDet.push(pitch10);
-    g_gyroVar.push(head_mov10);
+      // Push into ring buffers
+      g_nodDet.push(pitch10);
+      g_gyroVar.push(head_mov10);
 
-    // Cache latest snapshot for 1 Hz FIS tick and CSV
-    g_imu_ax_g      = ax_g10;
-    g_imu_ay_g      = ay_g10;
-    g_imu_az_g      = az_g10;
-    g_imu_gx_dp     = gx_dp10;
-    g_imu_gy_dp     = gy_dp10;
-    g_imu_gz_dp     = gz_dp10;
-    g_imu_head_mov  = head_mov10;
-    g_imu_pitch_deg = pitch10;
-    g_imu_gyro_var  = g_gyroVar.variance();
-    g_imu_nod_score = g_nodDet.score();
+      // Cache latest snapshot for 1 Hz FIS tick and CSV
+      g_imu_ax_g      = ax_g10;
+      g_imu_ay_g      = ay_g10;
+      g_imu_az_g      = az_g10;
+      g_imu_gx_dp     = gx_dp10;
+      g_imu_gy_dp     = gy_dp10;
+      g_imu_gz_dp     = gz_dp10;
+      g_imu_head_mov  = head_mov10;
+      g_imu_pitch_deg = pitch10;
+      g_imu_gyro_var  = g_gyroVar.variance();
+      g_imu_nod_score = g_nodDet.score();
+    }
+
+    // Track freshness for the 1 Hz CSV row so frozen samples are visibly stale
+    // rather than silently passed off as live readings.
+    g_imuSampleValid = imuSampleValid;
+    if (imuSampleValid) g_lastImuValidTime = now;
   }
 
   // ── CSV output: 1 Hz ───────────────────────────────────────────────────────────
@@ -1155,10 +1192,10 @@ void loop() {
       // Test mode: Beep buzzer for 200ms every 5 seconds
       static uint32_t lastTestBeep = 0;
       if (now - lastTestBeep >= 5000) {
-        digitalWrite(BUZZER_PIN, HIGH);
+        setBuzzerState(true);
         lastTestBeep = now;
       } else if (now - lastTestBeep >= 200) {
-        digitalWrite(BUZZER_PIN, LOW);
+        setBuzzerState(false);
       }
 #else
       // CRITICAL : 2s ON, 3s OFF (cooldown)
@@ -1166,7 +1203,6 @@ void loop() {
       // SAFE     : buzzer off.
 #if defined(STORAGE_MODE_USB)
       setBuzzerState(false);
-      g_buzzerActive = false;
 #else
       static uint32_t alertStartTime = 0;
       static bool alertActive = false;
@@ -1185,35 +1221,42 @@ void loop() {
           cooldownActive = true;
           cooldownStartTime = now;
           setBuzzerState(false);
-          g_buzzerActive = false;
+
+          // Buzzer just went silent -- try to reconnect right now instead of
+          // waiting up to 2 s for the periodic retry in the 10 Hz IMU block.
+          // Shrinks the "blind" window right after an alert, when detecting
+          // whether the driver actually woke up matters most.
+          Wire.begin(PIN_SDA, PIN_SCL);
+          Wire.setClock(100000);
+          tryInitMPU();
         } else {
           setBuzzerState(true);
-          g_buzzerActive = true;
         }
       } else {
         // Idle state - wait for new alert
-        if (g_alertLevel == ALERT_CRITICAL) {
+        if (g_alertLevel == ALERT_CRITICAL || g_alertLevel == ALERT_WARNING) {
+          // Force a fresh MPU reconnect/re-init right as the buzzer is about
+          // to start drawing current, so it enters the noisy window in a
+          // known-good state instead of whatever it drifted to since the
+          // last successful read. Cheap (a few I2C transactions, no delay())
+          // -- does NOT recalibrate, so it's safe to call every alert onset.
+          Wire.begin(PIN_SDA, PIN_SCL);
+          Wire.setClock(100000);
+          tryInitMPU();
+
           alertActive = true;
           alertStartTime = now;
-          currentAlertDuration = 2000;
+          currentAlertDuration = (g_alertLevel == ALERT_CRITICAL) ? 2000 : 1000;
           setBuzzerState(true);
-          g_buzzerActive = true;
-        } else if (g_alertLevel == ALERT_WARNING) {
-          alertActive = true;
-          alertStartTime = now;
-          currentAlertDuration = 1000;
-          setBuzzerState(true);
-          g_buzzerActive = true;
         } else {
           setBuzzerState(false);
-          g_buzzerActive = false;
         }
       }
 #endif
 #endif
     } else {
       // Keep buzzer quiet while paused (except for the start/stop beeps handled above)
-      digitalWrite(BUZZER_PIN, LOW);
+      setBuzzerState(false);
     }
   }
 
@@ -1258,8 +1301,16 @@ void loop() {
     Serial.print(g_imu_gy_dp, 1);
     Serial.print(F("  GZ:"));
     Serial.println(g_imu_gz_dp, 1);
-    Serial.printf("# BLINK:%.1f  PITCH:%.1fdeg  GVAR:%.0f  NOD:%.2f\n",
-                  g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var, g_imu_nod_score);
+    // "[FROZEN Nms]" marks IMU values held from the last good read (buzzer
+    // active or bus down) rather than sampled this tick -- so a suspicious
+    // pitch/nod reading during an alert can be told apart from a live one.
+    Serial.printf("# BLINK:%.1f  PITCH:%.1fdeg  GVAR:%.0f  NOD:%.2f%s",
+                  g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var, g_imu_nod_score,
+                  g_imuSampleValid ? "\n" : "");
+    if (!g_imuSampleValid) {
+      Serial.printf("  [FROZEN %lums]\n",
+                    (unsigned long)(now - g_lastImuValidTime));
+    }
     Serial.printf("# RISK:%.1f%%  ALERT:%s\n", g_riskScore, alertStr);
 
 #if defined(STORAGE_MODE_USB)
@@ -1267,7 +1318,11 @@ void loop() {
     if (g_sessionActive) {
       // Columns: timestamp_ms, hr_bpm, pulse_raw,
       //          ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, head_movement, signal_quality,
-      //          blink_rate, pitch_deg, gyro_var, nod_score, risk_pct, alert_level
+      //          blink_rate, pitch_deg, gyro_var, nod_score, risk_pct, alert_level,
+      //          imu_valid
+      // imu_valid=0 marks a row whose IMU fields are frozen last-known-good
+      // values (reads suspended during buzzer, or bus down) rather than a live
+      // sample -- exclude those rows from IMU statistics during analysis.
       Serial.print(now);                Serial.print(',');
       Serial.print(hr_out);             Serial.print(',');
       Serial.print(lastPulseRaw);       Serial.print(',');
@@ -1284,7 +1339,8 @@ void loop() {
       Serial.print(g_imu_gyro_var, 1); Serial.print(',');
       Serial.print(g_imu_nod_score, 3); Serial.print(',');
       Serial.print(g_riskScore, 2);    Serial.print(',');
-      Serial.println(g_alertLevel);
+      Serial.print(g_alertLevel);      Serial.print(',');
+      Serial.println(g_imuSampleValid ? 1 : 0);
     }
 #endif
 
@@ -1298,13 +1354,14 @@ void loop() {
   if (g_sdReady && g_csvFile && g_sessionActive) {
     if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       g_csvFile.printf(
-        "%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.2f,%.1f,%.3f,%.2f,%d\n",
+        "%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.2f,%.1f,%.3f,%.2f,%d,%d\n",
         now, hr_out, lastPulseRaw,
         g_imu_ax_g, g_imu_ay_g, g_imu_az_g,
         g_imu_gx_dp, g_imu_gy_dp, g_imu_gz_dp,
         g_imu_head_mov, lastSignalQuality,
         g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var,
-        g_imu_nod_score, g_riskScore, (int)g_alertLevel);
+        g_imu_nod_score, g_riskScore, (int)g_alertLevel,
+        g_imuSampleValid ? 1 : 0);
       g_csvFile.flush();
       xSemaphoreGive(g_sdMutex);
     }

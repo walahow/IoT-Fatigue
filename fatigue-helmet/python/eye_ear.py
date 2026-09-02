@@ -144,6 +144,38 @@ CSV_COLUMNS = [
 
 # ── Core offline processor ────────────────────────────────────────────────────
 
+def _lock_roi(frame_folder, frame_files, clahe, cascade,
+              scale_factor, min_neighbors, rotate_deg, no_enhance):
+    """Phase 1: average the first LOCK_FRAMES Haar hits into one fixed ROI."""
+    lock_detections = []
+    lock_frames_to_use = min(LOCK_FRAMES, len(frame_files))
+
+    for fname in frame_files[:lock_frames_to_use]:
+        img = cv2.imread(os.path.join(frame_folder, fname))
+        if img is None: continue
+        if rotate_deg == 90: img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        elif rotate_deg == 180: img = cv2.rotate(img, cv2.ROTATE_180)
+        elif rotate_deg == 270: img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        img = adjust_gamma(img, gamma=2.0)
+        enh  = img if no_enhance else enhance_frame(img, clahe)
+        gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
+        bbox = detect_eye(gray, cascade, scale_factor, min_neighbors)
+        if bbox is not None:
+            lock_detections.append(bbox)
+
+    if not lock_detections:
+        print("[EYE_EAR] WARNING: Could not lock ROI — falling back to per-frame Haar.")
+        locked_bbox = None
+    else:
+        lx = int(np.median([b[0] for b in lock_detections]))
+        ly = int(np.median([b[1] for b in lock_detections]))
+        lw = int(np.median([b[2] for b in lock_detections]))
+        lh = int(np.median([b[3] for b in lock_detections]))
+        locked_bbox = (lx, ly, lw, lh)
+        print(f"[EYE_EAR] ROI locked  : x={lx} y={ly} w={lw} h={lh}")
+    return locked_bbox
+
+
 def process_folder(
     session_path: str,
     clahe_clip: float = CLAHE_CLIP_DEFAULT,
@@ -159,6 +191,7 @@ def process_folder(
     verbose: bool     = False,
     no_enhance: bool  = False,
     max_frames: int | None = None,
+    roi: tuple[int, int, int, int] | None = None,
 ) -> None:
     frame_folder = os.path.join(session_path, "frames")
     preview_mode = max_frames is not None
@@ -192,32 +225,16 @@ def process_folder(
         sys.exit("[ERROR] Could not load haarcascade_eye.xml")
 
     # ── Phase 1: ROI lock ─────────────────────────────────────────────────────
-    lock_detections = []
-    lock_frames_to_use = min(LOCK_FRAMES, len(frame_files))
-
-    for fname in frame_files[:lock_frames_to_use]:
-        img = cv2.imread(os.path.join(frame_folder, fname))
-        if img is None: continue
-        if rotate_deg == 90: img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        elif rotate_deg == 180: img = cv2.rotate(img, cv2.ROTATE_180)
-        elif rotate_deg == 270: img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        img = adjust_gamma(img, gamma=2.0)
-        enh  = img if no_enhance else enhance_frame(img, clahe)
-        gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
-        bbox = detect_eye(gray, cascade, scale_factor, min_neighbors)
-        if bbox is not None:
-            lock_detections.append(bbox)
-
-    if not lock_detections:
-        print("[EYE_EAR] WARNING: Could not lock ROI — falling back to per-frame Haar.")
-        locked_bbox = None
+    # A manual --roi skips Phase 1 entirely. Needed when the Haar lock latches
+    # onto a non-eye feature (brow shadow, nose bridge) in the first LOCK_FRAMES
+    # and no scale-factor / min-neighbors combination shakes it loose.
+    if roi is not None:
+        locked_bbox = roi
+        print(f"[EYE_EAR] ROI manual  : x={roi[0]} y={roi[1]} w={roi[2]} h={roi[3]} "
+              f"(Haar lock + drift check disabled)")
     else:
-        lx = int(np.median([b[0] for b in lock_detections]))
-        ly = int(np.median([b[1] for b in lock_detections]))
-        lw = int(np.median([b[2] for b in lock_detections]))
-        lh = int(np.median([b[3] for b in lock_detections]))
-        locked_bbox = (lx, ly, lw, lh)
-        print(f"[EYE_EAR] ROI locked  : x={lx} y={ly} w={lw} h={lh}")
+        locked_bbox = _lock_roi(frame_folder, frame_files, clahe, cascade,
+                                scale_factor, min_neighbors, rotate_deg, no_enhance)
 
     # ── Phase 2: Run ──────────────────────────────────────────────────────────
     blink_count     = 0
@@ -257,7 +274,8 @@ def process_folder(
             enh  = img if no_enhance else enhance_frame(img, clahe)
             gray = cv2.cvtColor(enh, cv2.COLOR_BGR2GRAY)
 
-            if current_bbox is not None and frame_idx > 0 and frame_idx % DRIFT_CHECK_FREQ == 0:
+            if (roi is None and current_bbox is not None
+                    and frame_idx > 0 and frame_idx % DRIFT_CHECK_FREQ == 0):
                 drift_bbox = detect_eye(gray, cascade, scale_factor, min_neighbors)
                 if drift_bbox is not None:
                     shift = math.hypot(drift_bbox[0] - current_bbox[0], drift_bbox[1] - current_bbox[1])
@@ -377,6 +395,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ear-blink-drop",   type=float, default=0.0, metavar="F",
                    help="Minimum EAR velocity drop required to count a blink (default: 0.0).")
     p.add_argument("--blink-consec-min", type=int, default=BLINK_CONSEC_MIN_DEFAULT, metavar="N")
+    p.add_argument("--roi", metavar="X,Y,W,H", default=None,
+                   help="Skip the Haar ROI lock and crop this fixed box every frame. "
+                        "Use when the auto-lock latches onto a non-eye feature.")
     p.add_argument("--rotate", type=int, choices=[0, 90, 180, 270], default=0,
                    help="Rotate frames by N degrees clockwise before processing.")
     p.add_argument("--rotate-180", action="store_true",
@@ -394,6 +415,15 @@ def main() -> None:
     if not os.path.isdir(args.session):
         sys.exit(f"[ERROR] Session directory not found: {args.session}")
 
+    roi = None
+    if args.roi:
+        try:
+            roi = tuple(int(v) for v in args.roi.split(","))
+        except ValueError:
+            roi = None
+        if roi is None or len(roi) != 4 or roi[2] <= 0 or roi[3] <= 0:
+            sys.exit("[ERROR] --roi must be four integers X,Y,W,H with W and H > 0.")
+
     process_folder(
         session_path=args.session,
         clahe_clip=args.clahe_clip,
@@ -409,6 +439,7 @@ def main() -> None:
         verbose=args.verbose,
         no_enhance=args.no_enhance,
         max_frames=args.preview,
+        roi=roi,
     )
 
 
