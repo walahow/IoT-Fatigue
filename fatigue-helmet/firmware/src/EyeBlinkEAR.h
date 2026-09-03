@@ -122,6 +122,87 @@ inline bool centroid(const uint8_t *mask, int w, int h, float &outCx, float &out
     return true;
 }
 
+// Finds the winSize x winSize window with the highest count of "on" pixels
+// (the densest concentration of below-threshold pixels) within a mask, using
+// a separable two-pass box filter (row sums, then column sums) instead of a
+// full summed-area table -- every intermediate sum stays bounded by
+// winSize*winSize, so a 16-bit scratch buffer is enough even for a
+// full-frame-sized search region, with no wide (32-bit) integral image
+// needed.
+//
+// This is more fragmentation-tolerant than a bare centroid() call: a real
+// pupil that breaks into a few small disconnected speckles (JPEG noise)
+// still scores highly as long as the speckles fall within one window,
+// without needing connected-component labeling (which would need
+// unbounded-size queues/label buffers to implement safely on a
+// microcontroller). It also naturally prefers a small compact dark region
+// (a pupil) over a larger, more diffuse dark region (a shadow) of similar
+// or even lower average darkness, since the diffuse region rarely packs as
+// many "on" pixels into one small window as a solid compact blob does.
+//
+// rowSumScratch must be caller-provided, at least w*h uint16_t entries.
+// strideX/strideY (>=1) skip candidate window positions to trade thoroughness
+// for speed -- 1 checks every position, larger values check fewer.
+// Returns false if no window has any "on" pixels at all, or if winSize
+// doesn't fit within w/h.
+inline bool findDarkestWindow(const uint8_t *mask, int w, int h, int winSize,
+                               int strideX, int strideY,
+                               uint16_t *rowSumScratch,
+                               float &outCx, float &outCy) {
+    if (winSize <= 0 || winSize > w || winSize > h) return false;
+    if (strideX < 1) strideX = 1;
+    if (strideY < 1) strideY = 1;
+
+    // Pass 1: rowSumScratch[y*w + x] = sum of mask[y][x .. x+winSize)
+    for (int y = 0; y < h; y++) {
+        uint16_t sum = 0;
+        for (int x = 0; x < winSize; x++) sum = (uint16_t)(sum + mask[y * w + x]);
+        rowSumScratch[y * w + 0] = sum;
+        for (int x = 1; x <= w - winSize; x++) {
+            sum = (uint16_t)(sum - mask[y * w + (x - 1)] + mask[y * w + (x - 1 + winSize)]);
+            rowSumScratch[y * w + x] = sum;
+        }
+    }
+
+    // Pass 2: slide winSize-tall column sums over the row sums, tracking the
+    // best (x, y) top-left window position seen.
+    int lastX = w - winSize;
+    int lastY = h - winSize;
+    int bestX = -1, bestY = -1;
+    uint32_t bestSum = 0;
+
+    for (int x = 0; x <= lastX; x += strideX) {
+        uint32_t colSum = 0;
+        for (int y = 0; y < winSize; y++) colSum += rowSumScratch[y * w + x];
+        if (colSum > bestSum) { bestSum = colSum; bestX = x; bestY = 0; }
+        for (int y = 1; y <= lastY; y++) {
+            colSum = colSum - rowSumScratch[(y - 1) * w + x] + rowSumScratch[(y - 1 + winSize) * w + x];
+            if ((y % strideY) == 0 && colSum > bestSum) { bestSum = colSum; bestX = x; bestY = y; }
+        }
+    }
+
+    if (bestX < 0 || bestSum == 0) return false;
+
+    // Refine: centroid of the "on" pixels within the winning window only
+    // (full-buffer coordinates), not the whole window's geometric center.
+    double sx = 0, sy = 0;
+    int cnt = 0;
+    for (int y = 0; y < winSize; y++) {
+        for (int x = 0; x < winSize; x++) {
+            if (mask[(bestY + y) * w + (bestX + x)]) {
+                sx += bestX + x;
+                sy += bestY + y;
+                cnt++;
+            }
+        }
+    }
+    if (cnt == 0) return false;
+
+    outCx = (float)(sx / cnt);
+    outCy = (float)(sy / cnt);
+    return true;
+}
+
 struct RoiLock {
     int x = 0;
     int y = 0;

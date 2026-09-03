@@ -182,6 +182,71 @@ void test_rolling_rate_evicts_old_blinks(void) {
     TEST_ASSERT_EQUAL_FLOAT(0.0f, rateLater);
 }
 
+void test_darkest_window_prefers_compact_blob_over_diffuse_region(void) {
+    const int W = 40, H = 40;
+    uint8_t mask[W * H];
+    memset(mask, 0, sizeof(mask));
+
+    // Diffuse region: sparse grid over a big area -- best 8x8 window here
+    // contains at most 4x4=16 "on" pixels (spacing 2 in both axes).
+    for (int y = 0; y < 32; y += 2) {
+        for (int x = 0; x < 32; x += 2) {
+            mask[y * W + x] = 1;
+        }
+    }
+    // Compact blob: solid 6x6 block -- an 8x8 window can fully contain it,
+    // scoring 36 "on" pixels, beating the diffuse region's best of 16.
+    for (int y = 33; y < 39; y++) {
+        for (int x = 33; x < 39; x++) {
+            mask[y * W + x] = 1;
+        }
+    }
+
+    uint16_t rowSumScratch[W * H];
+    float cx, cy;
+    bool found = EyeBlinkEAR::findDarkestWindow(mask, W, H, 8, 1, 1, rowSumScratch, cx, cy);
+
+    TEST_ASSERT_TRUE(found);
+    // Centroid should land inside/near the compact blob (33..39), not the
+    // diffuse region (0..32).
+    TEST_ASSERT_TRUE(cx > 30.0f);
+    TEST_ASSERT_TRUE(cy > 30.0f);
+}
+
+void test_darkest_window_aggregates_fragmented_speckles(void) {
+    const int W = 30, H = 30;
+    uint8_t mask[W * H];
+    memset(mask, 0, sizeof(mask));
+
+    // Three small disconnected fragments close together (simulating JPEG
+    // noise breaking up a real pupil into pieces) -- no other dark pixels
+    // anywhere else in the buffer.
+    mask[10 * W + 10] = 1;
+    mask[11 * W + 13] = 1;
+    mask[14 * W + 11] = 1;
+    mask[14 * W + 12] = 1;
+
+    uint16_t rowSumScratch[W * H];
+    float cx, cy;
+    bool found = EyeBlinkEAR::findDarkestWindow(mask, W, H, 10, 1, 1, rowSumScratch, cx, cy);
+
+    TEST_ASSERT_TRUE(found);
+    TEST_ASSERT_FLOAT_WITHIN(3.0f, 11.5f, cx);
+    TEST_ASSERT_FLOAT_WITHIN(3.0f, 12.0f, cy);
+}
+
+void test_darkest_window_empty_mask_fails(void) {
+    const int W = 20, H = 20;
+    uint8_t mask[W * H];
+    memset(mask, 0, sizeof(mask));
+
+    uint16_t rowSumScratch[W * H];
+    float cx, cy;
+    bool found = EyeBlinkEAR::findDarkestWindow(mask, W, H, 6, 1, 1, rowSumScratch, cx, cy);
+
+    TEST_ASSERT_FALSE(found);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
@@ -198,5 +263,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_blink_detected_on_dip_and_recovery);
     RUN_TEST(test_cooldown_prevents_double_count);
     RUN_TEST(test_rolling_rate_evicts_old_blinks);
+    RUN_TEST(test_darkest_window_prefers_compact_blob_over_diffuse_region);
+    RUN_TEST(test_darkest_window_aggregates_fragmented_speckles);
+    RUN_TEST(test_darkest_window_empty_mask_fails);
     return UNITY_END();
 }
