@@ -52,6 +52,16 @@ static const float    EAR_LOCK_PERCENTILE  = 10.0f;
 static const int      EAR_LOCK_WIN_SIZE    = 22;   // ~pupil diameter at this resolution
 static const int      EAR_LOCK_STRIDE      = 2;
 static const uint32_t EAR_LOCK_WARMUP_MS   = 2000; // let the subject settle before sampling
+static const int      EAR_DRIFT_BURST      = 8;    // samples per drift-check (median, not single-frame)
+// Drift-correction is validated as noise-resistant on its own (median-of-8,
+// two-burst confirmation), but retrospective validation against session_023
+// found it can confidently track hair occluding the camera later in this
+// specific session, since hair is a genuinely darker/more stable feature
+// than the eye once it's in frame -- a different problem (occlusion) than
+// what drift-correction was built to solve (real small physical drift).
+// Disabled for now: ship the validated boot-lock, frozen for the session,
+// and revisit occlusion-robust drift as a separate piece of work.
+static const bool     EAR_DRIFT_ENABLED    = false;
 
 // ── Same helpers as main.cpp (byte-identical logic) ────────────────────────
 static void earExtractGray(const uint8_t *rgb, int fullW, int fullH,
@@ -142,6 +152,10 @@ int main(int argc, char **argv) {
 
   uint32_t earFrameCounter = 0;
   uint32_t earDriftCounter = 0;
+  bool driftBursting = false;
+  std::vector<float> driftSamplesX, driftSamplesY;
+  bool havePendingCandidate = false;
+  float pendingCandidateX = 0, pendingCandidateY = 0;
 
   std::vector<float> lockSamplesX, lockSamplesY;
   bool earLockDone = false;
@@ -211,7 +225,21 @@ int main(int argc, char **argv) {
                roi.x, roi.y, roi.size, f.timestampMs);
       }
     } else {
-      if (++earDriftCounter % EAR_DRIFT_PERIOD == 0) {
+      // Periodic drift check: a SINGLE findDarkestWindow sample is too noisy
+      // to trust on its own (validated against session_023: every single
+      // per-frame drift sample landed 20-70px from the current ROI, purely
+      // from single-frame search noise, so the shift gate rejected every
+      // one -- the ROI never moved once in the whole 9-minute session, even
+      // though it clearly should have). Same fix as the boot-lock: gather a
+      // small burst of samples and use their median instead of one frame.
+      ++earDriftCounter;
+      if (EAR_DRIFT_ENABLED && !driftBursting && earDriftCounter % EAR_DRIFT_PERIOD == 0) {
+        driftBursting = true;
+        driftSamplesX.clear();
+        driftSamplesY.clear();
+      }
+
+      if (driftBursting) {
         int dx = roi.x - EAR_DRIFT_MARGIN;
         int dy = roi.y - EAR_DRIFT_MARGIN;
         int dw = roi.size + 2 * EAR_DRIFT_MARGIN;
@@ -224,15 +252,64 @@ int main(int argc, char **argv) {
         if (EyeBlinkEAR::findDarkestWindow(earMaskBuf, dw, dh, EAR_LOCK_WIN_SIZE,
                                             EAR_LOCK_STRIDE, EAR_LOCK_STRIDE,
                                             earRowSumBuf, localCx, localCy)) {
-          float newFullCx = dx + localCx;
-          float newFullCy = dy + localCy;
+          driftSamplesX.push_back(dx + localCx);
+          driftSamplesY.push_back(dy + localCy);
+        }
+
+        if ((int)driftSamplesX.size() >= EAR_DRIFT_BURST) {
+          driftBursting = false;
+
+          std::vector<float> sortedX = driftSamplesX, sortedY = driftSamplesY;
+          std::sort(sortedX.begin(), sortedX.end());
+          std::sort(sortedY.begin(), sortedY.end());
+          float newFullCx = sortedX[sortedX.size() / 2];
+          float newFullCy = sortedY[sortedY.size() / 2];
+
           float curCx = roi.x + roi.size / 2.0f;
           float curCy = roi.y + roi.size / 2.0f;
+          float medShift = sqrtf((newFullCx - curCx) * (newFullCx - curCx) +
+                                  (newFullCy - curCy) * (newFullCy - curCy));
+          fprintf(stderr, "DRIFTBURST ts=%u cur=(%.1f,%.1f) median=(%.1f,%.1f) shift=%.1f  samples: ",
+                  f.timestampMs, curCx, curCy, newFullCx, newFullCy, medShift);
+          for (size_t i = 0; i < driftSamplesX.size(); i++) {
+            fprintf(stderr, "(%.0f,%.0f) ", driftSamplesX[i], driftSamplesY[i]);
+          }
+          fprintf(stderr, "\n");
 
-          float blendedCx, blendedCy;
+          float blendedCx = 0, blendedCy = 0;
+          bool apply = false;
+
           if (EyeBlinkEAR::driftBlend(curCx, curCy, newFullCx, newFullCy,
                                        EAR_DRIFT_MAX_PX, EAR_DRIFT_ALPHA,
                                        blendedCx, blendedCy)) {
+            // Small shift from the current ROI -- trust it immediately.
+            apply = true;
+            havePendingCandidate = false;
+          } else {
+            // Large shift from the current ROI. Don't trust a single burst
+            // this far off (could be the eye closed mid-blink, a shadow,
+            // etc.) -- but if an EARLIER, INDEPENDENT burst already found
+            // a closely-agreeing position, two independent confirmations
+            // is real signal, not noise. Apply the full correction then.
+            float agreeShift = 1e9f;
+            if (havePendingCandidate) {
+              float ddx = newFullCx - pendingCandidateX;
+              float ddy = newFullCy - pendingCandidateY;
+              agreeShift = sqrtf(ddx * ddx + ddy * ddy);
+            }
+            if (havePendingCandidate && agreeShift < EAR_DRIFT_MAX_PX) {
+              blendedCx = newFullCx;
+              blendedCy = newFullCy;
+              apply = true;
+              havePendingCandidate = false;
+            } else {
+              pendingCandidateX = newFullCx;
+              pendingCandidateY = newFullCy;
+              havePendingCandidate = true;
+            }
+          }
+
+          if (apply) {
             int rx = (int)(blendedCx - roi.size / 2.0f);
             int ry = (int)(blendedCy - roi.size / 2.0f);
             if (rx + roi.size > w) rx = w - roi.size;
@@ -241,6 +318,7 @@ int main(int argc, char **argv) {
             if (ry < 0) ry = 0;
             roi.x = rx;
             roi.y = ry;
+            fprintf(stderr, "  -> APPLIED new roi=(%d,%d)\n", roi.x, roi.y);
           }
         }
       }
