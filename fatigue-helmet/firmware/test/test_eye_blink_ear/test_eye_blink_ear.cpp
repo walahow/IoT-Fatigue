@@ -182,6 +182,17 @@ void test_rolling_rate_evicts_old_blinks(void) {
     TEST_ASSERT_EQUAL_FLOAT(0.0f, rateLater);
 }
 
+void test_percentile_threshold_isolates_darkest_fraction(void) {
+    uint8_t img[100];
+    for (int i = 0; i < 10; i++) img[i] = 5;     // darkest 10 pixels
+    for (int i = 10; i < 100; i++) img[i] = 200; // remaining 90, bright
+
+    uint8_t threshold = EyeBlinkEAR::percentileThreshold(img, 100, 1, 10.0f);
+
+    for (int i = 0; i < 10; i++) TEST_ASSERT_TRUE(img[i] <= threshold);
+    for (int i = 10; i < 100; i++) TEST_ASSERT_TRUE(img[i] > threshold);
+}
+
 void test_darkest_window_prefers_compact_blob_over_diffuse_region(void) {
     const int W = 40, H = 40;
     uint8_t mask[W * H];
@@ -263,6 +274,7 @@ int main(int argc, char **argv) {
     RUN_TEST(test_blink_detected_on_dip_and_recovery);
     RUN_TEST(test_cooldown_prevents_double_count);
     RUN_TEST(test_rolling_rate_evicts_old_blinks);
+    RUN_TEST(test_percentile_threshold_isolates_darkest_fraction);
     RUN_TEST(test_darkest_window_prefers_compact_blob_over_diffuse_region);
     RUN_TEST(test_darkest_window_aggregates_fragmented_speckles);
     RUN_TEST(test_darkest_window_empty_mask_fails);

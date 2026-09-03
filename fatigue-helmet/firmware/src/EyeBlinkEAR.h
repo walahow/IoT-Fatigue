@@ -101,6 +101,31 @@ inline EarResult computeEAR(const uint8_t *mask, int w, int h) {
     return r;
 }
 
+// Threshold that isolates the darkest `percentile` percent of pixels (e.g.
+// 10.0 for the darkest 10%), rather than Otsu's variance-maximizing ~50/50
+// split. Used for pupil localization (findDarkestWindow's input mask), where
+// we specifically want only the most extreme dark pixels -- the pupil is
+// usually much darker than surrounding shadow/skin -- not a generic
+// foreground/background split. Otsu's wider net was found (via retrospective
+// validation against a real session) to let a large diffuse shadow region
+// dominate a small genuinely-dark pupil.
+inline uint8_t percentileThreshold(const uint8_t *gray, int w, int h, float percentile) {
+    uint32_t hist[256] = {0};
+    int total = w * h;
+    for (int i = 0; i < total; i++) hist[gray[i]]++;
+
+    if (percentile < 0.0f) percentile = 0.0f;
+    if (percentile > 100.0f) percentile = 100.0f;
+    long targetCount = (long)((percentile / 100.0f) * (float)total);
+
+    long cumulative = 0;
+    for (int t = 0; t < 256; t++) {
+        cumulative += hist[t];
+        if (cumulative >= targetCount) return (uint8_t)t;
+    }
+    return 255;
+}
+
 // Centroid (center of mass) of the "on" pixels in a mask. Returns false
 // if the mask is empty. Coordinates are local to the given buffer (0..w,
 // 0..h) -- the caller maps them back to full-frame coordinates if the
