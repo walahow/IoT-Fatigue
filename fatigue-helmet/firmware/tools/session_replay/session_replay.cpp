@@ -36,8 +36,8 @@
 #include "../../src/EyeBlinkEAR.h"
 
 // ── Same constants as main.cpp's processEarFrame() integration ────────────
-static const int   EAR_THROTTLE_DIV = 3;
-static const int   EAR_ROI_SIZE     = 64;
+static const int   EAR_THROTTLE_DIV = 1;   // every frame, matches main.cpp
+static const int   EAR_ROI_SIZE     = 48;  // QVGA, matches main.cpp
 static const int   EAR_DRIFT_PERIOD = 40;
 static const int   EAR_DRIFT_MARGIN = 30;
 static const float EAR_DRIFT_MAX_PX = 20.0f;
@@ -62,6 +62,14 @@ static const int      EAR_DRIFT_BURST      = 8;    // samples per drift-check (m
 // Disabled for now: ship the validated boot-lock, frozen for the session,
 // and revisit occlusion-robust drift as a separate piece of work.
 static const bool     EAR_DRIFT_ENABLED    = false;
+
+// ── Motion-based localization (alternative to the darkest-blob boot lock) ──
+// Validated on session_023 at decimated resolution: 60 frames is enough and
+// scores better than longer windows; confidence (peak/mean) separates a real
+// eye lock from a smeared/flat map.
+static const int   EAR_MOTION_MIN_FRAMES = 60;    // ~3 s at 20 fps
+static const float EAR_MOTION_MIN_CONF   = 2.0f;  // reject flat/smeared maps
+static const int   EAR_MOTION_MAX_TRIES  = 12;    // give up after this many windows
 
 // ── Same helpers as main.cpp (byte-identical logic) ────────────────────────
 static void earExtractGray(const uint8_t *rgb, int fullW, int fullH,
@@ -128,6 +136,14 @@ int main(int argc, char **argv) {
   }
   std::string framesDir = argv[1];
   std::string outCsvPath = argv[2];
+  // Lock mode: "dark" = original darkest-blob boot lock, "motion" = temporal
+  // motion-energy localizer. Default motion (the validated one).
+  bool useMotionLock = true;
+  for (int i = 3; i < argc; i++) {
+    if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
+    else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
+  }
+  printf("Lock mode: %s\n", useMotionLock ? "motion-energy" : "darkest-blob");
 
   std::vector<FrameFile> frames;
   if (!listFrames(framesDir, frames) || frames.empty()) {
@@ -142,13 +158,19 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ERROR: cannot open %s for writing\n", outCsvPath.c_str());
     return 1;
   }
-  fprintf(csv, "timestamp_ms,processed,ear,is_blink_event,rolling_rate_bpm,roi_x,roi_y,roi_locked\n");
+  fprintf(csv, "timestamp_ms,processed,ear,is_blink_event,rolling_rate_bpm,roi_x,roi_y,roi_locked,lock_conf\n");
 
   // ── Replay state (mirrors main.cpp's globals for this pipeline) ─────────
   uint8_t *earGrayBuf = nullptr;
   uint8_t *earMaskBuf = nullptr;
   uint16_t *earRowSumBuf = nullptr;
   int earFullW = 0, earFullH = 0;
+
+  // Scratch for isolateLargestComponent(), sized to the locked EAR crop --
+  // fixed at compile time, matching main.cpp's static arrays.
+  static int16_t  earLabelScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
+  static uint16_t earQueueScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
+  static uint8_t  earIsolatedMask[EAR_ROI_SIZE * EAR_ROI_SIZE];
 
   uint32_t earFrameCounter = 0;
   uint32_t earDriftCounter = 0;
@@ -163,6 +185,10 @@ int main(int argc, char **argv) {
 
   EyeBlinkEAR::RoiLock roi;
   EyeBlinkEAR::BlinkDetector blink;
+  EyeBlinkEAR::GlintBlinkDetector glint;
+  static EyeBlinkEAR::MotionLocator locator;   // ~24 KB, keep off the stack
+  int motionTries = 0;
+  float lockConfidence = 0.0f;
 
   int totalBlinkEvents = 0;
   uint32_t lockCompletedAtMs = 0;
@@ -199,7 +225,32 @@ int main(int argc, char **argv) {
     bool blinkEvent = false;
     float rollingRate = 0.0f;
 
-    if (!earLockDone) {
+    if (!earLockDone && useMotionLock) {
+      // Motion-energy lock: accumulate |dI| over a short window, then take
+      // the peak. Retries with a fresh window if confidence is too low,
+      // rather than committing to a bad lock the way darkest-blob did.
+      earExtractGray(rgb, w, h, 0, 0, w, h, earGrayBuf);
+      bool pastWarmup = (f.timestampMs - firstFrameTs) >= EAR_LOCK_WARMUP_MS;
+      if (pastWarmup) {
+        locator.addFrame(earGrayBuf, w, h);
+        float mcx, mcy, conf;
+        if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES, mcx, mcy, conf)) {
+          if (conf >= EAR_MOTION_MIN_CONF || ++motionTries >= EAR_MOTION_MAX_TRIES) {
+            float xs[1] = {mcx}, ys[1] = {mcy};
+            EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, roi);
+            earLockDone = true;
+            lockConfidence = conf;
+            lockCompletedAtMs = f.timestampMs;
+            printf("#STATUS: motion lock at x=%d y=%d size=%d conf=%.2f (t=%ums, %d tries)\n",
+                   roi.x, roi.y, roi.size, conf, f.timestampMs, motionTries + 1);
+          } else {
+            printf("#STATUS: motion lock REJECTED conf=%.2f (<%.2f) at t=%ums, retrying\n",
+                   conf, EAR_MOTION_MIN_CONF, f.timestampMs);
+            locator.reset();
+          }
+        }
+      }
+    } else if (!earLockDone) {
       // Full-frame search -- no assumption about where in the frame the eye
       // sits (validated against session_023: the eye was NOT centered).
       earExtractGray(rgb, w, h, 0, 0, w, h, earGrayBuf);
@@ -324,22 +375,29 @@ int main(int argc, char **argv) {
       }
 
       earExtractGray(rgb, w, h, roi.x, roi.y, roi.size, roi.size, earGrayBuf);
-      earThresholdToMask(earGrayBuf, earMaskBuf, roi.size * roi.size);
 
-      EyeBlinkEAR::EarResult ear = EyeBlinkEAR::computeEAR(earMaskBuf, roi.size, roi.size);
-      if (ear.valid) {
-        earValue = ear.ear;
-        blinkEvent = blink.update(ear.ear, f.timestampMs);
-        rollingRate = blink.rollingRateBpm(f.timestampMs);
-        if (blinkEvent) totalBlinkEvents++;
-        wroteRow = true;
-      }
+      // Glint-based detection -- same call main.cpp makes.
+      int glintPx = 0, roiBrightness = 0;
+      EyeBlinkEAR::glintAndBrightness(
+          earGrayBuf, roi.size, roi.size,
+          EyeBlinkEAR::GlintBlinkDetector::GLINT_LEVEL, glintPx, roiBrightness);
+      earValue = (float)glintPx;   // "ear" column now carries the glint count
+      const int WIDE_PAD = EAR_ROI_SIZE / 2;
+      int ww = roi.size + 2 * WIDE_PAD, wh = roi.size + 2 * WIDE_PAD;
+      earExtractGray(rgb, w, h, roi.x - WIDE_PAD, roi.y - WIDE_PAD, ww, wh, earGrayBuf);
+      int wideDarkPx = EyeBlinkEAR::countDarkPixels(
+          earGrayBuf, ww, wh, EyeBlinkEAR::GlintBlinkDetector::DARK_OFFSET_BELOW_MEAN);
+      blinkEvent = glint.update(glintPx, roiBrightness, wideDarkPx, f.timestampMs);
+      rollingRate = glint.rollingRateBpm(f.timestampMs);
+      if (blinkEvent) totalBlinkEvents++;
+      wroteRow = true;
     }
 
     std::string earField = wroteRow ? std::to_string(earValue) : std::string();
-    fprintf(csv, "%u,1,%s,%d,%.2f,%d,%d,%d\n",
+    fprintf(csv, "%u,1,%s,%d,%.2f,%d,%d,%d,%.2f\n",
             f.timestampMs, earField.c_str(),
-            blinkEvent ? 1 : 0, rollingRate, roi.x, roi.y, roi.locked ? 1 : 0);
+            blinkEvent ? 1 : 0, rollingRate, roi.x, roi.y, roi.locked ? 1 : 0,
+            lockConfidence);
 
     stbi_image_free(rgb);
   }
@@ -348,7 +406,10 @@ int main(int argc, char **argv) {
 
   printf("\n=== session_replay summary ===\n");
   printf("Total frames in session : %zu\n", frames.size());
-  printf("Lock samples collected  : %zu (of %d target)\n", lockSamplesX.size(), EAR_LOCK_SAMPLES);
+  if (useMotionLock)
+    printf("Lock confidence         : %.2f (min %.2f)\n", lockConfidence, EAR_MOTION_MIN_CONF);
+  else
+    printf("Lock samples collected  : %zu (of %d target)\n", lockSamplesX.size(), EAR_LOCK_SAMPLES);
   printf("ROI locked              : %s", earLockDone ? "yes" : "no");
   if (earLockDone) printf(" (at t=%ums)", lockCompletedAtMs);
   printf("\n");

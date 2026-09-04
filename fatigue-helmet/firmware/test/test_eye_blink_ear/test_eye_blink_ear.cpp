@@ -258,6 +258,121 @@ void test_darkest_window_empty_mask_fails(void) {
     TEST_ASSERT_FALSE(found);
 }
 
+void test_isolate_largest_component_keeps_only_the_bigger_blob(void) {
+    const int W = 20, H = 20;
+    uint8_t mask[W * H];
+    memset(mask, 0, sizeof(mask));
+
+    // Small 2x2 speck (4 px) -- an eyelash fragment / shadow speck.
+    mask[2 * W + 2] = 1; mask[2 * W + 3] = 1;
+    mask[3 * W + 2] = 1; mask[3 * W + 3] = 1;
+
+    // Larger 4x4 blob (16 px) elsewhere, not touching the speck -- the pupil.
+    for (int y = 10; y < 14; y++)
+        for (int x = 10; x < 14; x++)
+            mask[y * W + x] = 1;
+
+    int16_t labelScratch[W * H];
+    uint16_t queueScratch[W * H];
+    uint8_t outMask[W * H];
+    bool found = EyeBlinkEAR::isolateLargestComponent(mask, W, H, labelScratch, queueScratch, outMask);
+    TEST_ASSERT_TRUE(found);
+
+    // The speck must be gone entirely.
+    TEST_ASSERT_EQUAL_UINT8(0, outMask[2 * W + 2]);
+    TEST_ASSERT_EQUAL_UINT8(0, outMask[3 * W + 3]);
+
+    // The larger blob must survive intact.
+    int keptCount = 0;
+    for (int y = 10; y < 14; y++)
+        for (int x = 10; x < 14; x++)
+            if (outMask[y * W + x]) keptCount++;
+    TEST_ASSERT_EQUAL_INT(16, keptCount);
+
+    // Nothing else got turned on.
+    int totalOn = 0;
+    for (int i = 0; i < W * H; i++) if (outMask[i]) totalOn++;
+    TEST_ASSERT_EQUAL_INT(16, totalOn);
+}
+
+// ── Glint blink detector: the precision-first guarantees ─────────────────
+void test_glint_count_counts_specular_pixels(void) {
+    const int W = 10, H = 10;
+    uint8_t gray[W * H];
+    memset(gray, 50, sizeof(gray));      // dim background
+    gray[0] = 255; gray[1] = 220; gray[2] = 199;  // 2 at/above 200, 1 just below
+    TEST_ASSERT_EQUAL_INT(2, EyeBlinkEAR::countGlintPixels(gray, W, H, 200));
+}
+
+void test_glint_blink_counted_on_recovery(void) {
+    EyeBlinkEAR::GlintBlinkDetector d;
+    TEST_ASSERT_FALSE(d.update(40, 50, 1000, 1000));   // open
+    TEST_ASSERT_FALSE(d.update(0, 90, 100, 1100));   // closed 1 (brighter)
+    TEST_ASSERT_FALSE(d.update(0, 90, 100, 1200));   // closed 2 -> run is now valid
+    TEST_ASSERT_TRUE (d.update(40, 50, 1000, 1300));   // reopened -> blink counted here
+}
+
+void test_glint_single_frame_dropout_is_ignored(void) {
+    // The exact ambiguous case the >=2 rule exists to reject.
+    EyeBlinkEAR::GlintBlinkDetector d;
+    d.update(40, 50, 1000, 1000);
+    TEST_ASSERT_FALSE(d.update(0, 90, 100, 1100));   // one absent frame only
+    TEST_ASSERT_FALSE(d.update(40, 50, 1000, 1200));   // back -> must NOT count
+}
+
+void test_glint_gone_without_brightening_is_not_a_blink(void) {
+    // The false-positive case the second cue exists to kill: the reflection
+    // leaves the crop (or is occluded) while the eye stays OPEN, so the dark
+    // iris still fills the region and it never brightens.
+    EyeBlinkEAR::GlintBlinkDetector d;
+    for (int i = 0; i < 10; i++) d.update(40, 50, 1000, i * 100);  // open, learn baseline 50
+    TEST_ASSERT_FALSE(d.update(0, 50, 1000, 2000));   // glint gone, brightness UNCHANGED
+    TEST_ASSERT_FALSE(d.update(0, 51, 1000, 2100));   // still no brightening
+    TEST_ASSERT_FALSE(d.update(40, 50, 1000, 2200));  // returns -> must NOT count as a blink
+}
+
+void test_glint_gaze_shift_is_not_a_blink(void) {
+    // The session_067 false positive: the eye ROLLS sideways. The glint
+    // leaves the ROI and bright sclera raises brightness, so cues 1 and 2
+    // both pass -- but the dark pupil is still there, just moved. Cue 3
+    // must veto it.
+    EyeBlinkEAR::GlintBlinkDetector d;
+    for (int i = 0; i < 20; i++) d.update(40, 50, 1000, i * 100);  // open: baselines settle
+    TEST_ASSERT_FALSE(d.update(0, 80, 900, 3000));   // glint gone, brighter, pupil STILL present
+    TEST_ASSERT_FALSE(d.update(0, 80, 880, 3100));
+    TEST_ASSERT_FALSE(d.update(40, 50, 1000, 3200)); // returns -> must NOT count
+}
+
+void test_glint_long_absence_is_not_a_blink(void) {
+    // Covered lens / darkness / eye out of frame must read as "no data".
+    EyeBlinkEAR::GlintBlinkDetector d;
+    d.update(40, 50, 1000, 0);
+    for (int i = 0; i < 40; i++) d.update(0, 90, 100, 100 + i * 100);
+    TEST_ASSERT_FALSE(d.update(40, 50, 1000, 9000));   // recovery after a long gap: not a blink
+}
+
+void test_glint_rolling_rate_evicts_old_blinks(void) {
+    EyeBlinkEAR::GlintBlinkDetector d;
+    d.update(40, 50, 1000, 1000);
+    d.update(0, 90, 100, 1100); d.update(0, 90, 100, 1200);
+    TEST_ASSERT_TRUE(d.update(40, 50, 1000, 1300));
+    TEST_ASSERT_EQUAL_FLOAT(1.0f, d.rollingRateBpm(2000));
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, d.rollingRateBpm(90000));  // aged out of the 60s window
+}
+
+void test_isolate_largest_component_empty_mask_fails(void) {
+    const int W = 12, H = 12;
+    uint8_t mask[W * H];
+    memset(mask, 0, sizeof(mask));
+
+    int16_t labelScratch[W * H];
+    uint16_t queueScratch[W * H];
+    uint8_t outMask[W * H];
+    bool found = EyeBlinkEAR::isolateLargestComponent(mask, W, H, labelScratch, queueScratch, outMask);
+
+    TEST_ASSERT_FALSE(found);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
@@ -278,5 +393,14 @@ int main(int argc, char **argv) {
     RUN_TEST(test_darkest_window_prefers_compact_blob_over_diffuse_region);
     RUN_TEST(test_darkest_window_aggregates_fragmented_speckles);
     RUN_TEST(test_darkest_window_empty_mask_fails);
+    RUN_TEST(test_isolate_largest_component_keeps_only_the_bigger_blob);
+    RUN_TEST(test_isolate_largest_component_empty_mask_fails);
+    RUN_TEST(test_glint_count_counts_specular_pixels);
+    RUN_TEST(test_glint_blink_counted_on_recovery);
+    RUN_TEST(test_glint_single_frame_dropout_is_ignored);
+    RUN_TEST(test_glint_gone_without_brightening_is_not_a_blink);
+    RUN_TEST(test_glint_gaze_shift_is_not_a_blink);
+    RUN_TEST(test_glint_long_absence_is_not_a_blink);
+    RUN_TEST(test_glint_rolling_rate_evicts_old_blinks);
     return UNITY_END();
 }

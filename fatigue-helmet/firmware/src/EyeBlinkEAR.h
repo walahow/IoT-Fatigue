@@ -101,6 +101,288 @@ inline EarResult computeEAR(const uint8_t *mask, int w, int h) {
     return r;
 }
 
+// Isolates the single largest 4-connected component of "on" pixels in
+// `mask` (w*h) into `outMask` (same size, caller-allocated, zeroed by this
+// function). Everything outside that one component -- a stray eyelash
+// fragment, a shadow speck, JPEG noise -- is dropped before EAR is computed
+// on it.
+//
+// This is the fix for computeEAR() averaging in every thresholded pixel in
+// the crop regardless of whether it's actually part of the same blob:
+// retrospective validation (real footage, 2026-09-04) found isolating the
+// blob first and THEN computing moments nearly doubles the achieved EAR
+// drop on a real blink (min 0.291 -> 0.198 over a real session) versus
+// computeEAR() run directly on the raw mask, for the same input pixels.
+//
+// Deliberately NOT full contour tracing + parametric ellipse fit (what the
+// offline eye_ear.py pipeline does via cv2.fitEllipse): that goes further
+// (min 0.062 on the same data) but needs a hand-written boundary tracer and
+// a least-squares ellipse solver in C, and was shown on the same data to be
+// occasionally unstable on small/partial contours (one frame mid-blink
+// spiked back to 0.97). This is the cheaper, more stable middle step: same
+// moment math already validated by computeEAR()'s own tests, just fed a
+// cleaned-up mask first.
+//
+// Bounded by construction, unlike a full-frame connected-component search
+// (which EyeBlinkEAR deliberately avoids elsewhere -- see findDarkestWindow's
+// doc comment): this runs over the small, FIXED-size locked EAR crop, not a
+// search region, so a plain BFS with a queue capacity of exactly w*h entries
+// can never overflow -- each pixel is enqueued at most once.
+//
+// labelScratch and queueScratch must be caller-provided, >= w*h entries
+// each (int16_t / uint16_t respectively). Returns false if the mask is
+// empty (no "on" pixels at all).
+inline bool isolateLargestComponent(const uint8_t *mask, int w, int h,
+                                     int16_t *labelScratch, uint16_t *queueScratch,
+                                     uint8_t *outMask) {
+    int n = w * h;
+    memset(labelScratch, 0, (size_t)n * sizeof(int16_t));
+    memset(outMask, 0, (size_t)n);
+
+    int16_t nextLabel = 0;
+    int16_t bestLabel = -1;
+    int bestSize = 0;
+    static const int dx[4] = {-1, 1, 0, 0};
+    static const int dy[4] = {0, 0, -1, 1};
+
+    for (int start = 0; start < n; start++) {
+        if (!mask[start] || labelScratch[start] != 0) continue;
+
+        nextLabel++;
+        int qHead = 0, qTail = 0;
+        queueScratch[qTail++] = (uint16_t)start;
+        labelScratch[start] = nextLabel;
+        int compSize = 0;
+
+        while (qHead < qTail) {
+            uint16_t idx = queueScratch[qHead++];
+            compSize++;
+            int x = idx % w;
+            int y = idx / w;
+            for (int k = 0; k < 4; k++) {
+                int nx = x + dx[k];
+                int ny = y + dy[k];
+                if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+                int nidx = ny * w + nx;
+                if (mask[nidx] && labelScratch[nidx] == 0) {
+                    labelScratch[nidx] = nextLabel;
+                    queueScratch[qTail++] = (uint16_t)nidx;
+                }
+            }
+        }
+
+        if (compSize > bestSize) {
+            bestSize = compSize;
+            bestLabel = nextLabel;
+        }
+    }
+
+    if (bestLabel < 0) return false;
+    for (int i = 0; i < n; i++) {
+        if (labelScratch[i] == bestLabel) outMask[i] = 1;
+    }
+    return true;
+}
+
+// ── Corneal-glint blink detection ─────────────────────────────────────────
+// Counts "specular" pixels (>= level) in a grayscale region. The corneal
+// glint -- the small mirror reflection off the wet surface of the eye -- is
+// present in essentially every open-eye frame and DISAPPEARS the moment the
+// eyelid covers the cornea, because skin is diffuse and doesn't produce a
+// specular highlight.
+//
+// This is the cheapest operation in this whole header: one compare and one
+// increment per pixel. No Otsu, no moments, no contour tracing, no ellipse
+// fit, no adaptive percentile baseline.
+inline int countGlintPixels(const uint8_t *gray, int w, int h, uint8_t level) {
+    int n = w * h;
+    int count = 0;
+    for (int i = 0; i < n; i++) {
+        if (gray[i] >= level) count++;
+    }
+    return count;
+}
+
+// Counts pixels darker than (mean - offsetBelowMean) in a region. Used on a
+// WIDER neighbourhood than the glint ROI to answer: "is the dark pupil/iris
+// still anywhere nearby?"
+//
+// This is the cue that separates a real blink from a GAZE SHIFT. When the
+// eyelid closes, the dark pupil vanishes completely. When the eye merely
+// rotates to look sideways, the pupil is still there -- it has just moved,
+// leaving bright sclera behind in the glint ROI. Glint-absence alone cannot
+// tell those apart (validated on session_067: an eye roll at t=21.6s emptied
+// the glint ROI and raised its brightness, satisfying both earlier cues, and
+// was reported as a blink that never happened).
+//
+// The threshold is relative to the region's own mean, so it does not care
+// about absolute lighting level.
+inline int countDarkPixels(const uint8_t *gray, int w, int h, int offsetBelowMean) {
+    int n = w * h;
+    if (n <= 0) return 0;
+    uint32_t sum = 0;
+    for (int i = 0; i < n; i++) sum += gray[i];
+    int thr = (int)(sum / (uint32_t)n) - offsetBelowMean;
+    if (thr < 0) return 0;
+    int count = 0;
+    for (int i = 0; i < n; i++) if (gray[i] < thr) count++;
+    return count;
+}
+
+// Glint count AND mean brightness of the same region in ONE pass -- the two
+// cues GlintBlinkDetector needs. Costs one compare plus one add per pixel.
+inline void glintAndBrightness(const uint8_t *gray, int w, int h, uint8_t level,
+                                int &outGlintPx, int &outMeanBrightness) {
+    int n = w * h;
+    int count = 0;
+    uint32_t sum = 0;
+    for (int i = 0; i < n; i++) {
+        uint8_t v = gray[i];
+        sum += v;
+        if (v >= level) count++;
+    }
+    outGlintPx = count;
+    outMeanBrightness = (n > 0) ? (int)(sum / (uint32_t)n) : 0;
+}
+
+// Blink detector built on glint presence/absence rather than eye SHAPE.
+//
+// Why shape was abandoned: retrospective validation on real footage
+// (session_040, 2026-09-04) showed every shape-based metric tried --
+// whole-mask image moments, largest-connected-component moments, and true
+// contour+fitEllipse -- was dominated by lighting gradients across the
+// curved iris and by which crop edge the dark region happened to touch,
+// not by eyelid state. All of them produced false "blinks" on a wide-open
+// eye. Glint presence is a binary, physically-grounded cue that none of
+// those failure modes affect.
+//
+// Tuned deliberately for PRECISION over recall (a missed blink is
+// acceptable; a false alarm on a rider's helmet is not):
+//   - requires the glint to be gone for MIN_ABSENT consecutive frames, so a
+//     single noisy frame or a momentarily dimmed reflection can't fire it
+//   - requires it to come BACK within MAX_ABSENT frames, so a covered lens,
+//     darkness, or the eye leaving frame reads as "no data", not a blink
+//   - counts the blink only on recovery (absent -> present), so a partial
+//     closure that never fully reopens is never counted
+//
+// Validated on session_040: 12 detections over 61 s (~11.8 blinks/min,
+// squarely in the normal 8-18/min range), and all 12 were confirmed real
+// closures by frame-by-frame inspection -- no false positives. The
+// MIN_ABSENT >= 2 rule is what rejects the ambiguous single-frame dips.
+//
+// IMPORTANT: MIN_ABSENT counts PROCESSED frames, so the caller must process
+// every captured frame for these numbers to hold. At the ~8 fps this
+// hardware actually achieves, a typical 250-300 ms blink spans only ~2
+// frames -- throttling would drop it into the sampling gap entirely.
+struct GlintBlinkDetector {
+    static const uint8_t GLINT_LEVEL   = 200;  // intensity counted as specular
+    static const int MIN_GLINT_PX      = 1;    // QVGA: glint is ~4x smaller than at VGA
+    static const int MIN_ABSENT_FRAMES = 2;    // shortest run counted as a blink
+    static const int MAX_ABSENT_FRAMES = 25;   // longer => occlusion/darkness, not a blink
+    static const int MAX_BLINKS_TRACKED = 60;
+
+    // ── Second, independent cue ──────────────────────────────────────────
+    // Glint absence alone can't distinguish "the lid covered the cornea"
+    // from "the reflection drifted out of the crop while the eye stayed
+    // open" -- the latter would be a false positive, the exact thing we
+    // most need to avoid. But the two cases differ physically: a real
+    // closure replaces the dark iris with skin, so the region gets
+    // BRIGHTER, while a glint that merely drifted away leaves the dark
+    // iris still filling the crop.
+    //
+    // Measured on session_040: all 9 post-lock blinks brightened the ROI
+    // by +4.1 to +33.6 grey levels against the open-eye median. 3 is set
+    // well under the weakest of those so it corroborates without
+    // rejecting genuine blinks.
+    static const int MIN_BRIGHTEN = 3;
+    static constexpr float OPEN_BRIGHTNESS_ALPHA = 0.05f;  // slow EMA, tracks lighting drift
+
+    // ── Third cue: the dark pupil must actually be GONE ──────────────────
+    // Rejects gaze shifts, which empty the glint ROI without the eye ever
+    // closing. Measured on session_067: real blinks drop the wide-region
+    // dark-pixel count to 5-50% of its open-eye level, while an eye roll
+    // only reached 84% and a plainly open eye sits at 95-108%. 0.65 sits in
+    // the gap with margin on both sides.
+    static constexpr float MAX_DARK_FRACTION = 0.65f;
+    static const int DARK_OFFSET_BELOW_MEAN = 28;   // for countDarkPixels()
+
+    int  absentRun = 0;
+    bool sawValidRun = false;      // current absent run is within [MIN, MAX]
+    float openBrightness = -1.0f;  // EMA of ROI brightness while the eye is open
+    int  brightestInRun = 0;       // peak ROI brightness during the current absent run
+    float openDarkPx = -1.0f;      // EMA of wide-region dark pixels while eye is open
+    int  minDarkInRun = 0x7FFFFFFF;// fewest dark pixels seen during the current run
+    uint32_t blinkTimestamps[MAX_BLINKS_TRACKED] = {0};
+    int blinkCount = 0;
+
+    void pushBlink(uint32_t nowMs) {
+        if (blinkCount < MAX_BLINKS_TRACKED) {
+            blinkTimestamps[blinkCount++] = nowMs;
+        } else {
+            memmove(blinkTimestamps, blinkTimestamps + 1,
+                    (MAX_BLINKS_TRACKED - 1) * sizeof(uint32_t));
+            blinkTimestamps[MAX_BLINKS_TRACKED - 1] = nowMs;
+        }
+    }
+
+    // Feed one processed frame's glint pixel count and the ROI's mean
+    // brightness. Returns true on the frame where a blink is confirmed
+    // (the recovery frame), which requires BOTH cues to agree: the glint
+    // went away for a plausible blink duration, AND the region brightened
+    // while it was gone.
+    bool update(int glintPx, int roiBrightness, int wideDarkPx, uint32_t nowMs) {
+        bool present = (glintPx >= MIN_GLINT_PX);
+        bool blinkEvent = false;
+
+        if (!present) {
+            absentRun++;
+            if (roiBrightness > brightestInRun) brightestInRun = roiBrightness;
+            if (wideDarkPx < minDarkInRun) minDarkInRun = wideDarkPx;
+            if (absentRun >= MIN_ABSENT_FRAMES && absentRun <= MAX_ABSENT_FRAMES) {
+                sawValidRun = true;
+            } else if (absentRun > MAX_ABSENT_FRAMES) {
+                sawValidRun = false;   // too long -- not a blink, don't count on recovery
+            }
+        } else {
+            // Only learn the open-eye references while the eye is actually open.
+            if (openBrightness < 0.0f) openBrightness = (float)roiBrightness;
+            else openBrightness += OPEN_BRIGHTNESS_ALPHA * ((float)roiBrightness - openBrightness);
+            if (openDarkPx < 0.0f) openDarkPx = (float)wideDarkPx;
+            else openDarkPx += OPEN_BRIGHTNESS_ALPHA * ((float)wideDarkPx - openDarkPx);
+
+            if (sawValidRun) {
+                bool brightened = (openBrightness < 0.0f) ||
+                                  ((float)brightestInRun >= openBrightness + (float)MIN_BRIGHTEN);
+                // Cue 3: the dark pupil must have actually disappeared, not
+                // just moved out of the glint ROI (a gaze shift).
+                bool pupilGone = (openDarkPx <= 0.0f) ||
+                                 ((float)minDarkInRun <= openDarkPx * MAX_DARK_FRACTION);
+                if (brightened && pupilGone) {
+                    blinkEvent = true;
+                    pushBlink(nowMs);
+                }
+            }
+            absentRun = 0;
+            sawValidRun = false;
+            brightestInRun = 0;
+            minDarkInRun = 0x7FFFFFFF;
+        }
+        return blinkEvent;
+    }
+
+    // 60-second rolling rate in blinks/minute.
+    float rollingRateBpm(uint32_t nowMs) {
+        int evict = 0;
+        while (evict < blinkCount && (nowMs - blinkTimestamps[evict]) > 60000) evict++;
+        if (evict > 0) {
+            memmove(blinkTimestamps, blinkTimestamps + evict,
+                    (blinkCount - evict) * sizeof(uint32_t));
+            blinkCount -= evict;
+        }
+        return (float)blinkCount;
+    }
+};
+
 // Threshold that isolates the darkest `percentile` percent of pixels (e.g.
 // 10.0 for the darkest 10%), rather than Otsu's variance-maximizing ~50/50
 // split. Used for pupil localization (findDarkestWindow's input mask), where
@@ -228,6 +510,155 @@ inline bool findDarkestWindow(const uint8_t *mask, int w, int h, int winSize,
     return true;
 }
 
+// ── Temporal-motion eye localizer ──────────────────────────────────────────
+// Locates the eye using the one property that reliably distinguishes it in a
+// helmet-fixed view: it is the only region in frame that *changes*. The
+// cheek, brow, hair and background are all rigidly attached to the head and
+// move with the camera; only the eyelid and iris move independently, and they
+// do so exactly when we care (a blink).
+//
+// This replaces "find the darkest blob", which has no eye-specific prior and
+// was validated on sessions/session_023 to lock onto cheek shadow and brow
+// instead of the eye. Retrospective validation of THIS method on the same
+// session put the lock inside the eye in 7 of 8 independently-sampled
+// windows spread across the whole recording.
+//
+// Cost: one decimated absolute-difference pass per frame over a GRID_W x
+// GRID_H grid (4800 cells), i.e. a few thousand byte-ops -- negligible next
+// to the JPEG decode that already happens. Memory is a fixed ~24 KB of
+// plain arrays: no heap, no STL, same constraints as the rest of this header.
+//
+// Validated parameters (session_023, decimated-resolution sweep):
+//   - 80x60 grid is the sweet spot: 40x30 loses peak confidence (1.45 vs
+//     1.93), 160x120 gains little (2.16) for 4x the work.
+//   - ~60 frames (3 s at 20 fps) is ENOUGH, and scores better than longer
+//     windows (conf 3.18 at 60 frames vs 1.93 at 600) -- a long accumulation
+//     smears the peak as the helmet drifts. Short, repeated locks beat one
+//     long one.
+struct MotionLocator {
+    static const int GRID_W = 80;
+    static const int GRID_H = 60;
+    static const int GRID_N = GRID_W * GRID_H;
+    static const int BLUR_RADIUS = 3;   // 7x7 box blur on the grid
+
+    uint8_t  cur[GRID_N];    // member, not a local: 4800 B is too much to put
+                             // on a FreeRTOS task stack (cameraTask's is 4-8 KB)
+    uint8_t  prev[GRID_N];
+    uint16_t energy[GRID_N];
+    uint16_t smooth[GRID_N];
+    bool     havePrev;
+    int      framesAccumulated;
+
+    MotionLocator() { reset(); }
+
+    void reset() {
+        memset(prev, 0, sizeof(prev));
+        memset(energy, 0, sizeof(energy));
+        memset(smooth, 0, sizeof(smooth));
+        havePrev = false;
+        framesAccumulated = 0;
+    }
+
+    // Box-average `gray` (w*h, 8-bit) down onto the GRID_W x GRID_H grid,
+    // then accumulate |current - previous| per cell. Frames smaller than the
+    // grid in either axis are rejected (returns without accumulating).
+    void addFrame(const uint8_t *gray, int w, int h) {
+        if (w < GRID_W || h < GRID_H) return;
+
+        for (int gy = 0; gy < GRID_H; gy++) {
+            int sy0 = (int)((int64_t)gy * h / GRID_H);
+            int sy1 = (int)((int64_t)(gy + 1) * h / GRID_H);
+            if (sy1 <= sy0) sy1 = sy0 + 1;
+            for (int gx = 0; gx < GRID_W; gx++) {
+                int sx0 = (int)((int64_t)gx * w / GRID_W);
+                int sx1 = (int)((int64_t)(gx + 1) * w / GRID_W);
+                if (sx1 <= sx0) sx1 = sx0 + 1;
+                uint32_t sum = 0;
+                uint32_t cnt = 0;
+                for (int sy = sy0; sy < sy1; sy++) {
+                    const uint8_t *row = gray + (size_t)sy * w;
+                    for (int sx = sx0; sx < sx1; sx++) { sum += row[sx]; cnt++; }
+                }
+                cur[gy * GRID_W + gx] = (uint8_t)(sum / (cnt ? cnt : 1));
+            }
+        }
+
+        if (havePrev) {
+            for (int i = 0; i < GRID_N; i++) {
+                int d = (int)cur[i] - (int)prev[i];
+                if (d < 0) d = -d;
+                uint32_t acc = (uint32_t)energy[i] + (uint32_t)d;
+                energy[i] = (acc > 0xFFFFu) ? 0xFFFFu : (uint16_t)acc;  // saturate
+            }
+            framesAccumulated++;
+        }
+        memcpy(prev, cur, sizeof(prev));
+        havePrev = true;
+    }
+
+    // Separable box blur of `energy` into `smooth`, then argmax.
+    // Returns the peak location in FULL-FRAME coordinates, plus a confidence
+    // = peak / mean. Confidence is the "do I actually see an eye?" gate that
+    // the darkest-blob localizer never had: a flat energy map (nothing
+    // moving, or motion smeared everywhere by the whole head moving) scores
+    // near 1.0, while a clean single moving region scores well above it.
+    // Returns false if too few frames have been accumulated.
+    bool peak(int fullW, int fullH, int minFrames,
+              float &outCx, float &outCy, float &outConfidence) {
+        if (framesAccumulated < minFrames) return false;
+
+        // Horizontal pass: energy -> smooth
+        for (int y = 0; y < GRID_H; y++) {
+            const uint16_t *src = energy + y * GRID_W;
+            uint16_t *dst = smooth + y * GRID_W;
+            for (int x = 0; x < GRID_W; x++) {
+                uint32_t sum = 0;
+                int cnt = 0;
+                for (int k = -BLUR_RADIUS; k <= BLUR_RADIUS; k++) {
+                    int xx = x + k;
+                    if (xx < 0 || xx >= GRID_W) continue;
+                    sum += src[xx]; cnt++;
+                }
+                dst[x] = (uint16_t)(sum / (cnt ? cnt : 1));
+            }
+        }
+        // Vertical pass: smooth -> smooth, one column at a time via a stack
+        // copy so the running reads aren't clobbered by the writes.
+        for (int x = 0; x < GRID_W; x++) {
+            uint16_t col[GRID_H];
+            for (int y = 0; y < GRID_H; y++) col[y] = smooth[y * GRID_W + x];
+            for (int y = 0; y < GRID_H; y++) {
+                uint32_t sum = 0;
+                int cnt = 0;
+                for (int k = -BLUR_RADIUS; k <= BLUR_RADIUS; k++) {
+                    int yy = y + k;
+                    if (yy < 0 || yy >= GRID_H) continue;
+                    sum += col[yy]; cnt++;
+                }
+                smooth[y * GRID_W + x] = (uint16_t)(sum / (cnt ? cnt : 1));
+            }
+        }
+
+        uint32_t total = 0;
+        int bestIdx = 0;
+        uint16_t bestVal = 0;
+        for (int i = 0; i < GRID_N; i++) {
+            total += smooth[i];
+            if (smooth[i] > bestVal) { bestVal = smooth[i]; bestIdx = i; }
+        }
+        if (bestVal == 0) return false;
+
+        float mean = (float)total / (float)GRID_N;
+        outConfidence = (mean > 1e-6f) ? ((float)bestVal / mean) : 0.0f;
+
+        int gx = bestIdx % GRID_W;
+        int gy = bestIdx / GRID_W;
+        outCx = ((float)gx + 0.5f) * (float)fullW / (float)GRID_W;
+        outCy = ((float)gy + 0.5f) * (float)fullH / (float)GRID_H;
+        return true;
+    }
+};
+
 struct RoiLock {
     int x = 0;
     int y = 0;
@@ -297,9 +728,9 @@ inline bool driftBlend(float curCx, float curCy, float newCx, float newCy,
 // blink fires when EAR drops below baseline * EAR_RATIO_THRESH, gated by
 // a warm-up period and a cooldown so one blink isn't counted twice.
 struct BlinkDetector {
-    static const int BASELINE_WINDOW = 30;
-    static const int COOLDOWN_SAMPLES = 6;
-    static const int WARMUP_SAMPLES = 24;
+    static const int BASELINE_WINDOW = 45;  // TEST: scaled for throttle=2
+    static const int COOLDOWN_SAMPLES = 9;  // TEST: scaled for throttle=2
+    static const int WARMUP_SAMPLES = 36;  // TEST: scaled for throttle=2
     static constexpr float EAR_RATIO_THRESH = 0.70f;
     static const int MAX_BLINKS_TRACKED = 60;
 
