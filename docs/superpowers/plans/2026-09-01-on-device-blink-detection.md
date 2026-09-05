@@ -40,8 +40,8 @@ build_flags = -std=gnu++14
 
 - [ ] **Step 2: Verify PlatformIO recognizes the new environment**
 
-Run: `cd fatigue-helmet/firmware && pio project config -e native`
-Expected: prints the `native` environment's config (platform, build_flags) with no errors.
+Run: `cd fatigue-helmet/firmware && pio project config`
+Expected: prints config for all environments including `env:native` (platform, build_flags) with no errors. (`pio project config` doesn't take an `-e` filter; `pio run -e native` is an equally valid way to confirm PlatformIO accepts the env.)
 
 - [ ] **Step 3: Commit**
 

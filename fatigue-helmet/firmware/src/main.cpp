@@ -44,6 +44,12 @@
 #include <math.h>
 #include "FuzzyFatigue.h"  // Mamdani FIS (heap-free, STL-free, header-only)
 
+#if defined(STORAGE_MODE_SD)
+#include "EyeBlinkEAR.h"        // on-device blink detection (spec section 5)
+#include "img_converters.h"     // fmt2rgb888() -- esp32-camera
+#include "esp_heap_caps.h"      // heap_caps_malloc() / MALLOC_CAP_SPIRAM
+#endif
+
 // ── Camera resolution / FPS defaults ─────────────────────────────────────
 // Override via build_flags in platformio.ini, e.g.:
 //   -DCAMERA_FRAMESIZE=FRAMESIZE_VGA  -DCAMERA_FPS=20
@@ -182,6 +188,244 @@ uint32_t g_frameIndex = 0; // monotonic frame counter
 bool g_sdReady = false;
 #endif
 
+// ── On-device EAR blink detection state (SD mode) ───────────────────────
+// See docs/superpowers/specs/2026-09-01-on-device-fatigue-detection-design.md §5.
+#if defined(STORAGE_MODE_SD)
+// Every captured frame is processed. The glint check that replaced the old
+// shape math is one compare+increment per pixel, so the per-frame cost is
+// now dominated entirely by the JPEG decode that already had to happen.
+// This ALSO has to be 1: GlintBlinkDetector's "absent for >= 2 consecutive
+// frames" rule counts PROCESSED frames, and this hardware really captures
+// at ~8 fps (measured on session_040: 480 frames / 60.9 s), so a typical
+// 250-300 ms blink spans only ~2 frames. Any throttling drops it into the
+// sampling gap entirely.
+static const int   EAR_THROTTLE_DIV   = 1;   // every frame -- affordable at QVGA
+                                              // the decode is half-scale (see processEarFrame)
+// Sized to the eye region rather than tightly to the pupil, so normal gaze
+// movement keeps the corneal reflection inside the crop.
+static const int   EAR_ROI_SIZE       = 48;   // QVGA: same physical eye area as 96px at VGA
+static const int   EAR_DRIFT_PERIOD   = 40;    // processed frames between drift checks
+static const int   EAR_DRIFT_MARGIN   = 30;    // px added around the ROI when searching for drift
+static const float EAR_DRIFT_MAX_PX   = 20.0f;
+static const float EAR_DRIFT_ALPHA    = 0.3f;
+// Retrospective validation against a real session (2026-09-03, see
+// session_replay tool) found the periodic drift-check above can confidently
+// re-lock onto hair occluding the camera later in a session -- hair is a
+// genuinely darker/more stable feature than the eye once it drifts into
+// frame, so the Otsu+centroid drift check has no way to tell the difference.
+// That's a different problem (occlusion) than what drift-correction was
+// built to solve (small physical helmet shift). Disabled until an
+// occlusion-robust version exists: ship the validated boot lock, frozen for
+// the session, rather than let a "correction" actively track the wrong
+// thing.
+static const bool  EAR_DRIFT_ENABLED  = false;
+
+// ── Motion-energy boot lock ──────────────────────────────────────────────
+// Replaces an earlier "largest Otsu-thresholded blob in the middle 60% of
+// the frame" lock, which retrospective validation (session_023) found
+// consistently latched onto brow/cheek shadow instead of the eye (59px off
+// the real eye centre, 0.24 IoU with a Haar-verified reference box) -- Otsu
+// always finds SOME dark region, with no eye-specific prior at all.
+//
+// The eye is the one region that's normally in the camera's field of view.
+// In a helmet-fixed shot, cheek/brow/hair are all rigidly attached to the
+// head and move with the camera; only the eyelid moves independently. See
+// EyeBlinkEAR::MotionLocator for the implementation; validated on the same
+// session: locked within 2.8px of the true eye centre on the first try,
+// confidence 5.04 against a 2.0 gate.
+static const int   EAR_MOTION_MIN_FRAMES = 60;    // ~3s of processed frames
+static const float EAR_MOTION_MIN_CONF   = 2.0f;  // reject flat/smeared maps
+static const int   EAR_MOTION_MAX_TRIES  = 12;    // accept a weak lock rather than never locking
+
+static uint8_t *g_earRgbBuf  = nullptr;  // PSRAM, fullW*fullH*3 (decoded JPEG)
+static uint8_t *g_earGrayBuf = nullptr;  // PSRAM, fullW*fullH, reused at partial size
+static uint8_t *g_earMaskBuf = nullptr;  // PSRAM, fullW*fullH, reused at partial size
+static int      g_earFullW   = 0;
+static int      g_earFullH   = 0;
+
+static uint32_t g_earFrameCounter = 0;
+static uint32_t g_earDriftCounter = 0;
+
+static bool  g_earLockDone = false;
+static bool  g_earDisabled = false;  // set true after a failed buffer allocation; never retried
+static int   g_earMotionTries = 0;
+static float g_earLockConfidence = 0.0f;
+
+// ~28 KB -- global, not a local/stack variable (see MotionLocator's own note).
+static EyeBlinkEAR::MotionLocator g_earLocator;
+
+// Scratch for isolateLargestComponent(), sized to the locked EAR crop
+// (EAR_ROI_SIZE^2) -- fixed at compile time, so plain static arrays rather
+// than a PSRAM heap_caps_malloc like the full-frame buffers above.
+static int16_t  g_earLabelScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
+static uint16_t g_earQueueScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
+static uint8_t  g_earIsolatedMask[EAR_ROI_SIZE * EAR_ROI_SIZE];
+
+EyeBlinkEAR::RoiLock      g_earRoi;
+EyeBlinkEAR::BlinkDetector g_earBlink;        // legacy shape-based path, no longer driving alerts
+EyeBlinkEAR::GlintBlinkDetector g_earGlint;   // active blink detector
+volatile float g_onDeviceBlinkRate = 13.0f;  // read by the g_blinkRate fallback below
+
+// Converts a rectangular region of an RGB888 buffer to grayscale (simple
+// average of R,G,B) into a caller-provided buffer sized regionW*regionH.
+// Out-of-frame coordinates clamp to the nearest edge.
+// Converts a rectangular region of an RGB888 buffer to grayscale (simple
+// average of R,G,B) into a caller-provided buffer sized regionW*regionH.
+// Out-of-frame coordinates clamp to the nearest edge.
+static void earExtractGray(const uint8_t *rgb, int fullW, int fullH,
+                            int regionX, int regionY, int regionW, int regionH,
+                            uint8_t *outGray) {
+  for (int ry = 0; ry < regionH; ry++) {
+    int sy = regionY + ry;
+    if (sy < 0) sy = 0;
+    if (sy >= fullH) sy = fullH - 1;
+    for (int rx = 0; rx < regionW; rx++) {
+      int sx = regionX + rx;
+      if (sx < 0) sx = 0;
+      if (sx >= fullW) sx = fullW - 1;
+      const uint8_t *px = rgb + ((size_t)sy * fullW + sx) * 3;
+      outGray[ry * regionW + rx] = (uint8_t)(((int)px[0] + px[1] + px[2]) / 3);
+    }
+  }
+}
+
+// otsuThreshold() only cares about total pixel count, not 2D shape, so a
+// flat n-pixel buffer can be passed as (n, 1) safely.
+static void earThresholdToMask(const uint8_t *gray, uint8_t *mask, int n) {
+  uint8_t t = EyeBlinkEAR::otsuThreshold(gray, n, 1);
+  for (int i = 0; i < n; i++) mask[i] = (gray[i] <= t) ? 1 : 0;
+}
+
+void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
+  int w = (int)fb->width;
+  int h = (int)fb->height;
+
+  if (!g_earRgbBuf && !g_earDisabled) {
+    // Half-scale RGB565: (w/2)*(h/2)*2 bytes, vs the old w*h*3 full-scale
+    // RGB888 -- 6x smaller, and ~4x less decode work (measured below).
+    g_earRgbBuf  = (uint8_t *)heap_caps_malloc((size_t)w * h * 3, MALLOC_CAP_SPIRAM);
+    g_earGrayBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
+    g_earMaskBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
+    g_earFullW = w;
+    g_earFullH = h;
+    if (!g_earRgbBuf || !g_earGrayBuf || !g_earMaskBuf) {
+      Serial.println(F("#ERROR: EAR buffer alloc failed -- on-device blink detection disabled"));
+      g_earDisabled = true;
+      return;
+    }
+  }
+  if (g_earDisabled) return;
+  if (w != g_earFullW || h != g_earFullH) return;  // frame size changed mid-session, skip
+
+  // Full-scale RGB888. A half-scale jpg2rgb565(JPG_SCALE_2X) path was tried
+  // to cut this cost and MEASURED ON HARDWARE at ~267 ms per call -- nearly
+  // 3x SLOWER than this full-scale decode's ~97 ms, not 4x faster as the
+  // pixel count suggested. Do not "optimise" it back to a scaled decode
+  // without profiling again.
+  if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, g_earRgbBuf)) {
+    return;  // decode failed this frame, try again next frame
+  }
+
+#if defined(EAR_ROI_MANUAL_X)
+  if (!g_earRoi.locked) {
+    g_earRoi.x = EAR_ROI_MANUAL_X;
+    g_earRoi.y = EAR_ROI_MANUAL_Y;
+    g_earRoi.size = EAR_ROI_SIZE;
+    g_earRoi.locked = true;
+    g_earLockDone = true;
+    Serial.printf("#STATUS: EAR ROI manually pinned at x=%d y=%d size=%d\n",
+                  g_earRoi.x, g_earRoi.y, g_earRoi.size);
+  }
+#endif
+
+  if (!g_earLockDone) {
+    // Full-frame motion energy -- no assumption about where in the frame
+    // the eye sits (session_023 found it was NOT centered).
+    earExtractGray(g_earRgbBuf, w, h, 0, 0, w, h, g_earGrayBuf);
+    g_earLocator.addFrame(g_earGrayBuf, w, h);
+
+    float mcx, mcy, conf;
+    if (g_earLocator.peak(w, h, EAR_MOTION_MIN_FRAMES, mcx, mcy, conf)) {
+      if (conf >= EAR_MOTION_MIN_CONF || ++g_earMotionTries >= EAR_MOTION_MAX_TRIES) {
+        float xs[1] = {mcx}, ys[1] = {mcy};
+        EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, g_earRoi);
+        g_earLockDone = true;
+        g_earLockConfidence = conf;
+        Serial.printf("#STATUS: EAR ROI motion-locked at x=%d y=%d size=%d conf=%.2f (%d tries)\n",
+                      g_earRoi.x, g_earRoi.y, g_earRoi.size, conf, g_earMotionTries + 1);
+      } else {
+        Serial.printf("#STATUS: EAR motion lock rejected conf=%.2f (<%.2f), retrying\n",
+                      conf, EAR_MOTION_MIN_CONF);
+        g_earLocator.reset();
+      }
+    }
+    return;
+  }
+
+  if (EAR_DRIFT_ENABLED && ++g_earDriftCounter % EAR_DRIFT_PERIOD == 0) {
+    int dx = g_earRoi.x - EAR_DRIFT_MARGIN;
+    int dy = g_earRoi.y - EAR_DRIFT_MARGIN;
+    int dw = g_earRoi.size + 2 * EAR_DRIFT_MARGIN;
+    int dh = g_earRoi.size + 2 * EAR_DRIFT_MARGIN;
+
+    earExtractGray(g_earRgbBuf, w, h, dx, dy, dw, dh, g_earGrayBuf);
+    earThresholdToMask(g_earGrayBuf, g_earMaskBuf, dw * dh);
+
+    float localCx, localCy;
+    if (EyeBlinkEAR::centroid(g_earMaskBuf, dw, dh, localCx, localCy)) {
+      float newFullCx = dx + localCx;
+      float newFullCy = dy + localCy;
+      float curCx = g_earRoi.x + g_earRoi.size / 2.0f;
+      float curCy = g_earRoi.y + g_earRoi.size / 2.0f;
+
+      float blendedCx, blendedCy;
+      if (EyeBlinkEAR::driftBlend(curCx, curCy, newFullCx, newFullCy,
+                                   EAR_DRIFT_MAX_PX, EAR_DRIFT_ALPHA,
+                                   blendedCx, blendedCy)) {
+        int rx = (int)(blendedCx - g_earRoi.size / 2.0f);
+        int ry = (int)(blendedCy - g_earRoi.size / 2.0f);
+        if (rx + g_earRoi.size > w) rx = w - g_earRoi.size;
+        if (ry + g_earRoi.size > h) ry = h - g_earRoi.size;
+        if (rx < 0) rx = 0;
+        if (ry < 0) ry = 0;
+        g_earRoi.x = rx;
+        g_earRoi.y = ry;
+      }
+    }
+  }
+
+  earExtractGray(g_earRgbBuf, w, h, g_earRoi.x, g_earRoi.y,
+                 g_earRoi.size, g_earRoi.size, g_earGrayBuf);
+  // Blink detection is glint-based, not shape-based. Every shape metric
+  // tried before this (whole-mask moments, largest-component moments,
+  // contour+fitEllipse) was validated against real footage and found to
+  // track lighting gradients across the iris and crop-edge clipping rather
+  // than eyelid state -- all of them fired on a wide-open eye. The corneal
+  // reflection simply vanishes when the lid covers the cornea, which none
+  // of those failure modes affect. See GlintBlinkDetector's doc comment.
+  int glintPx = 0, roiBrightness = 0;
+  EyeBlinkEAR::glintAndBrightness(
+      g_earGrayBuf, g_earRoi.size, g_earRoi.size,
+      EyeBlinkEAR::GlintBlinkDetector::GLINT_LEVEL, glintPx, roiBrightness);
+
+  // Cue 3 input: dark-pupil presence in a WIDER neighbourhood than the glint
+  // ROI. Distinguishes a real closure (pupil gone) from a gaze shift (pupil
+  // merely moved out of the ROI) -- see countDarkPixels()'s doc comment.
+  const int WIDE_PAD = EAR_ROI_SIZE / 2;
+  int wx = g_earRoi.x - WIDE_PAD, wy = g_earRoi.y - WIDE_PAD;
+  int ww = g_earRoi.size + 2 * WIDE_PAD, wh = g_earRoi.size + 2 * WIDE_PAD;
+  earExtractGray(g_earRgbBuf, w, h, wx, wy, ww, wh, g_earGrayBuf);
+  int wideDarkPx = EyeBlinkEAR::countDarkPixels(
+      g_earGrayBuf, ww, wh,
+      EyeBlinkEAR::GlintBlinkDetector::DARK_OFFSET_BELOW_MEAN);
+
+  if (g_earGlint.update(glintPx, roiBrightness, wideDarkPx, timestampMs)) {
+    Serial.printf("#STATUS: blink (glint) t=%u\n", timestampMs);
+  }
+  g_onDeviceBlinkRate = g_earGlint.rollingRateBpm(timestampMs);
+}
+#endif  // STORAGE_MODE_SD
+
 // ── USB mode: binary frame constants ─────────────────────────────────────
 #if defined(STORAGE_MODE_USB)
 static const uint8_t FRAME_SOF[4] = {0xAA, 0xBB, 0xCC, 0xDD};
@@ -211,16 +455,36 @@ struct NodDetector {
 
     // Returns nodding_score [0..1].
     // Chronological index: count<N → oldest at buf[0]; count==N → oldest at buf[head].
+    // Minimum peak-to-peak pitch swing (degrees) required within the 6 s
+    // window before the zero-crossing score is trusted at all. Retrospective
+    // hardware check (2026-09-04): sitting motionless, pitch noise stayed
+    // under 0.5 deg peak-to-peak, yet the zero-crossing rate alone still hit
+    // score=1.0 in >50% of samples -- the algorithm was correctly measuring
+    // zero crossings, but at this amplitude it's measuring MEMS/quantization
+    // noise, not head motion. mf_pitch_Limp (this file's other pitch-based
+    // signal) already treats a real sustained head-drop as starting at 20 deg,
+    // so a discrete nod -- faster and smaller than a full slump, but still a
+    // deliberate real motion -- should clearly clear a couple of degrees.
+    // 2.0 deg is a conservative floor: comfortably above the measured noise
+    // floor, comfortably below a real nod. Needs retuning against real rider
+    // footage, same as every other threshold in this file.
+    static constexpr float MIN_SWING_DEG = 2.0f;
+
     float score() const {
         if (count < 6) return 0.0f;
 
-        // Mean for detrending
+        // Mean for detrending, and peak-to-peak swing for the noise gate below.
         float mean = 0.0f;
+        float lo = buf[(count < N) ? 0 : head];
+        float hi = lo;
         for (uint8_t i = 0; i < count; i++) {
             uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
             mean += buf[idx];
+            if (buf[idx] < lo) lo = buf[idx];
+            if (buf[idx] > hi) hi = buf[idx];
         }
         mean /= (float)count;
+        if ((hi - lo) < MIN_SWING_DEG) return 0.0f;  // noise floor gate
 
         // Zero crossings of detrended signal
         int zcr = 0;
@@ -594,6 +858,15 @@ void cameraTask(void *arg) {
 
   while (true) {
     vTaskDelayUntil(&lastWake, period);
+    // vTaskDelayUntil does NOT block once the deadline has already passed,
+    // and with fb_count=2 a frame is usually already queued so
+    // esp_camera_fb_get() returns immediately too. With per-frame EAR work
+    // (~97 ms) exceeding the period, that combination left this task with no
+    // yield at all: IDLE0 on CPU 0 never ran and the task watchdog aborted
+    // (observed as a boot loop). This unconditional short delay guarantees
+    // the idle task gets scheduled every iteration no matter how the frame
+    // timing lands.
+    vTaskDelay(pdMS_TO_TICKS(5));
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) {
@@ -601,7 +874,36 @@ void cameraTask(void *arg) {
         uint32_t ts = (uint32_t)millis();
 
 #if defined(STORAGE_MODE_SD)
+        // Build with -DEAR_PROFILE to print the per-frame cost breakdown.
+        // Off by default: it prints every 40 frames, which is serial noise
+        // during a real recording. Kept because the numbers it produced are
+        // what identified the watchdog cause (see cameraTask's yield note
+        // and processEarFrame's decode-cost note) and will be needed again
+        // if the camera resolution or pipeline cost changes.
+#if defined(EAR_PROFILE)
+        uint32_t tSd0 = (uint32_t)micros();
+#endif
         saveJpegToSD(fb->buf, fb->len, ts);
+#if defined(EAR_PROFILE)
+        uint32_t tSd1 = (uint32_t)micros();
+#endif
+        if (++g_earFrameCounter % EAR_THROTTLE_DIV == 0) {
+          processEarFrame(fb, ts);
+        }
+#if defined(EAR_PROFILE)
+        uint32_t tEar1 = (uint32_t)micros();
+        static uint32_t profCount = 0, profSd = 0, profEar = 0;
+        profSd  += (tSd1 - tSd0);
+        profEar += (tEar1 - tSd1);
+        if (++profCount >= 40) {
+          Serial.printf("#PROF: sd=%luus ear=%luus total=%luus budget=%dus\n",
+                        (unsigned long)(profSd / profCount),
+                        (unsigned long)(profEar / profCount),
+                        (unsigned long)((profSd + profEar) / profCount),
+                        (int)(1000000 / CAMERA_FPS));
+          profCount = profSd = profEar = 0;
+        }
+#endif
 #elif defined(STORAGE_MODE_USB)
         sendJpegFrame(fb->buf, fb->len, ts);
 #endif
@@ -826,6 +1128,12 @@ void setup() {
   unsigned long t0 = millis();
   while (!Serial && millis() - t0 < 3000)
     delay(10);
+  // Native USB-CDC re-enumerates on every reset, so a host-side monitor
+  // that was attached before the reset is still reconnecting for a bit
+  // after Serial reports ready -- without this, the earliest boot lines
+  // (camera/PSRAM/SD status, the ones you most want on a fresh reset) are
+  // silently dropped since nothing is listening yet.
+  delay(1500);
 
   Serial.println(F("#STATUS: ---- IoT Fatigue Helmet Phase 2 ----"));
 #if defined(STORAGE_MODE_SD)
@@ -1129,11 +1437,18 @@ void loop() {
       g_serialLineBufLen = 0;   // line too long — discard
     }
   }
-  // Fallback: sticky last-valid after timeout; 13.0 if pipeline never connected
+  // Fallback: sticky last-valid after timeout; on-device EAR rate in SD
+  // mode (see processEarFrame() above), or the 13.0 stub in USB mode
+  // (unchanged -- USB debug mode still relies on the offline eye_ear.py
+  // pipeline, see spec non-goals).
   if (g_blinkEverRx && (now - g_lastBlinkRxTime > BLINK_TIMEOUT_MS)) {
     g_blinkRate = g_lastValidBlink;
   } else if (!g_blinkEverRx) {
+#if defined(STORAGE_MODE_SD)
+    g_blinkRate = g_onDeviceBlinkRate;
+#else
     g_blinkRate = 13.0f;
+#endif
   }
 
   // ── Warn on prolonged no-contact (non-blocking: skip if mutex busy) ────────

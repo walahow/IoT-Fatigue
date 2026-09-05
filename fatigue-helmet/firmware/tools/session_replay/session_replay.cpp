@@ -1,0 +1,420 @@
+// session_replay.cpp
+// ============================================================================
+// Host-side validation harness: runs the EXACT, unmodified EyeBlinkEAR.h
+// algorithm (same source file the ESP32 firmware compiles) against a folder
+// of already-recorded JPEG frames from a real session, replicating
+// processEarFrame()'s logic from main.cpp (same constants, same throttle,
+// same boot-lock/drift/EAR/blink flow) -- just fed from decoded JPEG files
+// on the host instead of camera_fb_t from a live ESP32-S3 camera.
+//
+// This does NOT run on the ESP32. It runs the same algorithm, compiled for
+// the host, so you can see how it performs on real recorded footage without
+// needing to build a live frame-injection mode on the actual chip.
+//
+// Usage:
+//   session_replay <frames_dir> <output_csv>
+//
+// frames_dir must contain files named {timestamp_ms}.jpg (the naming
+// convention used by unpack_session.py / debug_recorder.py).
+// ============================================================================
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#include "stb_image.h"
+
+#include "../../src/EyeBlinkEAR.h"
+
+// ── Same constants as main.cpp's processEarFrame() integration ────────────
+static const int   EAR_THROTTLE_DIV = 1;   // every frame, matches main.cpp
+static const int   EAR_ROI_SIZE     = 48;  // QVGA, matches main.cpp
+static const int   EAR_DRIFT_PERIOD = 40;
+static const int   EAR_DRIFT_MARGIN = 30;
+static const float EAR_DRIFT_MAX_PX = 20.0f;
+static const float EAR_DRIFT_ALPHA  = 0.3f;
+
+// ── Pupil-localization constants (boot-lock + drift-check) ─────────────────
+// Validated in Python against sessions/session_023's real frames before
+// being ported here -- see the EyeBlinkEAR.h commits that added
+// percentileThreshold() and findDarkestWindow().
+static const int      EAR_LOCK_SAMPLES     = 60;   // more thorough one-time pass at boot
+static const float    EAR_LOCK_PERCENTILE  = 10.0f;
+static const int      EAR_LOCK_WIN_SIZE    = 22;   // ~pupil diameter at this resolution
+static const int      EAR_LOCK_STRIDE      = 2;
+static const uint32_t EAR_LOCK_WARMUP_MS   = 2000; // let the subject settle before sampling
+static const int      EAR_DRIFT_BURST      = 8;    // samples per drift-check (median, not single-frame)
+// Drift-correction is validated as noise-resistant on its own (median-of-8,
+// two-burst confirmation), but retrospective validation against session_023
+// found it can confidently track hair occluding the camera later in this
+// specific session, since hair is a genuinely darker/more stable feature
+// than the eye once it's in frame -- a different problem (occlusion) than
+// what drift-correction was built to solve (real small physical drift).
+// Disabled for now: ship the validated boot-lock, frozen for the session,
+// and revisit occlusion-robust drift as a separate piece of work.
+static const bool     EAR_DRIFT_ENABLED    = false;
+
+// ── Motion-based localization (alternative to the darkest-blob boot lock) ──
+// Validated on session_023 at decimated resolution: 60 frames is enough and
+// scores better than longer windows; confidence (peak/mean) separates a real
+// eye lock from a smeared/flat map.
+static const int   EAR_MOTION_MIN_FRAMES = 60;    // ~3 s at 20 fps
+static const float EAR_MOTION_MIN_CONF   = 2.0f;  // reject flat/smeared maps
+static const int   EAR_MOTION_MAX_TRIES  = 12;    // give up after this many windows
+
+// ── Same helpers as main.cpp (byte-identical logic) ────────────────────────
+static void earExtractGray(const uint8_t *rgb, int fullW, int fullH,
+                            int regionX, int regionY, int regionW, int regionH,
+                            uint8_t *outGray) {
+  for (int ry = 0; ry < regionH; ry++) {
+    int sy = regionY + ry;
+    if (sy < 0) sy = 0;
+    if (sy >= fullH) sy = fullH - 1;
+    for (int rx = 0; rx < regionW; rx++) {
+      int sx = regionX + rx;
+      if (sx < 0) sx = 0;
+      if (sx >= fullW) sx = fullW - 1;
+      const uint8_t *px = rgb + ((size_t)sy * fullW + sx) * 3;
+      outGray[ry * regionW + rx] = (uint8_t)(((int)px[0] + px[1] + px[2]) / 3);
+    }
+  }
+}
+
+static void earThresholdToMask(const uint8_t *gray, uint8_t *mask, int n) {
+  uint8_t t = EyeBlinkEAR::otsuThreshold(gray, n, 1);
+  for (int i = 0; i < n; i++) mask[i] = (gray[i] <= t) ? 1 : 0;
+}
+
+// Percentile-threshold variant, used for pupil localization (boot-lock and
+// drift-check) instead of Otsu -- see percentileThreshold()'s doc comment.
+static void earPercentileMask(const uint8_t *gray, uint8_t *mask, int n) {
+  uint8_t t = EyeBlinkEAR::percentileThreshold(gray, n, 1, EAR_LOCK_PERCENTILE);
+  for (int i = 0; i < n; i++) mask[i] = (gray[i] <= t) ? 1 : 0;
+}
+
+// ── Frame listing ───────────────────────────────────────────────────────────
+struct FrameFile {
+  uint32_t timestampMs;
+  std::string path;
+};
+
+static bool listFrames(const std::string &dir, std::vector<FrameFile> &out) {
+#if defined(_WIN32)
+  std::string pattern = dir + "\\*.jpg";
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return false;
+  do {
+    std::string name = fd.cFileName;
+    size_t dot = name.find(".jpg");
+    if (dot == std::string::npos) continue;
+    uint32_t ts = (uint32_t)strtoul(name.substr(0, dot).c_str(), nullptr, 10);
+    out.push_back({ts, dir + "\\" + name});
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+#else
+  return false; // not needed on this project's target host (Windows)
+#endif
+  std::sort(out.begin(), out.end(),
+            [](const FrameFile &a, const FrameFile &b) { return a.timestampMs < b.timestampMs; });
+  return true;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 3) {
+    fprintf(stderr, "Usage: %s <frames_dir> <output_csv>\n", argv[0]);
+    return 1;
+  }
+  std::string framesDir = argv[1];
+  std::string outCsvPath = argv[2];
+  // Lock mode: "dark" = original darkest-blob boot lock, "motion" = temporal
+  // motion-energy localizer. Default motion (the validated one).
+  bool useMotionLock = true;
+  for (int i = 3; i < argc; i++) {
+    if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
+    else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
+  }
+  printf("Lock mode: %s\n", useMotionLock ? "motion-energy" : "darkest-blob");
+
+  std::vector<FrameFile> frames;
+  if (!listFrames(framesDir, frames) || frames.empty()) {
+    fprintf(stderr, "ERROR: no .jpg frames found in %s\n", framesDir.c_str());
+    return 1;
+  }
+  printf("Found %zu frames. First ts=%u  Last ts=%u\n",
+         frames.size(), frames.front().timestampMs, frames.back().timestampMs);
+
+  FILE *csv = fopen(outCsvPath.c_str(), "w");
+  if (!csv) {
+    fprintf(stderr, "ERROR: cannot open %s for writing\n", outCsvPath.c_str());
+    return 1;
+  }
+  fprintf(csv, "timestamp_ms,processed,ear,is_blink_event,rolling_rate_bpm,roi_x,roi_y,roi_locked,lock_conf\n");
+
+  // ── Replay state (mirrors main.cpp's globals for this pipeline) ─────────
+  uint8_t *earGrayBuf = nullptr;
+  uint8_t *earMaskBuf = nullptr;
+  uint16_t *earRowSumBuf = nullptr;
+  int earFullW = 0, earFullH = 0;
+
+  // Scratch for isolateLargestComponent(), sized to the locked EAR crop --
+  // fixed at compile time, matching main.cpp's static arrays.
+  static int16_t  earLabelScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
+  static uint16_t earQueueScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
+  static uint8_t  earIsolatedMask[EAR_ROI_SIZE * EAR_ROI_SIZE];
+
+  uint32_t earFrameCounter = 0;
+  uint32_t earDriftCounter = 0;
+  bool driftBursting = false;
+  std::vector<float> driftSamplesX, driftSamplesY;
+  bool havePendingCandidate = false;
+  float pendingCandidateX = 0, pendingCandidateY = 0;
+
+  std::vector<float> lockSamplesX, lockSamplesY;
+  bool earLockDone = false;
+  uint32_t firstFrameTs = frames.front().timestampMs;
+
+  EyeBlinkEAR::RoiLock roi;
+  EyeBlinkEAR::BlinkDetector blink;
+  EyeBlinkEAR::GlintBlinkDetector glint;
+  static EyeBlinkEAR::MotionLocator locator;   // ~24 KB, keep off the stack
+  int motionTries = 0;
+  float lockConfidence = 0.0f;
+
+  int totalBlinkEvents = 0;
+  uint32_t lockCompletedAtMs = 0;
+
+  for (const auto &f : frames) {
+    earFrameCounter++;
+    // Boot-lock (not yet locked): process EVERY captured frame -- a more
+    // thorough one-time search before steady-state processing begins, since
+    // there's no real-time budget pressure yet. Once locked: throttle to
+    // keep steady-state CPU cost bounded, same as before.
+    if (earLockDone && (earFrameCounter % EAR_THROTTLE_DIV != 0)) continue;
+
+    int w, h, comp;
+    uint8_t *rgb = stbi_load(f.path.c_str(), &w, &h, &comp, 3);
+    if (!rgb) {
+      fprintf(stderr, "WARN: failed to decode %s, skipping\n", f.path.c_str());
+      continue;
+    }
+
+    if (!earGrayBuf) {
+      earGrayBuf = (uint8_t *)malloc((size_t)w * h);
+      earMaskBuf = (uint8_t *)malloc((size_t)w * h);
+      earRowSumBuf = (uint16_t *)malloc((size_t)w * h * sizeof(uint16_t));
+      earFullW = w;
+      earFullH = h;
+    }
+    if (w != earFullW || h != earFullH) {
+      stbi_image_free(rgb);
+      continue; // frame size changed mid-session, skip (matches main.cpp guard)
+    }
+
+    bool wroteRow = false;
+    float earValue = -1.0f;
+    bool blinkEvent = false;
+    float rollingRate = 0.0f;
+
+    if (!earLockDone && useMotionLock) {
+      // Motion-energy lock: accumulate |dI| over a short window, then take
+      // the peak. Retries with a fresh window if confidence is too low,
+      // rather than committing to a bad lock the way darkest-blob did.
+      earExtractGray(rgb, w, h, 0, 0, w, h, earGrayBuf);
+      bool pastWarmup = (f.timestampMs - firstFrameTs) >= EAR_LOCK_WARMUP_MS;
+      if (pastWarmup) {
+        locator.addFrame(earGrayBuf, w, h);
+        float mcx, mcy, conf;
+        if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES, mcx, mcy, conf)) {
+          if (conf >= EAR_MOTION_MIN_CONF || ++motionTries >= EAR_MOTION_MAX_TRIES) {
+            float xs[1] = {mcx}, ys[1] = {mcy};
+            EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, roi);
+            earLockDone = true;
+            lockConfidence = conf;
+            lockCompletedAtMs = f.timestampMs;
+            printf("#STATUS: motion lock at x=%d y=%d size=%d conf=%.2f (t=%ums, %d tries)\n",
+                   roi.x, roi.y, roi.size, conf, f.timestampMs, motionTries + 1);
+          } else {
+            printf("#STATUS: motion lock REJECTED conf=%.2f (<%.2f) at t=%ums, retrying\n",
+                   conf, EAR_MOTION_MIN_CONF, f.timestampMs);
+            locator.reset();
+          }
+        }
+      }
+    } else if (!earLockDone) {
+      // Full-frame search -- no assumption about where in the frame the eye
+      // sits (validated against session_023: the eye was NOT centered).
+      earExtractGray(rgb, w, h, 0, 0, w, h, earGrayBuf);
+      earPercentileMask(earGrayBuf, earMaskBuf, w * h);
+
+      float fullCx, fullCy;
+      bool pastWarmup = (f.timestampMs - firstFrameTs) >= EAR_LOCK_WARMUP_MS;
+      bool gotSample = pastWarmup &&
+          EyeBlinkEAR::findDarkestWindow(earMaskBuf, w, h, EAR_LOCK_WIN_SIZE,
+                                          EAR_LOCK_STRIDE, EAR_LOCK_STRIDE,
+                                          earRowSumBuf, fullCx, fullCy);
+      if (gotSample && (int)lockSamplesX.size() < EAR_LOCK_SAMPLES) {
+        lockSamplesX.push_back(fullCx);
+        lockSamplesY.push_back(fullCy);
+      }
+
+      if ((int)lockSamplesX.size() >= EAR_LOCK_SAMPLES) {
+        EyeBlinkEAR::lockRoiFromSamples(lockSamplesX.data(), lockSamplesY.data(),
+                                         (int)lockSamplesX.size(), EAR_ROI_SIZE, w, h, roi);
+        earLockDone = true;
+        lockCompletedAtMs = f.timestampMs;
+        printf("#STATUS: EAR ROI locked at x=%d y=%d size=%d (t=%ums)\n",
+               roi.x, roi.y, roi.size, f.timestampMs);
+      }
+    } else {
+      // Periodic drift check: a SINGLE findDarkestWindow sample is too noisy
+      // to trust on its own (validated against session_023: every single
+      // per-frame drift sample landed 20-70px from the current ROI, purely
+      // from single-frame search noise, so the shift gate rejected every
+      // one -- the ROI never moved once in the whole 9-minute session, even
+      // though it clearly should have). Same fix as the boot-lock: gather a
+      // small burst of samples and use their median instead of one frame.
+      ++earDriftCounter;
+      if (EAR_DRIFT_ENABLED && !driftBursting && earDriftCounter % EAR_DRIFT_PERIOD == 0) {
+        driftBursting = true;
+        driftSamplesX.clear();
+        driftSamplesY.clear();
+      }
+
+      if (driftBursting) {
+        int dx = roi.x - EAR_DRIFT_MARGIN;
+        int dy = roi.y - EAR_DRIFT_MARGIN;
+        int dw = roi.size + 2 * EAR_DRIFT_MARGIN;
+        int dh = roi.size + 2 * EAR_DRIFT_MARGIN;
+
+        earExtractGray(rgb, w, h, dx, dy, dw, dh, earGrayBuf);
+        earPercentileMask(earGrayBuf, earMaskBuf, dw * dh);
+
+        float localCx, localCy;
+        if (EyeBlinkEAR::findDarkestWindow(earMaskBuf, dw, dh, EAR_LOCK_WIN_SIZE,
+                                            EAR_LOCK_STRIDE, EAR_LOCK_STRIDE,
+                                            earRowSumBuf, localCx, localCy)) {
+          driftSamplesX.push_back(dx + localCx);
+          driftSamplesY.push_back(dy + localCy);
+        }
+
+        if ((int)driftSamplesX.size() >= EAR_DRIFT_BURST) {
+          driftBursting = false;
+
+          std::vector<float> sortedX = driftSamplesX, sortedY = driftSamplesY;
+          std::sort(sortedX.begin(), sortedX.end());
+          std::sort(sortedY.begin(), sortedY.end());
+          float newFullCx = sortedX[sortedX.size() / 2];
+          float newFullCy = sortedY[sortedY.size() / 2];
+
+          float curCx = roi.x + roi.size / 2.0f;
+          float curCy = roi.y + roi.size / 2.0f;
+          float medShift = sqrtf((newFullCx - curCx) * (newFullCx - curCx) +
+                                  (newFullCy - curCy) * (newFullCy - curCy));
+          fprintf(stderr, "DRIFTBURST ts=%u cur=(%.1f,%.1f) median=(%.1f,%.1f) shift=%.1f  samples: ",
+                  f.timestampMs, curCx, curCy, newFullCx, newFullCy, medShift);
+          for (size_t i = 0; i < driftSamplesX.size(); i++) {
+            fprintf(stderr, "(%.0f,%.0f) ", driftSamplesX[i], driftSamplesY[i]);
+          }
+          fprintf(stderr, "\n");
+
+          float blendedCx = 0, blendedCy = 0;
+          bool apply = false;
+
+          if (EyeBlinkEAR::driftBlend(curCx, curCy, newFullCx, newFullCy,
+                                       EAR_DRIFT_MAX_PX, EAR_DRIFT_ALPHA,
+                                       blendedCx, blendedCy)) {
+            // Small shift from the current ROI -- trust it immediately.
+            apply = true;
+            havePendingCandidate = false;
+          } else {
+            // Large shift from the current ROI. Don't trust a single burst
+            // this far off (could be the eye closed mid-blink, a shadow,
+            // etc.) -- but if an EARLIER, INDEPENDENT burst already found
+            // a closely-agreeing position, two independent confirmations
+            // is real signal, not noise. Apply the full correction then.
+            float agreeShift = 1e9f;
+            if (havePendingCandidate) {
+              float ddx = newFullCx - pendingCandidateX;
+              float ddy = newFullCy - pendingCandidateY;
+              agreeShift = sqrtf(ddx * ddx + ddy * ddy);
+            }
+            if (havePendingCandidate && agreeShift < EAR_DRIFT_MAX_PX) {
+              blendedCx = newFullCx;
+              blendedCy = newFullCy;
+              apply = true;
+              havePendingCandidate = false;
+            } else {
+              pendingCandidateX = newFullCx;
+              pendingCandidateY = newFullCy;
+              havePendingCandidate = true;
+            }
+          }
+
+          if (apply) {
+            int rx = (int)(blendedCx - roi.size / 2.0f);
+            int ry = (int)(blendedCy - roi.size / 2.0f);
+            if (rx + roi.size > w) rx = w - roi.size;
+            if (ry + roi.size > h) ry = h - roi.size;
+            if (rx < 0) rx = 0;
+            if (ry < 0) ry = 0;
+            roi.x = rx;
+            roi.y = ry;
+            fprintf(stderr, "  -> APPLIED new roi=(%d,%d)\n", roi.x, roi.y);
+          }
+        }
+      }
+
+      earExtractGray(rgb, w, h, roi.x, roi.y, roi.size, roi.size, earGrayBuf);
+
+      // Glint-based detection -- same call main.cpp makes.
+      int glintPx = 0, roiBrightness = 0;
+      EyeBlinkEAR::glintAndBrightness(
+          earGrayBuf, roi.size, roi.size,
+          EyeBlinkEAR::GlintBlinkDetector::GLINT_LEVEL, glintPx, roiBrightness);
+      earValue = (float)glintPx;   // "ear" column now carries the glint count
+      const int WIDE_PAD = EAR_ROI_SIZE / 2;
+      int ww = roi.size + 2 * WIDE_PAD, wh = roi.size + 2 * WIDE_PAD;
+      earExtractGray(rgb, w, h, roi.x - WIDE_PAD, roi.y - WIDE_PAD, ww, wh, earGrayBuf);
+      int wideDarkPx = EyeBlinkEAR::countDarkPixels(
+          earGrayBuf, ww, wh, EyeBlinkEAR::GlintBlinkDetector::DARK_OFFSET_BELOW_MEAN);
+      blinkEvent = glint.update(glintPx, roiBrightness, wideDarkPx, f.timestampMs);
+      rollingRate = glint.rollingRateBpm(f.timestampMs);
+      if (blinkEvent) totalBlinkEvents++;
+      wroteRow = true;
+    }
+
+    std::string earField = wroteRow ? std::to_string(earValue) : std::string();
+    fprintf(csv, "%u,1,%s,%d,%.2f,%d,%d,%d,%.2f\n",
+            f.timestampMs, earField.c_str(),
+            blinkEvent ? 1 : 0, rollingRate, roi.x, roi.y, roi.locked ? 1 : 0,
+            lockConfidence);
+
+    stbi_image_free(rgb);
+  }
+
+  fclose(csv);
+
+  printf("\n=== session_replay summary ===\n");
+  printf("Total frames in session : %zu\n", frames.size());
+  if (useMotionLock)
+    printf("Lock confidence         : %.2f (min %.2f)\n", lockConfidence, EAR_MOTION_MIN_CONF);
+  else
+    printf("Lock samples collected  : %zu (of %d target)\n", lockSamplesX.size(), EAR_LOCK_SAMPLES);
+  printf("ROI locked              : %s", earLockDone ? "yes" : "no");
+  if (earLockDone) printf(" (at t=%ums)", lockCompletedAtMs);
+  printf("\n");
+  printf("Total blink events      : %d\n", totalBlinkEvents);
+  printf("Output CSV              : %s\n", outCsvPath.c_str());
+
+  return 0;
+}
