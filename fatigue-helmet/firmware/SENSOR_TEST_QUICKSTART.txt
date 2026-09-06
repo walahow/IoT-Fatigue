@@ -1,0 +1,101 @@
+════════════════════════════════════════════════════════════════════════════
+  IoT FATIGUE HELMET — SENSOR TEST QUICK START
+════════════════════════════════════════════════════════════════════════════
+
+1. COMPILE & UPLOAD (2 minutes)
+   ─────────────────────────────────────────────────────────────────────────
+   cd fatigue-helmet/firmware
+   pio run -e sensor_test -t upload --upload-port COM3
+
+   Replace COM3 with your actual serial port. On Linux/Mac use /dev/ttyUSB0.
+
+2. RUN TEST (1 minute)
+   ─────────────────────────────────────────────────────────────────────────
+   pio device monitor -b 921600 -p COM3
+
+   The test automatically runs and completes in ~100 seconds (30s per sensor).
+
+3. INTERPRET RESULTS (immediate)
+   ─────────────────────────────────────────────────────────────────────────
+   ✓ STABLE   → Sensor is healthy, proceed with full firmware
+   ⚠️ WARNING  → Minor issues, check troubleshooting table in SENSOR_TEST_GUIDE.md
+   ✗ FAILED   → Critical problem, verify wiring & power
+
+════════════════════════════════════════════════════════════════════════════
+
+WHAT EACH SENSOR TEST MEASURES:
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ PULSE SENSOR (GPIO 1, ADC1 @ 500 Hz) — 30 seconds                      │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ✓ Signal quality (ADC range 200–3900)                                   │
+│ ✓ Beat detection (at least 10 valid BPM readings expected)              │
+│ ✓ Contact stability (error rate <10%)                                   │
+│ → Pass: <10% error, ≥10 beats, smooth BPM 50–100                       │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ IMU: MPU-6050 (I2C @ 0x68, 10 Hz) — 30 seconds (~300 samples)          │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ✓ WHO_AM_I register (device identification)                             │
+│ ✓ I2C bus stability (0–5 read errors expected)                          │
+│ ✓ Sensor calibration (offsets computed)                                 │
+│ ✓ Data ranges (accel ±2g, gyro ±250 °/s)                               │
+│ → Pass: ≥290 samples, <5 errors, reasonable accel/gyro values          │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│ CAMERA: OV2640 (JPEG @ 20 FPS) — 30 seconds (~600 frames)              │
+├─────────────────────────────────────────────────────────────────────────┤
+│ ✓ Frame capture success rate                                            │
+│ ✓ Frame drop tracking (SD or USB contention)                            │
+│ ✓ JPEG compression stability                                            │
+│ ✓ Effective FPS vs. target                                              │
+│ → Pass: <5% drop rate, FPS ≥18, consistent frame sizes                 │
+└─────────────────────────────────────────────────────────────────────────┘
+
+════════════════════════════════════════════════════════════════════════════
+
+BEFORE YOU TEST:
+
+1. Pulse Sensor: Have a fingertip ready to place on sensor before test starts
+2. IMU: Keep device perfectly still during calibration (~2s at start)
+3. Camera: Let board warm up 10s; if no PSRAM, auto-falls back to QVGA
+
+════════════════════════════════════════════════════════════════════════════
+
+TROUBLESHOOTING CHECKLISTS:
+
+PULSE: No beats detected?
+  □ Check GPIO 1 wiring (should show 12-bit analog)
+  □ Adjust finger position/pressure on sensor
+  □ If ADC stuck at 0 or 4095: I2C noise on bus?
+  □ Clean sensor contact area
+
+IMU: "MPU-6050 not detected"?
+  □ Check VCC/GND wiring to MPU (typically 3.3V)
+  □ Verify SDA (GPIO 2) and SCL (GPIO 3) connections
+  □ Add 4.7kΩ pull-up resistors if missing (I2C bus: SDA/SCL → 3.3V)
+  □ Check I2C clock rate (should be 100 kHz)
+
+CAMERA: High frame drop rate?
+  □ If SD card mode: reduce FPS to 10 or resolution to QVGA
+  □ Check PSRAM is detected (shown in test output)
+  □ Verify no pin conflicts with pulse/IMU/SD
+  □ Power supply: board may brown-out if insufficient current (typical: 500mA @ 3.3V)
+
+════════════════════════════════════════════════════════════════════════════
+
+AFTER SUCCESSFUL TEST:
+
+  pio run -e esp32s3cam -t upload --upload-port COM3          # Debug mode (USB)
+  pio run -e esp32s3cam_sd -t upload --upload-port COM3       # Production (SD)
+
+════════════════════════════════════════════════════════════════════════════
+
+CAPTURE RESULTS TO FILE (for record-keeping):
+
+  pio device monitor -b 921600 -p COM3 > test_result_$(date +%s).txt 2>&1
+  python analyze_sensor_test.py test_result_*.txt              # Parse & grade
+
+════════════════════════════════════════════════════════════════════════════

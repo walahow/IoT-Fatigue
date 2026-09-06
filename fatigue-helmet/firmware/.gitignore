@@ -6,3 +6,10 @@
 sessions/
 venv/
 .venv/
+
+# Raw serial captures from sensor_test runs (scratch, not source)
+diag_raw*.txt
+imu_*.txt
+recmode_*.txt
+sensor_test_output*.txt
+sensor_test_result_*.txt
