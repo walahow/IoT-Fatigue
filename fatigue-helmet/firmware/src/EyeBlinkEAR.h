@@ -299,11 +299,34 @@ struct GlintBlinkDetector {
 
     // ── Third cue: the dark pupil must actually be GONE ──────────────────
     // Rejects gaze shifts, which empty the glint ROI without the eye ever
-    // closing. Measured on session_067: real blinks drop the wide-region
-    // dark-pixel count to 5-50% of its open-eye level, while an eye roll
-    // only reached 84% and a plainly open eye sits at 95-108%. 0.65 sits in
-    // the gap with margin on both sides.
-    static constexpr float MAX_DARK_FRACTION = 0.65f;
+    // closing. Originally 0.65, chosen from session_067 alone where real
+    // blinks fell to 5-50% of the open-eye dark count and an eye roll reached
+    // 84%.
+    //
+    // Re-measured across sessions 023/040/067/100 at the locked ROI, splitting
+    // candidates by whether they match a blink found with the ROI pinned on
+    // the pupil (23 real candidates, 94 non-blinks):
+    //
+    //     dark ratio    median   p90    max
+    //     real blinks     0.05   0.69   0.97
+    //     non-blinks      0.64   1.09  12.14
+    //
+    // 0.65 sat directly on the real distribution's p90, so it was clipping
+    // genuine blinks. Recall against that reference, holding MIN_BRIGHTEN:
+    //
+    //     0.65   15 real   5 noise      <- previous
+    //     0.70   17 real   5 noise
+    //     0.75   17 real   5 noise      <- here, centre of the plateau
+    //     0.78   17 real   5 noise
+    //     0.80   17 real   6 noise
+    //
+    // Two more blinks for no additional false positives, on a plateau rather
+    // than a single point. Loosening MIN_BRIGHTEN was measured too and is NOT
+    // a free win (2 -> 18 real but 6 noise), so it stays at 3.
+#ifndef EAR_MAX_DARK_FRACTION_X100
+#define EAR_MAX_DARK_FRACTION_X100 75
+#endif
+    static constexpr float MAX_DARK_FRACTION = EAR_MAX_DARK_FRACTION_X100 / 100.0f;
     static const int DARK_OFFSET_BELOW_MEAN = 28;   // for countDarkPixels()
 
     // ── Baseline seeding ────────────────────────────────────────────────
@@ -335,6 +358,20 @@ struct GlintBlinkDetector {
     int  minDarkInRun = 0x7FFFFFFF;// fewest dark pixels seen during the current run
     uint32_t blinkTimestamps[MAX_BLINKS_TRACKED] = {0};
     int blinkCount = 0;
+
+    // ── Per-candidate diagnostics ───────────────────────────────────────
+    // Written whenever a glint-absent run of plausible duration ENDS, whether
+    // or not it was accepted. Without these, a missed blink is indistinguish-
+    // able from a blink the glint cue never noticed, and tuning the thresholds
+    // is guesswork. ~24 bytes, and host tooling reads them every frame.
+    bool  dbgCandidate   = false;  // a valid-duration run ended this frame
+    int   dbgRunLen      = 0;
+    int   dbgBrightest   = 0;
+    float dbgOpenBright  = 0.0f;
+    int   dbgMinDark     = 0;
+    float dbgOpenDark    = 0.0f;
+    bool  dbgBrightened  = false;
+    bool  dbgPupilGone   = false;
 
     // Median of the first n entries. n <= BASELINE_WARMUP_N and this runs once
     // per session, so an insertion sort on a scratch copy is the right tool.
@@ -368,6 +405,7 @@ struct GlintBlinkDetector {
     bool update(int glintPx, int roiBrightness, int wideDarkPx, uint32_t nowMs) {
         bool present = (glintPx >= MIN_GLINT_PX);
         bool blinkEvent = false;
+        dbgCandidate = false;   // set only on the frame a candidate is judged
 
         if (!present) {
             absentRun++;
@@ -409,10 +447,18 @@ struct GlintBlinkDetector {
             // seconds, and in production the detector is already running during
             // ARMING, before the recording starts.
             if (sawValidRun && baselineReady) {
+                dbgCandidate  = true;
+                dbgRunLen     = absentRun;
+                dbgBrightest  = brightestInRun;
+                dbgOpenBright = openBrightness;
+                dbgMinDark    = minDarkInRun;
+                dbgOpenDark   = openDarkPx;
                 bool brightened = ((float)brightestInRun >= openBrightness + (float)MIN_BRIGHTEN);
                 // Cue 3: the dark pupil must have actually disappeared, not
                 // just moved out of the glint ROI (a gaze shift).
                 bool pupilGone = ((float)minDarkInRun <= openDarkPx * MAX_DARK_FRACTION);
+                dbgBrightened = brightened;
+                dbgPupilGone  = pupilGone;
                 if (brightened && pupilGone) {
                     blinkEvent = true;
                     pushBlink(nowMs);

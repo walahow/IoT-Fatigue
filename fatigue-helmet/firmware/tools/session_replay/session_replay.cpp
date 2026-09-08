@@ -194,7 +194,7 @@ int main(int argc, char **argv) {
     fprintf(stderr, "ERROR: cannot open %s for writing\n", outCsvPath.c_str());
     return 1;
   }
-  fprintf(csv, "timestamp_ms,processed,ear,is_blink_event,rolling_rate_bpm,roi_x,roi_y,roi_locked,lock_conf\n");
+  fprintf(csv, "timestamp_ms,processed,ear,is_blink_event,rolling_rate_bpm,roi_x,roi_y,roi_locked,lock_conf,cand,run_len,brightest,open_bright,min_dark,open_dark,brightened,pupil_gone\n");
 
   // ── Replay state (mirrors main.cpp's globals for this pipeline) ─────────
   uint8_t *earGrayBuf = nullptr;
@@ -468,10 +468,13 @@ int main(int argc, char **argv) {
     }
 
     std::string earField = wroteRow ? std::to_string(earValue) : std::string();
-    fprintf(csv, "%u,1,%s,%d,%.2f,%d,%d,%d,%.2f\n",
+    fprintf(csv, "%u,1,%s,%d,%.2f,%d,%d,%d,%.2f,%d,%d,%d,%.1f,%d,%.1f,%d,%d\n",
             f.timestampMs, earField.c_str(),
             blinkEvent ? 1 : 0, rollingRate, roi.x, roi.y, roi.locked ? 1 : 0,
-            lockConfidence);
+            lockConfidence,
+            glint.dbgCandidate ? 1 : 0, glint.dbgRunLen, glint.dbgBrightest,
+            glint.dbgOpenBright, glint.dbgMinDark, glint.dbgOpenDark,
+            glint.dbgBrightened ? 1 : 0, glint.dbgPupilGone ? 1 : 0);
 
     stbi_image_free(rgb);
   }
