@@ -306,14 +306,49 @@ struct GlintBlinkDetector {
     static constexpr float MAX_DARK_FRACTION = 0.65f;
     static const int DARK_OFFSET_BELOW_MEAN = 28;   // for countDarkPixels()
 
+    // ── Baseline seeding ────────────────────────────────────────────────
+    // openBrightness and openDarkPx used to be seeded from a SINGLE open-eye
+    // frame and then moved by a slow EMA (alpha 0.05, so ~20 frames to shift).
+    // Both gates below are tight -- 3 grey levels, and a 0.65 ratio -- so one
+    // unrepresentative seed frame skewed every decision for the rest of the
+    // session. Measured on session_100 with the ROI fixed and only the start
+    // frame varied, the blink count swung between 2 and 9.
+    //
+    // Seeding from the MEDIAN of the first N open-eye frames removes the
+    // dependence on any one frame, and the median (not the mean) keeps a
+    // half-closed or motion-blurred sample from dragging the reference.
+    // Setting this to 1 reproduces the old single-sample behaviour.
+#ifndef EAR_BASELINE_WARMUP_N
+#define EAR_BASELINE_WARMUP_N 12
+#endif
+    static const int BASELINE_WARMUP_N = EAR_BASELINE_WARMUP_N;
+
     int  absentRun = 0;
     bool sawValidRun = false;      // current absent run is within [MIN, MAX]
-    float openBrightness = -1.0f;  // EMA of ROI brightness while the eye is open
+    uint16_t warmBright[BASELINE_WARMUP_N] = {0};
+    uint16_t warmDark[BASELINE_WARMUP_N]   = {0};
+    int  warmCount = 0;
+    bool baselineReady = false;
+    float openBrightness = -1.0f;  // median-seeded, then EMA; see above
     int  brightestInRun = 0;       // peak ROI brightness during the current absent run
     float openDarkPx = -1.0f;      // EMA of wide-region dark pixels while eye is open
     int  minDarkInRun = 0x7FFFFFFF;// fewest dark pixels seen during the current run
     uint32_t blinkTimestamps[MAX_BLINKS_TRACKED] = {0};
     int blinkCount = 0;
+
+    // Median of the first n entries. n <= BASELINE_WARMUP_N and this runs once
+    // per session, so an insertion sort on a scratch copy is the right tool.
+    static uint16_t medianOf(const uint16_t *src, int n) {
+        uint16_t tmp[BASELINE_WARMUP_N];
+        for (int i = 0; i < n; i++) tmp[i] = src[i];
+        for (int i = 1; i < n; i++) {
+            uint16_t v = tmp[i];
+            int j = i - 1;
+            while (j >= 0 && tmp[j] > v) { tmp[j + 1] = tmp[j]; j--; }
+            tmp[j + 1] = v;
+        }
+        return tmp[n / 2];
+    }
 
     void pushBlink(uint32_t nowMs) {
         if (blinkCount < MAX_BLINKS_TRACKED) {
@@ -345,18 +380,39 @@ struct GlintBlinkDetector {
             }
         } else {
             // Only learn the open-eye references while the eye is actually open.
-            if (openBrightness < 0.0f) openBrightness = (float)roiBrightness;
-            else openBrightness += OPEN_BRIGHTNESS_ALPHA * ((float)roiBrightness - openBrightness);
-            if (openDarkPx < 0.0f) openDarkPx = (float)wideDarkPx;
-            else openDarkPx += OPEN_BRIGHTNESS_ALPHA * ((float)wideDarkPx - openDarkPx);
+            if (!baselineReady) {
+                if (warmCount < BASELINE_WARMUP_N) {
+                    warmBright[warmCount] = (uint16_t)roiBrightness;
+                    warmDark[warmCount]   = (uint16_t)wideDarkPx;
+                    warmCount++;
+                }
+                if (warmCount >= BASELINE_WARMUP_N) {
+                    openBrightness = (float)medianOf(warmBright, warmCount);
+                    openDarkPx     = (float)medianOf(warmDark, warmCount);
+                    baselineReady  = true;
+                }
+            } else {
+                openBrightness += OPEN_BRIGHTNESS_ALPHA * ((float)roiBrightness - openBrightness);
+                openDarkPx     += OPEN_BRIGHTNESS_ALPHA * ((float)wideDarkPx - openDarkPx);
+            }
 
-            if (sawValidRun) {
-                bool brightened = (openBrightness < 0.0f) ||
-                                  ((float)brightestInRun >= openBrightness + (float)MIN_BRIGHTEN);
+            // No blink is claimed before the baseline exists. The original code
+            // intended to bypass these cues while unseeded (`openBrightness <
+            // 0.0f`), but that test sat after the assignment and never fired.
+            // Bypassing is the wrong repair anyway: this module's own reasoning
+            // is that glint absence ALONE cannot tell a lid closure from the
+            // reflection drifting out of the crop, so an uncorroborated blink
+            // during warmup is exactly the false positive the three cues exist
+            // to prevent. Measured: bypassing inflated counts as the warmup
+            // lengthened (9-12 blinks at N=30 against 6-8 at N=20). Abstaining
+            // costs only the blinks in the first N open-eye frames -- about two
+            // seconds, and in production the detector is already running during
+            // ARMING, before the recording starts.
+            if (sawValidRun && baselineReady) {
+                bool brightened = ((float)brightestInRun >= openBrightness + (float)MIN_BRIGHTEN);
                 // Cue 3: the dark pupil must have actually disappeared, not
                 // just moved out of the glint ROI (a gaze shift).
-                bool pupilGone = (openDarkPx <= 0.0f) ||
-                                 ((float)minDarkInRun <= openDarkPx * MAX_DARK_FRACTION);
+                bool pupilGone = ((float)minDarkInRun <= openDarkPx * MAX_DARK_FRACTION);
                 if (brightened && pupilGone) {
                     blinkEvent = true;
                     pushBlink(nowMs);

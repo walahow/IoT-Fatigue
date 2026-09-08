@@ -155,11 +155,18 @@ int main(int argc, char **argv) {
   // motion-energy localizer. Default motion (the validated one).
   bool useMotionLock = true;
   int  maxFrames = 0;    // 0 = all
+  int  skipFrames = 0;   // drop this many leading frames
   bool manualRoi = false;
   int  manualCx = 0, manualCy = 0;
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
     else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
+    else if (strncmp(argv[i], "--skip-frames=", 14) == 0) {
+      // Drop the first N frames. With --roi pinned this varies ONLY which
+      // frame the blink detector starts on, which is how the stability of
+      // its open-eye baselines is measured.
+      skipFrames = atoi(argv[i] + 14);
+    }
     else if (strncmp(argv[i], "--max-frames=", 13) == 0) {
       // Stop after N frames. The ROI lock is decided in the first ~120,
       // so a localizer sweep need not decode a 10k-frame session.
@@ -222,7 +229,9 @@ int main(int argc, char **argv) {
   int totalBlinkEvents = 0;
   uint32_t lockCompletedAtMs = 0;
 
+  int _skipped = 0;
   for (const auto &f : frames) {
+    if (_skipped < skipFrames) { _skipped++; continue; }
     if (maxFrames > 0 && (int)earFrameCounter >= maxFrames) break;
     earFrameCounter++;
     // Boot-lock (not yet locked): process EVERY captured frame -- a more
