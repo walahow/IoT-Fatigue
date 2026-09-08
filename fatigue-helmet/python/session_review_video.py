@@ -27,12 +27,32 @@ import cv2, numpy as np, glob, os, sys, csv as csvmod
 sess    = sys.argv[1]
 out_mp4 = sys.argv[2]
 
-FR_W, FR_H = 320, 240
-SC         = 2
-W, H       = 1280, 720
-VID_W, VID_H = FR_W * SC, FR_H * SC       # 640x480
-TL_Y       = VID_H                         # timeline starts at y=480
-TL_H       = H - TL_Y                      # 240
+# Frame geometry is read from the footage, not assumed: sessions exist at both
+# QVGA (320x240) and VGA (640x480), and an earlier version hardcoded QVGA and
+# silently produced a broken canvas for the VGA ones.
+_probe = sorted(glob.glob(os.path.join(sess, "frames", "*.jpg")),
+                key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+if not _probe:
+    raise SystemExit("no frames in %s -- run unpack_session.py first" % sess)
+_im = cv2.imread(_probe[0])
+if _im is None:
+    raise SystemExit("could not read %s" % _probe[0])
+FR_H, FR_W = _im.shape[:2]
+SC = max(1, int(round(640.0 / FR_W)))      # QVGA -> 2x, VGA -> 1x
+VID_W, VID_H = FR_W * SC, FR_H * SC
+W, H       = VID_W + 640, max(720, VID_H + 240)
+TL_Y       = VID_H
+TL_H       = H - TL_Y
+
+# ROI edge length in source pixels, matching EAR_ROI_SIZE in the firmware.
+# Override when replaying with a different value (e.g. 96 for VGA).
+ROI_PX = int(sys.argv[3]) if len(sys.argv) > 3 else 48
+
+# Keep every Nth frame. Output fps is unchanged, so a stride > 1 plays the
+# session back that many times faster -- session_023 is nine minutes at
+# 20 fps, which is neither watchable nor a sane file size at 1:1. The
+# timeline lanes are still drawn from the FULL data, so nothing is hidden.
+STRIDE = int(sys.argv[4]) if len(sys.argv) > 4 else 1
 
 # ── palette (BGR) ────────────────────────────────────────────────────
 BG      = (24, 20, 18)
@@ -55,8 +75,7 @@ def put(img, txt, org, scale=0.5, col=INK, thick=1, font=cv2.FONT_HERSHEY_SIMPLE
 # this script hardcoded "SESSION 100" and mislabelled every other session.
 SESSION_LABEL = os.path.basename(os.path.normpath(sess)).replace("_", " ").upper()
 
-files = sorted(glob.glob(os.path.join(sess, "frames", "*.jpg")),
-               key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
+files = _probe
 fts = [int(os.path.splitext(os.path.basename(p))[0]) for p in files]
 print("frames:", len(files))
 
@@ -159,13 +178,16 @@ for k in range(0, int(span / 1000) + 1, 10):
     put(tl, "%ds" % k, (x - 9, TL_H - 3), 0.36, INK3)
 
 # ── writer ───────────────────────────────────────────────────────────
-fps = len(files) / (span / 1000.0)
+fps = len(files) / (span / 1000.0)   # source rate; stride speeds playback
 vw = cv2.VideoWriter(out_mp4, cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
 print("fps: %.2f" % fps)
 
 BLINK_HOLD_MS = 220
 
-for i, (path, ts) in enumerate(zip(files, fts)):
+render_list = list(zip(files, fts))[::STRIDE]
+print("rendering %d of %d frames (stride %d)" % (len(render_list), len(files), STRIDE))
+
+for i, (path, ts) in enumerate(render_list):
     canvas = np.full((H, W, 3), BG, np.uint8)
     frame = cv2.imread(path)
     if frame is None:
@@ -180,11 +202,11 @@ for i, (path, ts) in enumerate(zip(files, fts)):
 
     if lok and lok["locked"]:
         x, y = lok["rx"] * SC, lok["ry"] * SC
-        cv2.rectangle(big, (x, y), (x + 48 * SC, y + 48 * SC), HOT, 2)
-        put(big, "localizer lock", (x + 4, y + 48 * SC + 16), 0.44, HOT)
+        cv2.rectangle(big, (x, y), (x + ROI_PX * SC, y + ROI_PX * SC), HOT, 2)
+        put(big, "localizer lock", (x + 4, y + ROI_PX * SC + 16), 0.44, HOT)
     if pin:
         x, y = pin["rx"] * SC, pin["ry"] * SC
-        cv2.rectangle(big, (x, y), (x + 48 * SC, y + 48 * SC), GOOD, 2)
+        cv2.rectangle(big, (x, y), (x + ROI_PX * SC, y + ROI_PX * SC), GOOD, 2)
         put(big, "pinned on eye", (x + 4, y - 8), 0.44, GOOD)
 
     if recent_blink:
@@ -202,7 +224,8 @@ for i, (path, ts) in enumerate(zip(files, fts)):
     yy = 34
     put(canvas, SESSION_LABEL, (px0 + 22, yy), 0.62, INK, 2)
     yy += 22
-    put(canvas, "t = %6.2f s     frame %d/%d" % ((ts - t0) / 1000.0, i + 1, len(files)),
+    put(canvas, "t = %6.2f s     frame %d/%d%s" % ((ts - t0) / 1000.0,
+            i * STRIDE + 1, len(files), "" if STRIDE == 1 else "  (%dx)" % STRIDE),
         (px0 + 22, yy), 0.44, INK2)
     yy += 26
     cv2.line(canvas, (px0 + 22, yy), (W - 22, yy), RULE, 1)
@@ -256,7 +279,7 @@ for i, (path, ts) in enumerate(zip(files, fts)):
 
     vw.write(canvas)
     if i % 100 == 0:
-        print("  %d/%d" % (i, len(files)))
+        print("  %d/%d" % (i, len(render_list)))
 
 vw.release()
 print("wrote", out_mp4)

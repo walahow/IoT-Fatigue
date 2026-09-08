@@ -37,7 +37,13 @@
 
 // ── Same constants as main.cpp's processEarFrame() integration ────────────
 static const int   EAR_THROTTLE_DIV = 1;   // every frame, matches main.cpp
-static const int   EAR_ROI_SIZE     = 48;  // QVGA, matches main.cpp
+#ifndef EAR_ROI_SIZE
+// 48 matches main.cpp and is correct for QVGA. A VGA recording covers the
+// same eye with roughly twice the pixels, so replaying one of those wants
+// -DEAR_ROI_SIZE=96. Must stay compile-time: it sizes the scratch arrays.
+#define EAR_ROI_SIZE 48
+#endif
+static const int   EAR_ROI_SIZE_V   = EAR_ROI_SIZE;  // QVGA, matches main.cpp
 static const int   EAR_DRIFT_PERIOD = 40;
 static const int   EAR_DRIFT_MARGIN = 30;
 static const float EAR_DRIFT_MAX_PX = 20.0f;
@@ -249,7 +255,7 @@ int main(int argc, char **argv) {
 
     if (!earLockDone && manualRoi) {
       float xs[1] = {(float)manualCx}, ys[1] = {(float)manualCy};
-      EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, roi);
+      EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE_V, w, h, roi);
       earLockDone = true;
       lockConfidence = -1.0f;       // -1 = pinned, not measured
       lockCompletedAtMs = f.timestampMs;
@@ -264,14 +270,14 @@ int main(int argc, char **argv) {
       bool pastWarmup = (f.timestampMs - firstFrameTs) >= EAR_LOCK_WARMUP_MS;
       if (pastWarmup) {
 #if EAR_LOCALIZER_VERSION == 2
-        locator.setRoiSize(EAR_ROI_SIZE);
+        locator.setRoiSize(EAR_ROI_SIZE_V);
 #endif
         locator.addFrame(earGrayBuf, w, h);
         float mcx, mcy, conf;
         if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES_V, mcx, mcy, conf)) {
           if (conf >= EAR_MOTION_MIN_CONF || ++motionTries >= EAR_MOTION_MAX_TRIES) {
             float xs[1] = {mcx}, ys[1] = {mcy};
-            EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, roi);
+            EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE_V, w, h, roi);
             earLockDone = true;
             lockConfidence = conf;
             lockCompletedAtMs = f.timestampMs;
