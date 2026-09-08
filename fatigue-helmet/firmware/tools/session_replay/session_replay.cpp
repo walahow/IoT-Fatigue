@@ -74,7 +74,9 @@ static const bool     EAR_DRIFT_ENABLED    = false;
 // scores better than longer windows; confidence (peak/mean) separates a real
 // eye lock from a smeared/flat map.
 #ifndef EAR_MOTION_MIN_FRAMES
-#if EAR_LOCALIZER_VERSION == 2
+#if EAR_LOCALIZER_VERSION >= 3
+#define EAR_MOTION_MIN_FRAMES 120   // frame floor under v3's time window
+#elif EAR_LOCALIZER_VERSION == 2
 #define EAR_MOTION_MIN_FRAMES 240   // ~20 s; see main.cpp for why
 #else
 #define EAR_MOTION_MIN_FRAMES 60
@@ -269,10 +271,14 @@ int main(int argc, char **argv) {
       earExtractGray(rgb, w, h, 0, 0, w, h, earGrayBuf);
       bool pastWarmup = (f.timestampMs - firstFrameTs) >= EAR_LOCK_WARMUP_MS;
       if (pastWarmup) {
-#if EAR_LOCALIZER_VERSION == 2
+#if EAR_LOCALIZER_VERSION >= 2
         locator.setRoiSize(EAR_ROI_SIZE_V);
 #endif
+#if EAR_LOCALIZER_VERSION >= 3
+        locator.addFrame(earGrayBuf, w, h, f.timestampMs);
+#else
         locator.addFrame(earGrayBuf, w, h);
+#endif
         float mcx, mcy, conf;
         if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES_V, mcx, mcy, conf)) {
           if (conf >= EAR_MOTION_MIN_CONF || ++motionTries >= EAR_MOTION_MAX_TRIES) {

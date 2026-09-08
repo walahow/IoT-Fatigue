@@ -277,7 +277,13 @@ static const bool  EAR_DRIFT_ENABLED  = false;
 // EyeBlinkEAR::MotionLocator for the implementation; validated on the same
 // session: locked within 2.8px of the true eye centre on the first try,
 // confidence 5.04 against a 2.0 gate.
-#if EAR_LOCALIZER_VERSION == 2
+#if EAR_LOCALIZER_VERSION >= 3
+// v3 gates on EAR_V3_WINDOW_MS of wall clock (20 s), which holds the number of
+// blinks in the window constant across frame rates. This is only the frame
+// FLOOR beneath that: enough samples to resolve a 100-300 ms blink at all. It
+// binds only below 6 fps, where 20 s would yield fewer than 120 frames.
+static const int   EAR_MOTION_MIN_FRAMES = 120;
+#elif EAR_LOCALIZER_VERSION == 2
 // 240 frames is ~20 s at this camera's real ~12 fps, which contains about
 // five blinks at a normal 14/min. The old 60 (~5 s) contained roughly ONE,
 // and a single blink is indistinguishable from a single stray light
@@ -400,13 +406,19 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     // Full-frame motion energy -- no assumption about where in the frame
     // the eye sits (session_023 found it was NOT centered).
     earExtractGray(g_earRgbBuf, w, h, 0, 0, w, h, g_earGrayBuf);
-#if EAR_LOCALIZER_VERSION == 2
-    // Tell v2 the ROI size so it can reject a peak whose ROI would hang off
+#if EAR_LOCALIZER_VERSION >= 2
+    // Tell v2+ the ROI size so it can reject a peak whose ROI would hang off
     // the frame, instead of clamping it inward the way v1 did. Cheap enough
     // to set every frame; v1 has no such setter, by design.
     g_earLocator.setRoiSize(EAR_ROI_SIZE);
 #endif
+#if EAR_LOCALIZER_VERSION >= 3
+    // v3 measures its lock window on the wall clock, so it needs the frame's
+    // timestamp. Without one it would silently fall back to frame counting.
+    g_earLocator.addFrame(g_earGrayBuf, w, h, timestampMs);
+#else
     g_earLocator.addFrame(g_earGrayBuf, w, h);
+#endif
 
     float mcx, mcy, conf;
     if (g_earLocator.peak(w, h, EAR_MOTION_MIN_FRAMES, mcx, mcy, conf)) {

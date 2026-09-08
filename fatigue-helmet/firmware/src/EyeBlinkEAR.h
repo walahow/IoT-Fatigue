@@ -773,20 +773,113 @@ struct MotionLocatorV2 : MotionLocatorV1 {
     }
 };
 
+
+// ── Localizer v3 ──────────────────────────────────────────────────────────
+// Derives from v2 and changes the unit the lock window is measured in: wall
+// clock instead of frame count.
+//
+// v2 waits for EAR_MOTION_MIN_FRAMES frames. Nothing in that path consults a
+// clock, so the window's real duration is set by whatever frame rate the
+// camera happens to achieve -- and that varies with the EAR decode cost and
+// SD write load. Measured across the recorded sessions, 240 frames means:
+//
+//     session_023  20.0 fps -> 12.0 s -> ~2.8 blinks in the window
+//     session_100  11.9 fps -> 20.2 s -> ~4.7 blinks
+//     session_067  11.8 fps -> 20.3 s -> ~4.7 blinks
+//     session_040   7.9 fps -> 30.4 s -> ~7.1 blinks   (half the session)
+//
+// The quantity the localizer actually depends on is BLINKS in the window --
+// that was the whole session_100 diagnosis: one blink is a single sample and
+// cannot be told apart from one stray light movement. Blinks arrive on a wall
+// clock (~14/min), not per frame, so time is the unit that holds the thing
+// that matters constant. A 20 s window is ~4.7 blinks at every frame rate
+// above.
+//
+// The frame count does not stop mattering, it becomes a FLOOR. A blink lasts
+// roughly 100-300 ms, so at a low enough frame rate a 20 s window would carry
+// too few samples to resolve one at all. peak()'s minFrames argument is now
+// that floor: v3 locks when BOTH the window has elapsed AND minFrames have
+// accumulated, whichever finishes later. At the call sites' 120-frame floor
+// this binds only below 6 fps.
+//
+// A caller that never supplies a timestamp keeps v2's behaviour exactly,
+// rather than never locking -- see the two addFrame overloads.
+struct MotionLocatorV3 : MotionLocatorV2 {
+#ifndef EAR_V3_WINDOW_MS
+// Swept over sessions 023/040/067/100: 16-21 s all give 4/4 locks at 12.8 px
+// mean error, 15 s and 22 s both drop to 3/4. 18 s is the centre of that
+// plateau rather than its edge. The distinction is narrow -- what flips is
+// session_040 crossing its 24 px tolerance by a few pixels, and mean error
+// only moves 12.8 vs 14.4 -- so treat the window as tuned, not as a constant
+// with wide margins. Re-run localizer_eval.py before changing it.
+#define EAR_V3_WINDOW_MS 18000
+#endif
+
+    uint32_t windowMs;
+    uint32_t firstMs;
+    uint32_t lastMs;
+    bool     haveTime;
+
+    MotionLocatorV3()
+        : windowMs(EAR_V3_WINDOW_MS), firstMs(0), lastMs(0), haveTime(false) {}
+
+    void reset() {
+        MotionLocatorV2::reset();
+        firstMs  = 0;
+        lastMs   = 0;
+        haveTime = false;
+        // windowMs is configuration, not accumulation state: the retry loop
+        // resets between attempts and must not lose it.
+    }
+
+    void setWindowMs(uint32_t ms) { windowMs = ms; }
+
+    // Timestamped form. Keeps the 3-argument version from v2 visible via the
+    // using-declaration below, so a caller without a clock still compiles and
+    // simply falls back to frame-count gating.
+    void addFrame(const uint8_t *gray, int w, int h, uint32_t nowMs) {
+        if (w < GRID_W || h < GRID_H) return;   // same guard as v1, so the
+                                                // clock cannot start on a
+                                                // frame that was not counted
+        MotionLocatorV2::addFrame(gray, w, h);
+        if (!haveTime) {
+            firstMs  = nowMs;
+            haveTime = true;
+        }
+        lastMs = nowMs;
+    }
+    using MotionLocatorV2::addFrame;
+
+    bool peak(int fullW, int fullH, int minFrames,
+              float &outCx, float &outCy, float &outConfidence) {
+        // Unsigned subtraction, so a millis() rollover mid-window yields the
+        // correct elapsed time rather than a huge value that locks instantly.
+        if (haveTime && (uint32_t)(lastMs - firstMs) < windowMs) return false;
+
+        // minFrames is enforced downstream by v1's own gate, which is what
+        // makes it the floor rather than the primary condition.
+        return MotionLocatorV2::peak(fullW, fullH, minFrames,
+                                     outCx, outCy, outConfidence);
+    }
+};
+
 // ── Localizer version selection ───────────────────────────────────────────
-// Build with -DEAR_LOCALIZER_VERSION=1 to fall back to the frozen v1, which is
+// Build with -DEAR_LOCALIZER_VERSION=1 or =2 to fall back to an earlier version;
+// v1 is the frozen baseline and v2 the frame-count window. Each is
 // kept as the regression baseline. Call sites use the EyeBlinkEAR::MotionLocator
 // alias and need no change when this moves.
 #ifndef EAR_LOCALIZER_VERSION
-#define EAR_LOCALIZER_VERSION 2
+#define EAR_LOCALIZER_VERSION 3
 #endif
 
 #if EAR_LOCALIZER_VERSION == 1
 typedef MotionLocatorV1 MotionLocator;
 #elif EAR_LOCALIZER_VERSION == 2
 typedef MotionLocatorV2 MotionLocator;
+#elif EAR_LOCALIZER_VERSION == 3
+typedef MotionLocatorV3 MotionLocator;
 #else
-#error "EAR_LOCALIZER_VERSION must be 1 or 2"
+#error "EAR_LOCALIZER_VERSION must be 1, 2 or 3"
 #endif
 
 
