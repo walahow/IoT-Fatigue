@@ -277,7 +277,21 @@ static const bool  EAR_DRIFT_ENABLED  = false;
 // EyeBlinkEAR::MotionLocator for the implementation; validated on the same
 // session: locked within 2.8px of the true eye centre on the first try,
 // confidence 5.04 against a 2.0 gate.
+#if EAR_LOCALIZER_VERSION == 2
+// 240 frames is ~20 s at this camera's real ~12 fps, which contains about
+// five blinks at a normal 14/min. The old 60 (~5 s) contained roughly ONE,
+// and a single blink is indistinguishable from a single stray light
+// movement anywhere else in the frame -- which is exactly how session_100
+// locked 252 px from the pupil and recorded zero blinks. Measured across
+// sessions 023/040/067/100, this one change drops mean lock error from
+// 74.6 px to 14.4 px. Do not shorten it without re-running that set.
+//
+// The arming phase waits up to ARMING_TIMEOUT_MS (60 s) for the eye lock,
+// so a ~20 s window fits comfortably inside a normal session start.
+static const int   EAR_MOTION_MIN_FRAMES = 240;
+#else
 static const int   EAR_MOTION_MIN_FRAMES = 60;    // ~3s of processed frames
+#endif
 static const float EAR_MOTION_MIN_CONF   = 2.0f;  // reject flat/smeared maps
 static const int   EAR_MOTION_MAX_TRIES  = 12;    // accept a weak lock rather than never locking
 
@@ -386,6 +400,12 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     // Full-frame motion energy -- no assumption about where in the frame
     // the eye sits (session_023 found it was NOT centered).
     earExtractGray(g_earRgbBuf, w, h, 0, 0, w, h, g_earGrayBuf);
+#if EAR_LOCALIZER_VERSION == 2
+    // Tell v2 the ROI size so it can reject a peak whose ROI would hang off
+    // the frame, instead of clamping it inward the way v1 did. Cheap enough
+    // to set every frame; v1 has no such setter, by design.
+    g_earLocator.setRoiSize(EAR_ROI_SIZE);
+#endif
     g_earLocator.addFrame(g_earGrayBuf, w, h);
 
     float mcx, mcy, conf;

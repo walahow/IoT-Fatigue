@@ -67,7 +67,14 @@ static const bool     EAR_DRIFT_ENABLED    = false;
 // Validated on session_023 at decimated resolution: 60 frames is enough and
 // scores better than longer windows; confidence (peak/mean) separates a real
 // eye lock from a smeared/flat map.
-static const int   EAR_MOTION_MIN_FRAMES = 60;    // ~3 s at 20 fps
+#ifndef EAR_MOTION_MIN_FRAMES
+#if EAR_LOCALIZER_VERSION == 2
+#define EAR_MOTION_MIN_FRAMES 240   // ~20 s; see main.cpp for why
+#else
+#define EAR_MOTION_MIN_FRAMES 60
+#endif
+#endif
+static const int   EAR_MOTION_MIN_FRAMES_V = EAR_MOTION_MIN_FRAMES;  // ~3 s at 20 fps
 static const float EAR_MOTION_MIN_CONF   = 2.0f;  // reject flat/smeared maps
 static const int   EAR_MOTION_MAX_TRIES  = 12;    // give up after this many windows
 
@@ -139,11 +146,17 @@ int main(int argc, char **argv) {
   // Lock mode: "dark" = original darkest-blob boot lock, "motion" = temporal
   // motion-energy localizer. Default motion (the validated one).
   bool useMotionLock = true;
+  int  maxFrames = 0;    // 0 = all
   bool manualRoi = false;
   int  manualCx = 0, manualCy = 0;
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
     else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
+    else if (strncmp(argv[i], "--max-frames=", 13) == 0) {
+      // Stop after N frames. The ROI lock is decided in the first ~120,
+      // so a localizer sweep need not decode a 10k-frame session.
+      maxFrames = atoi(argv[i] + 13);
+    }
     else if (strncmp(argv[i], "--roi=", 6) == 0) {
       // Pin the ROI centre instead of locking. Mirrors the firmware's
       // EAR_ROI_MANUAL_X/Y build flags, and lets the blink algorithm be
@@ -202,6 +215,7 @@ int main(int argc, char **argv) {
   uint32_t lockCompletedAtMs = 0;
 
   for (const auto &f : frames) {
+    if (maxFrames > 0 && (int)earFrameCounter >= maxFrames) break;
     earFrameCounter++;
     // Boot-lock (not yet locked): process EVERY captured frame -- a more
     // thorough one-time search before steady-state processing begins, since
@@ -249,9 +263,12 @@ int main(int argc, char **argv) {
       earExtractGray(rgb, w, h, 0, 0, w, h, earGrayBuf);
       bool pastWarmup = (f.timestampMs - firstFrameTs) >= EAR_LOCK_WARMUP_MS;
       if (pastWarmup) {
+#if EAR_LOCALIZER_VERSION == 2
+        locator.setRoiSize(EAR_ROI_SIZE);
+#endif
         locator.addFrame(earGrayBuf, w, h);
         float mcx, mcy, conf;
-        if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES, mcx, mcy, conf)) {
+        if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES_V, mcx, mcy, conf)) {
           if (conf >= EAR_MOTION_MIN_CONF || ++motionTries >= EAR_MOTION_MAX_TRIES) {
             float xs[1] = {mcx}, ys[1] = {mcy};
             EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, roi);

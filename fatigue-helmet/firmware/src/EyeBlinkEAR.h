@@ -535,7 +535,20 @@ inline bool findDarkestWindow(const uint8_t *mask, int w, int h, int winSize,
 //     windows (conf 3.18 at 60 frames vs 1.93 at 600) -- a long accumulation
 //     smears the peak as the helmet drifts. Short, repeated locks beat one
 //     long one.
-struct MotionLocator {
+// ── Localizer v1 (frozen) ─────────────────────────────────────────────────
+// Shipped implementation, kept byte-identical as the regression baseline that
+// later versions are measured against. Do not change this struct; add a new
+// version that derives from it instead (see MotionLocatorV2).
+//
+// Known limitation, measured across sessions 023/040/067/100: the accumulated
+// sum of |frame delta| rewards a CONTINUOUS low-level noise floor over the
+// BRIEF bursts a blink actually produces. On session_100 the left band of the
+// frame carried ~3x the temporal noise of the frame median, which out-
+// integrated the eye over the 60-frame lock window; the peak landed 227 px
+// from the pupil, in a corner, and the session recorded 0 blinks. v1 also
+// CLAMPS a peak whose ROI would not fit in frame rather than rejecting it,
+// which is how a peak at x=2 became a ROI at x=0.
+struct MotionLocatorV1 {
     static const int GRID_W = 80;
     static const int GRID_H = 60;
     static const int GRID_N = GRID_W * GRID_H;
@@ -549,7 +562,7 @@ struct MotionLocator {
     bool     havePrev;
     int      framesAccumulated;
 
-    MotionLocator() { reset(); }
+    MotionLocatorV1() { reset(); }
 
     void reset() {
         memset(prev, 0, sizeof(prev));
@@ -658,6 +671,125 @@ struct MotionLocator {
         return true;
     }
 };
+
+
+// ── Localizer v2 ──────────────────────────────────────────────────────────
+// Derives from v1 and changes exactly one thing: a peak whose ROI would not
+// fit inside the frame is REJECTED rather than clamped inward.
+//
+// v1 fed its peak to lockRoiFromSamples(), which clamps the ROI to the frame.
+// A peak 2 px from the left edge therefore became a ROI at x=0 -- a position
+// the eye can never occupy, because the camera is mounted to look at it. The
+// clamp turned "I found something at the very edge" into a confident-looking
+// lock on a region that was never a candidate. Rejecting instead means the
+// localizer keeps searching, or reports failure honestly.
+//
+// Set roiSize to enable the constraint; 0 preserves v1's behaviour exactly.
+//
+// WHAT WAS MEASURED, AND WHAT DID NOT WORK
+//
+// This started as an investigation into session_100, where v1 locked 252 px
+// from the pupil and the session recorded 0 blinks. The obvious-looking
+// causes were each tested against sessions 023/040/067/100 and each rejected:
+//
+//   - "A specular flare wins the lock." No: nothing in the frame was near
+//     saturation (max grid brightness 73 of 255), and a brightness gate did
+//     not separate the eye (44.8) from the winning cell (61.4).
+//   - "Summing |delta| rewards a continuous noise floor over brief blinks."
+//     Directionally true -- the losing band carried 3.1x the frame's median
+//     temporal noise -- but every fix built on it failed. Second temporal
+//     differences, per-cell burst counting against a frugal-median floor, a
+//     fixed-threshold burst count, and dark-weighted variants were compiled
+//     and run in 41 configurations. NONE moved session_100 below 231 px.
+//   - Per-cell normalisation specifically cannot work here: the eye cell and
+//     the winning band cell have near-identical median |d2| (3.5 vs 3.0), so
+//     there is no per-cell noise difference to normalise away.
+//
+// The actual cause was the LOCK WINDOW, not the statistic. EAR_MOTION_MIN
+// _FRAMES was 60, which at this camera's real ~12 fps is about 5 seconds and
+// contains roughly ONE blink at a normal 14 blinks/min. One blink is a single
+// sample; no statistic can separate "the cell that blinked once" from "the
+// cell where a light moved once". Raising the window to 240 frames (~20 s,
+// ~5 blinks) drops v1's own mean error from 74.6 px to 14.4 px and fixes
+// session_100 outright (252 px -> 12 px). See EAR_MOTION_MIN_FRAMES at the
+// call sites, which v2 raises.
+//
+// With an adequate window the burst-counting machinery gave no further gain
+// (mean 16.2 px vs v1's 14.4 px) for 28.8 KB of state and an extra pass over
+// the grid every frame, so it is deliberately NOT shipped. The negative
+// result is recorded here so the next version does not re-derive it.
+struct MotionLocatorV2 : MotionLocatorV1 {
+    int roiSize;   // 0 = no fit constraint (v1 behaviour)
+
+    MotionLocatorV2() : roiSize(0) {}
+
+    // roiSize is configuration, not accumulation state, so reset() must not
+    // clear it -- the retry loop resets between lock attempts.
+    void setRoiSize(int s) { roiSize = s; }
+
+    bool peak(int fullW, int fullH, int minFrames,
+              float &outCx, float &outCy, float &outConfidence) {
+        float vCx, vCy, vConf;
+        if (!MotionLocatorV1::peak(fullW, fullH, minFrames, vCx, vCy, vConf))
+            return false;   // too few frames, or nothing moved at all
+
+        if (roiSize <= 0) {                 // constraint disabled: v1 verbatim
+            outCx = vCx; outCy = vCy; outConfidence = vConf;
+            return true;
+        }
+
+        // v1 leaves the blurred energy map in smooth[]. Re-run the argmax over
+        // it, skipping cells whose ROI would hang off the edge, and take the
+        // confidence relative to the cells actually eligible to win.
+        const int half = roiSize / 2;
+        uint32_t total = 0;
+        int      counted = 0;
+        int      bestIdx = -1;
+        uint16_t bestVal = 0;
+
+        for (int gy = 0; gy < GRID_H; gy++) {
+            float cy = ((float)gy + 0.5f) * (float)fullH / (float)GRID_H;
+            if (cy - half < 0.0f || cy + half > (float)fullH) continue;
+            for (int gx = 0; gx < GRID_W; gx++) {
+                float cx = ((float)gx + 0.5f) * (float)fullW / (float)GRID_W;
+                if (cx - half < 0.0f || cx + half > (float)fullW) continue;
+                int i = gy * GRID_W + gx;
+                total += smooth[i];
+                counted++;
+                if (smooth[i] > bestVal) { bestVal = smooth[i]; bestIdx = i; }
+            }
+        }
+
+        if (bestIdx < 0 || bestVal == 0) return false;
+
+        float mean = counted ? ((float)total / (float)counted) : 0.0f;
+        outConfidence = (mean > 1e-6f) ? ((float)bestVal / mean) : 0.0f;
+
+        int gx = bestIdx % GRID_W;
+        int gy = bestIdx / GRID_W;
+        outCx = ((float)gx + 0.5f) * (float)fullW / (float)GRID_W;
+        outCy = ((float)gy + 0.5f) * (float)fullH / (float)GRID_H;
+        return true;
+    }
+};
+
+// ── Localizer version selection ───────────────────────────────────────────
+// Build with -DEAR_LOCALIZER_VERSION=1 to fall back to the frozen v1, which is
+// kept as the regression baseline. Call sites use the EyeBlinkEAR::MotionLocator
+// alias and need no change when this moves.
+#ifndef EAR_LOCALIZER_VERSION
+#define EAR_LOCALIZER_VERSION 2
+#endif
+
+#if EAR_LOCALIZER_VERSION == 1
+typedef MotionLocatorV1 MotionLocator;
+#elif EAR_LOCALIZER_VERSION == 2
+typedef MotionLocatorV2 MotionLocator;
+#else
+#error "EAR_LOCALIZER_VERSION must be 1 or 2"
+#endif
+
+
 
 struct RoiLock {
     int x = 0;
