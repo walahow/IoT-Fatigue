@@ -44,7 +44,7 @@
 #include <math.h>
 #include "FuzzyFatigue.h"  // Mamdani FIS (heap-free, STL-free, header-only)
 
-#if defined(STORAGE_MODE_SD)
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
 #include "EyeBlinkEAR.h"        // on-device blink detection (spec section 5)
 #include "img_converters.h"     // fmt2rgb888() -- esp32-camera
 #include "esp_heap_caps.h"      // heap_caps_malloc() / MALLOC_CAP_SPIRAM
@@ -115,6 +115,40 @@
 
 // ── Session Control ──────────────────────────────────────────────────────────
 #define BUTTON_PIN 21
+
+// Session lifecycle. The button no longer flips recording on directly:
+// pressing it ARMS the rig, which re-establishes the three things a usable
+// session needs -- eye ROI lock, HR baseline, IMU calibration for the pose the
+// helmet is ACTUALLY in -- and only then starts writing. Recording with any of
+// those missing produces a session that cannot be used for training, which is
+// the failure this state machine exists to prevent.
+//
+//   IDLE --press--> ARMING --all ready | timeout--> RECORDING --press--> IDLE
+//                     |                                        (closeSession)
+//                     +--press = abort--> IDLE
+enum SessionState {
+  SESSION_IDLE = 0,
+  SESSION_ARMING,
+  SESSION_RECORDING
+};
+
+// Give up waiting and record anyway after this long. A subsystem that never
+// goes ready (eye lock in poor light, bad pulse contact) must not cost the
+// whole session -- the readiness flags are written into metadata.txt instead,
+// so the recording can be judged afterward rather than silently trusted.
+static const uint32_t ARMING_TIMEOUT_MS = 60000;
+
+SessionState g_sessionState = SESSION_IDLE;
+uint32_t     g_armStartMs   = 0;
+bool         g_armTimedOut  = false;
+
+// Per-subsystem readiness, latched at the moment recording begins.
+bool g_readyImu = false;
+bool g_readyHr  = false;
+bool g_readyEye = false;
+
+// Derived from g_sessionState so the existing consumers (saveJpegToSD, the CSV
+// writer, the buzzer gate) keep working unchanged.
 #if defined(STORAGE_MODE_USB)
 bool g_sessionActive = true;  // Start streaming immediately in USB debug mode
 #else
@@ -169,7 +203,10 @@ bool g_mpuEnabled = false;
 bool g_buzzerActive = false;
 // Mute the physical buzzer without breaking the I2C-suspend-during-EMI logic:
 // setBuzzerState() ANDs this in, so g_buzzerActive only goes true when the
-// pin is actually driven HIGH. Flip to false for real deployment.
+// pin is actually driven HIGH. Re-muted to isolate whether the buzzer being
+// on the shared 3V/capacitor rail (with pulse sensor + IMU) is what's
+// causing the IMU to drop out in production firmware -- see the
+// camera-then-IMU-then-SD boot order + shared-rail discussion.
 bool g_buzzerMuted = true;
 int16_t ax_off = 0, ay_off = 0, az_off = 0;
 int16_t gx_off = 0, gy_off = 0, gz_off = 0;
@@ -188,9 +225,16 @@ uint32_t g_frameIndex = 0; // monotonic frame counter
 bool g_sdReady = false;
 #endif
 
-// ── On-device EAR blink detection state (SD mode) ───────────────────────
+// ── On-device EAR blink detection state (SD mode, or USB + EAR_LIVE_DEBUG) ──
 // See docs/superpowers/specs/2026-09-01-on-device-fatigue-detection-design.md §5.
-#if defined(STORAGE_MODE_SD)
+// EAR_LIVE_DEBUG (env:esp32s3cam_ear_preview) runs this same pipeline over
+// USB video streaming instead of SD writes, at the same QVGA resolution the
+// SD build uses -- NOT at the USB build's default VGA. The ~97 ms/frame
+// decode cost that's already proven safe at QVGA (see processEarFrame's
+// note) would be ~4x worse at VGA and risk the exact watchdog boot-loop
+// cameraTask's yield comment describes; that's why esp32s3cam_ear_preview
+// overrides CAMERA_FRAMESIZE back down to QVGA in platformio.ini.
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
 // Every captured frame is processed. The glint check that replaced the old
 // shape math is one compare+increment per pixel, so the per-frame cost is
 // now dominated entirely by the JPEG decode that already had to happen.
@@ -424,7 +468,95 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   }
   g_onDeviceBlinkRate = g_earGlint.rollingRateBpm(timestampMs);
 }
-#endif  // STORAGE_MODE_SD
+#endif  // STORAGE_MODE_SD || EAR_LIVE_DEBUG
+
+// ── Frame injection mode: PC feeds recorded JPEGs one at a time; the ESP
+// runs the SAME processEarFrame() a live capture would, on the real chip,
+// so pre-recorded footage can validate the actual compiled binary instead
+// of a PC recompile of the same algorithm (see session_replay tool for
+// that PC-side variant). No live camera task runs in this mode -- Serial
+// is exclusively the injection protocol's, so it must not also be drained
+// by the "BLINK:%f" text parser in loop() (see that block's own guard).
+#if defined(FRAME_INJECT_MODE)
+static const uint8_t INJECT_SOF[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+static const uint8_t INJECT_EOF[4] = {0xDD, 0xCC, 0xBB, 0xAA};
+
+// Blocking read of exactly n bytes, tolerant of USB CDC arriving in small
+// chunks. Returns false on a 5s stall (lets the caller resync on SOF
+// rather than wedge forever on a dropped/corrupt packet).
+static bool injectReadExact(uint8_t *dst, size_t n) {
+  size_t got = 0;
+  uint32_t lastProgress = millis();
+  while (got < n) {
+    int avail = Serial.available();
+    if (avail > 0) {
+      size_t want = n - got;
+      int toRead = (int)((size_t)avail < want ? (size_t)avail : want);
+      int r = Serial.readBytes((char *)(dst + got), toRead);
+      if (r > 0) {
+        got += (size_t)r;
+        lastProgress = millis();
+      }
+    } else {
+      // No bytes yet -- yield so IDLE0 gets scheduled (same watchdog trap
+      // cameraTask's own yield comment describes: a tight poll loop with
+      // no delay starves IDLE0 on Core 0 and the task watchdog aborts).
+      vTaskDelay(pdMS_TO_TICKS(1));
+      if (millis() - lastProgress > 5000) return false;
+    }
+  }
+  return true;
+}
+
+void frameInjectTask(void *arg) {
+  Serial.println(F("#STATUS: Frame-injection mode ready. Waiting for frames..."));
+  static uint8_t *jpegBuf = nullptr;
+  static size_t   jpegBufCap = 0;
+
+  while (true) {
+    uint8_t sof[4];
+    if (!injectReadExact(sof, 4)) continue;
+    if (memcmp(sof, INJECT_SOF, 4) != 0) continue;  // resync byte-by-byte
+
+    uint8_t header[16];  // ts(4) + width(4) + height(4) + jpeg_len(4), all LE u32
+    if (!injectReadExact(header, sizeof(header))) continue;
+    uint32_t ts, w, h, len;
+    memcpy(&ts,  header,      4);
+    memcpy(&w,   header + 4,  4);
+    memcpy(&h,   header + 8,  4);
+    memcpy(&len, header + 12, 4);
+
+    if (len == 0 || len > 400000) {
+      Serial.println(F("#ERROR: bad frame length, resyncing"));
+      continue;
+    }
+    if (len > jpegBufCap) {
+      if (jpegBuf) free(jpegBuf);
+      jpegBuf = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM);
+      jpegBufCap = jpegBuf ? len : 0;
+    }
+    if (!jpegBuf || !injectReadExact(jpegBuf, len)) {
+      Serial.println(F("#ERROR: frame read failed, resyncing"));
+      continue;
+    }
+    uint8_t eof[4];
+    if (!injectReadExact(eof, 4) || memcmp(eof, INJECT_EOF, 4) != 0) {
+      Serial.println(F("#ERROR: bad EOF marker, resyncing"));
+      continue;
+    }
+
+    camera_fb_t fb = {};
+    fb.buf    = jpegBuf;
+    fb.len    = len;
+    fb.width  = w;
+    fb.height = h;
+    fb.format = PIXFORMAT_JPEG;
+
+    processEarFrame(&fb, ts);
+    Serial.printf("#FRAME_DONE ts=%u\n", ts);
+  }
+}
+#endif  // FRAME_INJECT_MODE
 
 // ── USB mode: binary frame constants ─────────────────────────────────────
 #if defined(STORAGE_MODE_USB)
@@ -658,6 +790,24 @@ bool initSDCard() {
   Serial.printf("#STATUS: SD card mounted OK — %llu MB total, %llu MB free\n",
                 cardSizeMB, freeMB);
 
+  // Session creation deliberately does NOT happen here. It moved to
+  // openSession(), called when RECORDING actually begins, so each
+  // arm-record-stop cycle gets its own session_XXX folder. Creating the files
+  // at boot bound a "session" to a power cycle and made a second recording
+  // append into the first one's files, silently corrupting the dataset.
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// openSession() — create session_XXX and open its three files.
+//
+// Called at the ARMING -> RECORDING transition, not at boot, so the readiness
+// of each subsystem is known and can be recorded in metadata.txt alongside the
+// capture parameters. Returns false if any file could not be opened.
+// ─────────────────────────────────────────────────────────────────────────
+bool openSession() {
+  if (!g_sdReady) return false;
+
   // ── Find next session number ─────────────────────────────────────────
   if (!SD_MMC.exists("/sessions")) {
     SD_MMC.mkdir("/sessions");
@@ -704,6 +854,17 @@ bool initSDCard() {
     meta.printf("sd_cmd_pin=%d\n", SD_MMC_CMD_PIN);
     meta.printf("sd_clk_pin=%d\n", SD_MMC_CLK_PIN);
     meta.printf("sd_d0_pin=%d\n", SD_MMC_D0_PIN);
+
+    // Readiness at the moment recording began. A 0 here means that subsystem
+    // never went ready within ARMING_TIMEOUT_MS and the session started
+    // anyway -- the data is still recorded, but this says which channels to
+    // distrust rather than leaving it to be guessed later.
+    meta.printf("armed_imu=%d\n", g_readyImu ? 1 : 0);
+    meta.printf("armed_hr=%d\n",  g_readyHr  ? 1 : 0);
+    meta.printf("armed_eye=%d\n", g_readyEye ? 1 : 0);
+    meta.printf("arming_timed_out=%d\n", g_armTimedOut ? 1 : 0);
+    meta.printf("arming_duration_ms=%lu\n",
+                (unsigned long)(millis() - g_armStartMs));
     meta.close();
   }
 
@@ -745,6 +906,7 @@ bool initSDCard() {
 
   return true;
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // closeSession() — flush + close all SD files before power-off / card removal.
@@ -906,6 +1068,13 @@ void cameraTask(void *arg) {
 #endif
 #elif defined(STORAGE_MODE_USB)
         sendJpegFrame(fb->buf, fb->len, ts);
+#if defined(EAR_LIVE_DEBUG)
+        // Same on-device pipeline the SD build runs, just fed from the
+        // frame we're also streaming out over serial instead of to SD.
+        if (++g_earFrameCounter % EAR_THROTTLE_DIV == 0) {
+          processEarFrame(fb, ts);
+        }
+#endif
 #endif
         framesSent++;
       }
@@ -1081,6 +1250,222 @@ void calibrateMPU() {
   Serial.printf("#STATUS: Calib gravity vector: [%.0f, %.0f, %.0f] raw ADC\n",
                 g_calibGrav[0], g_calibGrav[1], g_calibGrav[2]);
 }
+// ─────────────────────────────────────────────────────────────────────────
+// ARMING support — non-blocking IMU calibration + per-session resets
+//
+// calibrateMPU() above blocks for ~4 s (a 3 s countdown plus 200 x delay(5)).
+// That is fine at boot but unusable during ARMING: loop() also drives the
+// 500 Hz pulse sampler and feeds the task watchdog, so stalling it for 4 s
+// would punch a hole in the pulse record and risk a watchdog reset. This
+// accumulates the same 200 samples from the loop cadence instead.
+// ─────────────────────────────────────────────────────────────────────────
+
+// Reject a calibration taken while the helmet is moving. Offsets captured
+// mid-motion bake that motion into every later reading, and a rider settling
+// onto the bike is exactly when arming happens. Thresholds are generous
+// against this clone's ~3 dps gyro noise (see IMU_INTEGRATION.md section 2.3).
+static const float   ARM_STILL_GYRO_DPS = 20.0f;  // vs running mean (~6 sigma)
+static const float   ARM_STILL_AMAG_LO  = 0.85f;  // |A| band, g
+static const float   ARM_STILL_AMAG_HI  = 1.15f;
+static const uint8_t ARM_STILL_MIN_N    = 30;     // samples before mean is usable
+
+struct ArmCalib {
+  bool     running  = false;
+  bool     done     = false;
+  int      count    = 0;
+  long     ax_s = 0, ay_s = 0, az_s = 0;
+  long     gx_s = 0, gy_s = 0, gz_s = 0;
+  uint32_t lastMs   = 0;
+  uint16_t restarts = 0;
+};
+ArmCalib g_armCalib;
+
+static void armCalibRestart() {
+  g_armCalib.count = 0;
+  g_armCalib.ax_s = g_armCalib.ay_s = g_armCalib.az_s = 0;
+  g_armCalib.gx_s = g_armCalib.gy_s = g_armCalib.gz_s = 0;
+}
+
+static void armCalibBegin() {
+  armCalibRestart();
+  g_armCalib.running  = true;
+  g_armCalib.done     = false;
+  g_armCalib.restarts = 0;
+  g_armCalib.lastMs   = 0;
+}
+
+// Call at >= 100 Hz from loop(). Returns true once offsets are committed.
+static bool armCalibTick(uint32_t now) {
+  if (!g_armCalib.running || g_armCalib.done) return g_armCalib.done;
+  if (!g_mpuEnabled) return false;
+  if (g_buzzerActive) return false;   // I2C unreliable while buzzer draws current
+  if (now - g_armCalib.lastMs < 10) return false;   // 100 Hz
+  g_armCalib.lastMs = now;
+
+  int16_t ax, ay, az, gx, gy, gz;
+  mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+
+  // ── Stillness gate ──────────────────────────────────────────────────
+  float amag = sqrtf((float)ax * ax + (float)ay * ay + (float)az * az) / ACCEL_SCALE;
+  bool moving = (amag < ARM_STILL_AMAG_LO || amag > ARM_STILL_AMAG_HI);
+
+  if (!moving && g_armCalib.count >= ARM_STILL_MIN_N) {
+    float n   = (float)g_armCalib.count;
+    float mgx = (g_armCalib.gx_s / n) / GYRO_SCALE;
+    float mgy = (g_armCalib.gy_s / n) / GYRO_SCALE;
+    float mgz = (g_armCalib.gz_s / n) / GYRO_SCALE;
+    if (fabsf(gx / GYRO_SCALE - mgx) > ARM_STILL_GYRO_DPS ||
+        fabsf(gy / GYRO_SCALE - mgy) > ARM_STILL_GYRO_DPS ||
+        fabsf(gz / GYRO_SCALE - mgz) > ARM_STILL_GYRO_DPS) {
+      moving = true;
+    }
+  }
+
+  if (moving) {
+    if (g_armCalib.count > 0) {
+      g_armCalib.restarts++;
+      armCalibRestart();
+    }
+    return false;
+  }
+
+  g_armCalib.ax_s += ax; g_armCalib.ay_s += ay; g_armCalib.az_s += az;
+  g_armCalib.gx_s += gx; g_armCalib.gy_s += gy; g_armCalib.gz_s += gz;
+
+  if (++g_armCalib.count < CALIB_SAMPLES) return false;
+
+  ax_off = g_armCalib.ax_s / CALIB_SAMPLES;
+  ay_off = g_armCalib.ay_s / CALIB_SAMPLES;
+  az_off = g_armCalib.az_s / CALIB_SAMPLES;
+  gx_off = g_armCalib.gx_s / CALIB_SAMPLES;
+  gy_off = g_armCalib.gy_s / CALIB_SAMPLES;
+  gz_off = g_armCalib.gz_s / CALIB_SAMPLES;
+
+  // The mean raw accel at the calibration pose IS the gravity reference the
+  // pitch formula needs -- same as calibrateMPU() captures.
+  g_calibGrav[0] = (float)ax_off;
+  g_calibGrav[1] = (float)ay_off;
+  g_calibGrav[2] = (float)az_off;
+
+  g_armCalib.running = false;
+  g_armCalib.done    = true;
+  Serial.printf("#STATUS: IMU calibrated for this session (%d motion restarts)\n",
+                (int)g_armCalib.restarts);
+  return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// signalState() — the single point every state change passes through.
+//
+// Serial only for now. LED_BUILTIN is GPIO 2, which is PIN_SDA, so it cannot
+// be used as an indicator without corrupting the I2C bus, and the buzzer is
+// physically disconnected on this rig. GPIO 47/48 are clear of the camera, SD,
+// IMU, pulse and button pins -- wire an indicator there and drive it HERE.
+// ─────────────────────────────────────────────────────────────────────────
+void signalState(SessionState st) {
+  switch (st) {
+    case SESSION_IDLE:      Serial.println(F("#STATE: IDLE"));      break;
+    case SESSION_ARMING:    Serial.println(F("#STATE: ARMING"));    break;
+    case SESSION_RECORDING: Serial.println(F("#STATE: RECORDING")); break;
+  }
+}
+
+// Enter ARMING. Every per-session quantity is cleared here so the session gets
+// its own calibration instead of inheriting boot-time or previous-session values.
+void armingBegin() {
+  g_armStartMs  = millis();
+  g_armTimedOut = false;
+  g_readyImu = g_readyHr = g_readyEye = false;
+
+  armCalibBegin();
+
+  // Fresh HR baseline. Carrying the previous session's resting rate over would
+  // skew hr_diff_pct for the whole of this recording.
+  g_baselineSum    = 0.0f;
+  g_baselineCount  = 0;
+  g_baselineFormed = false;
+
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+  // Drop the old ROI so the lock re-acquires against where the eye is now,
+  // rather than reusing a crop from a previous head/camera position.
+  g_earLockDone    = false;
+  g_earRoi.locked  = false;
+  g_earMotionTries = 0;
+  g_earLocator.reset();
+#endif
+
+  g_sessionState  = SESSION_ARMING;
+  g_sessionActive = false;
+  signalState(SESSION_ARMING);
+  Serial.println(F("#STATUS: Arming -- hold still, eye toward camera, finger on pulse sensor"));
+}
+
+// Enter RECORDING. Latches readiness, opens the session files, starts writing.
+void recordingBegin() {
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+  g_readyEye = g_earLockDone;
+#else
+  g_readyEye = true;   // no EAR pipeline in this build
+#endif
+  g_readyImu = g_armCalib.done;
+  g_readyHr  = g_baselineFormed;
+
+#if defined(STORAGE_MODE_SD)
+  if (!openSession()) {
+    Serial.println(F("#ERROR: Could not open session files -- staying idle"));
+    g_sessionState  = SESSION_IDLE;
+    g_sessionActive = false;
+    signalState(SESSION_IDLE);
+    return;
+  }
+#endif
+
+  g_sessionState  = SESSION_RECORDING;
+  g_sessionActive = true;
+  signalState(SESSION_RECORDING);
+  Serial.printf("#STATUS: Recording -- imu=%d hr=%d eye=%d timed_out=%d after %lu ms\n",
+                g_readyImu ? 1 : 0, g_readyHr ? 1 : 0, g_readyEye ? 1 : 0,
+                g_armTimedOut ? 1 : 0,
+                (unsigned long)(millis() - g_armStartMs));
+}
+
+// Return to IDLE from any state, closing the session files if they are open.
+void sessionStop(const char *reason) {
+  bool wasRecording = (g_sessionState == SESSION_RECORDING);
+
+  g_sessionState  = SESSION_IDLE;
+  g_sessionActive = false;
+  g_armCalib.running = false;
+
+#if defined(STORAGE_MODE_SD)
+  if (wasRecording) {
+    // Report what actually landed on the card. A session that ran but wrote
+    // zero frames or zero CSV rows is a silent failure otherwise.
+    Serial.printf("#STATUS: Wrote %lu frames, %lu video bytes\n",
+                  (unsigned long)g_frameIndex, (unsigned long)g_byteOffset);
+    closeSession();   // flush + close; without this the tail of the recording
+                      // is lost when the card is pulled
+  }
+#else
+  (void)wasRecording;
+#endif
+
+  signalState(SESSION_IDLE);
+  Serial.printf("#STATUS: %s\n", reason);
+}
+
+// One press, dispatched by current state. Shared by the physical button on
+// GPIO 21 and the "BUTTON" serial command, so a bench test over USB exercises
+// exactly the same path as a press on the helmet -- not a parallel one.
+void sessionButtonPress() {
+  switch (g_sessionState) {
+    case SESSION_IDLE:      armingBegin(); break;
+    case SESSION_ARMING:    sessionStop("Arming aborted"); break;
+    case SESSION_RECORDING: sessionStop("Session stopped"); break;
+  }
+}
+
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // tryInitMPU() — probe the two addresses an MPU-6050 can be strapped to
@@ -1101,11 +1486,25 @@ uint8_t tryInitMPU() {
   if (foundAddr == 0) return 0;
 
   mpu = MPU6050(foundAddr);
+  // Force a full device reset (PWR_MGMT_1 bit 7) before waking it, instead
+  // of going straight to initialize()'s "gentle" clock-source/sleep-bit
+  // writes. A chip left in a confused internal state by an irregular
+  // power-up sequence can ACK its address yet still misbehave on register
+  // reads/writes until it sees a real reset -- see D:\proj\atttts\imu_test
+  // (IMU_INTEGRATION.md), whose manual reset-then-wake sequence recovered
+  // this exact chip when our library-only initialize() path could not.
+  mpu.reset();
+  delay(120);
   mpu.initialize();
   uint8_t whoami = mpu.getDeviceID();
   Serial.printf("#STATUS: MPU at 0x%02X WHO_AM_I = 0x%02X\n", foundAddr, whoami);
-  if (whoami != 0x68 && whoami != 0x69 && whoami != 0x38 &&
-      whoami != 0x70 && whoami != 0x72) {
+  // getDeviceID() returns the 6-bit device ID field (register 0x75 bits
+  // 6:1), NOT the raw I2C address -- 0x68/0x69 here were never valid
+  // values for it to return. Match the MPU6050 library's own
+  // testConnection() whitelist instead: 0x34 is the common value, but
+  // 0x0C and 0x3A are documented hardware-revision variants of the same
+  // genuine chip (see MPU6050_Base::testConnection() in MPU6050.cpp).
+  if (whoami != 0x34 && whoami != 0x0C && whoami != 0x3A) {
     return 0;
   }
 
@@ -1120,6 +1519,18 @@ uint8_t tryInitMPU() {
 // ─────────────────────────────────────────────────────────────────────────
 
 void setup() {
+  // Claim the buzzer pin FIRST, before anything else -- Serial.begin()'s
+  // up-to-3s wait, the fixed 1.5s delay below, camera init, and the LED
+  // blink all run before this point used to be reached. A freshly reset
+  // ESP32 GPIO floats until pinMode()+digitalWrite() explicitly claim it,
+  // and a floating transistor base can pick up enough noise to partially
+  // turn the buzzer on for that whole multi-second window. Driving it LOW
+  // here shrinks that window to the fixed hardware boot time before
+  // setup() runs at all, which we can't reduce further from application
+  // code.
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
 #if defined(STORAGE_MODE_USB)
   Serial.begin(921600);
 #else
@@ -1200,10 +1611,9 @@ void setup() {
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   Serial.println(F("#STATUS: Button GPIO 21 initialized (INPUT_PULLUP)"));
 
-  // Buzzer: GPIO 14 (confirmed free — see fuzzy_walkthrough.md §7 GPIO audit)
+  // Buzzer: GPIO 14 (confirmed free — see fuzzy_walkthrough.md §7 GPIO audit).
+  // Pin already claimed at the very top of setup() -- see that comment.
   // NOTE: do NOT use LED_BUILTIN (GPIO 2) after Wire.begin() — conflicts with I2C SDA.
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
   Serial.println(F("#STATUS: Buzzer GPIO 14 initialized"));
 
   Wire.begin(PIN_SDA, PIN_SCL);
@@ -1223,13 +1633,13 @@ void setup() {
   g_sdMutex = xSemaphoreCreateMutex();
   g_sdReady = initSDCard();
   if (!g_sdReady) {
-    // Blink rapidly to signal SD error; still continue (CSV to Serial only)
-    for (int i = 0; i < 10; i++) {
-      digitalWrite(LED_BUILTIN, HIGH);
-      delay(80);
-      digitalWrite(LED_BUILTIN, LOW);
-      delay(80);
-    }
+    // NO LED blink here. LED_BUILTIN is GPIO 2, which is PIN_SDA -- driving it
+    // after Wire.begin() slams the I2C data line ten times and can wedge the
+    // MPU-6050 mid-byte, exactly the failure the comment above warns about
+    // and the one sensor_test now carries a bus-recovery routine for. The
+    // error is reported on serial only until a real indicator exists on a
+    // free GPIO (see signalState()).
+    Serial.println(F("#ERROR: SD init failed -- CSV goes to serial only"));
   }
 #endif
 
@@ -1250,11 +1660,35 @@ void setup() {
 #endif
 
   // ── Launch camera task on Core 0 ─────────────────────────────────────
+  // FRAME_INJECT_MODE replaces live capture with frameInjectTask(), which
+  // owns Serial exclusively for the PC->ESP frame protocol -- no live
+  // camera task runs alongside it (see that task's own doc comment).
+#if defined(FRAME_INJECT_MODE)
+  xTaskCreatePinnedToCore(frameInjectTask, "FrameInject",
+                          8192,       // stack bytes
+                          nullptr, 2, // priority 2
+                          nullptr, 0  // Core 0
+  );
+#else
   xTaskCreatePinnedToCore(cameraTask, "CameraTask",
                           8192,       // stack bytes
                           nullptr, 2, // priority 2
                           nullptr, 0  // Core 0
   );
+#endif
+
+  // ── Initial session state ────────────────────────────────────────────
+#if defined(STORAGE_MODE_USB)
+  // USB debug mode streams immediately: there is no SD session to open and
+  // no arming gate, matching the previous behaviour of this build.
+  g_sessionState  = SESSION_RECORDING;
+  g_sessionActive = true;
+#else
+  g_sessionState  = SESSION_IDLE;
+  g_sessionActive = false;
+  Serial.println(F("#STATUS: Idle -- press the button on GPIO 21 to arm a session"));
+#endif
+  signalState(g_sessionState);
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1277,16 +1711,50 @@ void loop() {
     if (reading != buttonState) {
       buttonState = reading;
       if (buttonState == LOW) { // pressed
-        g_sessionActive = !g_sessionActive;
-        if (g_sessionActive) {
-          Serial.println(F("\n#STATUS: Session STARTED (Recording active)"));
-        } else {
-          Serial.println(F("\n#STATUS: Session PAUSED (Recording stopped)"));
-        }
+        sessionButtonPress();
       }
     }
   }
   g_lastButtonState = reading;
+
+  // ── ARMING progress ──────────────────────────────────────────────────
+  // Nothing is written to SD in this state. The three checks run concurrently
+  // and independently; recording starts when all are ready, or when the
+  // timeout expires (readiness is then recorded in metadata.txt rather than
+  // costing the session).
+  if (g_sessionState == SESSION_ARMING) {
+    armCalibTick(now);
+
+    bool imuOk = g_armCalib.done;
+    bool hrOk  = g_baselineFormed;
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+    bool eyeOk = g_earLockDone;
+#else
+    bool eyeOk = true;   // no EAR pipeline compiled into this build
+#endif
+
+    static uint32_t lastArmReport = 0;
+    if (now - lastArmReport >= 2000) {
+      lastArmReport = now;
+      Serial.printf("#ARMING: imu=%d hr=%d(%u/%u) eye=%d  %lu/%lu s\n",
+                    imuOk ? 1 : 0,
+                    hrOk ? 1 : 0,
+                    (unsigned)g_baselineCount, (unsigned)N_BASELINE_SAMPLES,
+                    eyeOk ? 1 : 0,
+                    (unsigned long)((now - g_armStartMs) / 1000),
+                    (unsigned long)(ARMING_TIMEOUT_MS / 1000));
+    }
+
+    if (imuOk && hrOk && eyeOk) {
+      recordingBegin();
+    } else if (now - g_armStartMs >= ARMING_TIMEOUT_MS) {
+      g_armTimedOut = true;
+      Serial.println(F("#WARNING: Arming timed out -- recording anyway; check armed_* in metadata.txt"));
+      recordingBegin();
+    }
+  }
+
+
 
   // ── Pulse sensor: 500 Hz — must ALWAYS run, never skip ───────────────
   // Keep this first and outside any mutex so it is never starved.
@@ -1418,10 +1886,23 @@ void loop() {
   // ── Serial BLINK parser (drains UART buffer each 1 Hz tick) ──────────────────
   // Format: "BLINK:<float>\n"  Rate: 1 Hz from Python pipeline.
   // Valid range: 0–60 bl/min. Invalid / out-of-range lines silently discarded.
+  // Disabled under FRAME_INJECT_MODE: frameInjectTask() owns Serial reads
+  // there (the binary frame-injection protocol), and two tasks racing to
+  // read the same UART would each steal the other's bytes.
+#if !defined(FRAME_INJECT_MODE)
   while (Serial.available()) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       g_serialLineBuf[g_serialLineBufLen] = '\0';
+      // Bench affordance: "BUTTON" over serial is treated as one press of the
+      // GPIO 21 button, routed through the same sessionButtonPress() dispatch.
+      // Lets the arm/record/stop flow be exercised over USB without reaching
+      // into the helmet, and cannot collide with the BLINK: format below.
+      if (strcmp(g_serialLineBuf, "BUTTON") == 0) {
+        g_serialLineBufLen = 0;
+        sessionButtonPress();
+        continue;
+      }
       float blink_val = 0.0f;
       if (sscanf(g_serialLineBuf, "BLINK:%f", &blink_val) == 1
           && blink_val >= 0.0f && blink_val <= 60.0f) {
@@ -1437,14 +1918,15 @@ void loop() {
       g_serialLineBufLen = 0;   // line too long — discard
     }
   }
+#endif  // !FRAME_INJECT_MODE
   // Fallback: sticky last-valid after timeout; on-device EAR rate in SD
-  // mode (see processEarFrame() above), or the 13.0 stub in USB mode
-  // (unchanged -- USB debug mode still relies on the offline eye_ear.py
-  // pipeline, see spec non-goals).
+  // mode or EAR_LIVE_DEBUG (see processEarFrame() above), or the 13.0 stub
+  // in plain USB mode (USB debug mode without EAR_LIVE_DEBUG still relies
+  // on the offline eye_ear.py pipeline, see spec non-goals).
   if (g_blinkEverRx && (now - g_lastBlinkRxTime > BLINK_TIMEOUT_MS)) {
     g_blinkRate = g_lastValidBlink;
   } else if (!g_blinkEverRx) {
-#if defined(STORAGE_MODE_SD)
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
     g_blinkRate = g_onDeviceBlinkRate;
 #else
     g_blinkRate = 13.0f;
