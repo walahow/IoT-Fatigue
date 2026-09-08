@@ -51,6 +51,10 @@ def put(img, txt, org, scale=0.5, col=INK, thick=1, font=cv2.FONT_HERSHEY_SIMPLE
     cv2.putText(img, txt, org, font, scale, col, thick, cv2.LINE_AA)
 
 # ── load frames ──────────────────────────────────────────────────────
+# Title comes from the session folder, not a constant -- the first version of
+# this script hardcoded "SESSION 100" and mislabelled every other session.
+SESSION_LABEL = os.path.basename(os.path.normpath(sess)).replace("_", " ").upper()
+
 files = sorted(glob.glob(os.path.join(sess, "frames", "*.jpg")),
                key=lambda p: int(os.path.splitext(os.path.basename(p))[0]))
 fts = [int(os.path.splitext(os.path.basename(p))[0]) for p in files]
@@ -177,7 +181,7 @@ for i, (path, ts) in enumerate(zip(files, fts)):
     if lok and lok["locked"]:
         x, y = lok["rx"] * SC, lok["ry"] * SC
         cv2.rectangle(big, (x, y), (x + 48 * SC, y + 48 * SC), HOT, 2)
-        put(big, "ESP lock - missed the eye", (x + 4, y + 48 * SC + 16), 0.44, HOT)
+        put(big, "localizer lock", (x + 4, y + 48 * SC + 16), 0.44, HOT)
     if pin:
         x, y = pin["rx"] * SC, pin["ry"] * SC
         cv2.rectangle(big, (x, y), (x + 48 * SC, y + 48 * SC), GOOD, 2)
@@ -196,7 +200,7 @@ for i, (path, ts) in enumerate(zip(files, fts)):
 
     s = sensor_at(ts)
     yy = 34
-    put(canvas, "SESSION 100", (px0 + 22, yy), 0.62, INK, 2)
+    put(canvas, SESSION_LABEL, (px0 + 22, yy), 0.62, INK, 2)
     yy += 22
     put(canvas, "t = %6.2f s     frame %d/%d" % ((ts - t0) / 1000.0, i + 1, len(files)),
         (px0 + 22, yy), 0.44, INK2)
@@ -233,7 +237,7 @@ for i, (path, ts) in enumerate(zip(files, fts)):
     yy += 28
 
     esp_rate = float(s["blink_rate"]) if s else 0.0
-    put(canvas, "ESP on-device", (px0 + 22, yy), 0.40, INK3)
+    put(canvas, "ESP (as recorded)", (px0 + 22, yy), 0.40, INK3)
     put(canvas, "%.0f blinks/min" % esp_rate, (px0 + 200, yy), 0.52, HOT, 2)
     yy += 28
     pin_rate = pin["rate"] if pin else 0.0
