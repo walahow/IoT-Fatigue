@@ -131,7 +131,7 @@ static bool listFrames(const std::string &dir, std::vector<FrameFile> &out) {
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "Usage: %s <frames_dir> <output_csv>\n", argv[0]);
+    fprintf(stderr, "Usage: %s <frames_dir> <output_csv> [--lock=motion|dark] [--roi=X,Y]\n", argv[0]);
     return 1;
   }
   std::string framesDir = argv[1];
@@ -139,9 +139,17 @@ int main(int argc, char **argv) {
   // Lock mode: "dark" = original darkest-blob boot lock, "motion" = temporal
   // motion-energy localizer. Default motion (the validated one).
   bool useMotionLock = true;
+  bool manualRoi = false;
+  int  manualCx = 0, manualCy = 0;
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
     else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
+    else if (strncmp(argv[i], "--roi=", 6) == 0) {
+      // Pin the ROI centre instead of locking. Mirrors the firmware's
+      // EAR_ROI_MANUAL_X/Y build flags, and lets the blink algorithm be
+      // tested independently of whether the locator found the eye.
+      if (sscanf(argv[i] + 6, "%d,%d", &manualCx, &manualCy) == 2) manualRoi = true;
+    }
   }
   printf("Lock mode: %s\n", useMotionLock ? "motion-energy" : "darkest-blob");
 
@@ -224,6 +232,15 @@ int main(int argc, char **argv) {
     float earValue = -1.0f;
     bool blinkEvent = false;
     float rollingRate = 0.0f;
+
+    if (!earLockDone && manualRoi) {
+      float xs[1] = {(float)manualCx}, ys[1] = {(float)manualCy};
+      EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, roi);
+      earLockDone = true;
+      lockConfidence = -1.0f;       // -1 = pinned, not measured
+      lockCompletedAtMs = f.timestampMs;
+      printf("#STATUS: ROI pinned at x=%d y=%d size=%d\n", roi.x, roi.y, roi.size);
+    }
 
     if (!earLockDone && useMotionLock) {
       // Motion-energy lock: accumulate |dI| over a short window, then take
