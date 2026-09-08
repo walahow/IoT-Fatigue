@@ -919,13 +919,154 @@ struct MotionLocatorV3 : MotionLocatorV2 {
     }
 };
 
+
+// ── Localizer v4 ──────────────────────────────────────────────────────────
+// Derives from v3 and adds one step AFTER the motion lock: re-centre the ROI
+// on the corneal glint near the peak.
+//
+// Motion energy peaks on the eyelid, because the lid is what moves. Measured
+// across sessions 023/040/067/100 the locked centre lands 9-18 px from the
+// pupil in every one -- a consistent offset, not scatter. That matters because
+// the detector's cues are computed over the crop: roiBrightness is its MEAN
+// and wideDarkPx a dark-pixel fraction, so a pupil near the edge weakens both.
+//
+// The glint is the cue that works here. It sits ON the cornea, so the
+// brightest small cluster near the motion peak is the eye itself:
+//
+//     v3, no refine        mean lock error 12.8 px
+//     v4 glint             mean lock error  9.5 px   (session_067: 9.2 -> 2.2)
+//     v4 darkest blob      mean lock error 25.1 px   -- WORSE, do not use
+//
+// The darkest-blob variant is kept behind EAR_V4_MODE=0 only to keep that
+// negative result reproducible. It fails for a reason this codebase already
+// knew: darkest-blob was the ORIGINAL localizer and was replaced by motion
+// energy, and drift correction is disabled because it "can confidently track
+// hair occluding the camera". Unconstrained it pulled session_023's lock
+// 49.6 px away, onto eyebrow, and tripled the unmatched detections (17 vs 5).
+//
+// WHAT THIS DOES NOT BUY. Post-lock blink recall against a pinned reference is
+// 15/29 both before and after: session_040 gains a blink, session_067 loses
+// one. Lock precision is therefore NOT what limits blink recall right now --
+// session_067 locks 2.2 px from the pupil, essentially perfect, and still
+// misses 3 of 9. Whatever is costing those blinks is downstream in the
+// detector's cues, and further localizer precision has little left to give.
+// v4 ships because putting the ROI on the eye is this component's job and it
+// does that measurably better, not because it produced more blinks.
+//
+// The correction is bounded by REFINE_MAX_SHIFT. Unconstrained, glint mode
+// never made any session worse -- but that is four sessions, and on unseen
+// footage a stray highlight (a spectacle edge, a light source in frame) is
+// exactly the failure the guard exists for. 32 admits every beneficial
+// correction measured; 20 and 28 were too tight and blocked session_040's.
+struct MotionLocatorV4 : MotionLocatorV3 {
+#ifndef EAR_V4_MARGIN
+#define EAR_V4_MARGIN 16
+#endif
+#ifndef EAR_V4_PERCENTILE
+#define EAR_V4_PERCENTILE 10
+#endif
+#ifndef EAR_V4_MAX_SHIFT
+#define EAR_V4_MAX_SHIFT 32
+#endif
+    // Search this far beyond the ROI on every side, so the correction range is
+    // +/- REFINE_MARGIN.
+    static const int REFINE_MARGIN = EAR_V4_MARGIN;
+    // Darkest N% of the search region. Percentile, not Otsu: Otsu's ~50/50
+    // split lets a large diffuse shadow outvote a small genuinely dark pupil,
+    // which is the same reasoning percentileThreshold() was added for.
+    static const int REFINE_PERCENTILE = EAR_V4_PERCENTILE;
+    // Reject a correction larger than this; see the doc comment above.
+    static const int REFINE_MAX_SHIFT = EAR_V4_MAX_SHIFT;
+#ifndef EAR_V4_MODE
+#define EAR_V4_MODE 1          // 1 = corneal glint (measured best), 0 = darkest blob
+#endif
+#ifndef EAR_V4_GLINT_LEVEL
+#define EAR_V4_GLINT_LEVEL 200 // matches GlintBlinkDetector::GLINT_LEVEL
+#endif
+#ifndef EAR_V4_GLINT_WIN
+#define EAR_V4_GLINT_WIN 8     // a glint is a few pixels across at QVGA
+#endif
+    static const int GLINT_REFINE_LEVEL = EAR_V4_GLINT_LEVEL;
+    static const int GLINT_REFINE_WIN   = EAR_V4_GLINT_WIN;
+
+    // Side length of the square search region for a given ROI size.
+    static int refineSide(int roi) { return roi + 2 * REFINE_MARGIN; }
+
+    // Re-centre (cx, cy) onto the darkest blob near it. Returns true if the
+    // centre was moved.
+    //
+    // Storage is caller-supplied rather than owned here: this runs once per
+    // session, and on the ESP32 the buffers belong in PSRAM alongside the
+    // other EAR scratch. All three must hold refineSide(roiSize)^2 elements.
+    bool refine(const uint8_t *gray, int fullW, int fullH,
+                uint8_t *scratchGray, uint8_t *scratchMask,
+                uint16_t *scratchRow,
+                float &cx, float &cy) {
+        if (roiSize <= 0 || !gray || !scratchGray || !scratchMask || !scratchRow)
+            return false;
+
+        const int side = refineSide(roiSize);
+        if (side > fullW || side > fullH) return false;
+
+        // Clamp the search box inside the frame.
+        int bx = (int)(cx + 0.5f) - side / 2;
+        int by = (int)(cy + 0.5f) - side / 2;
+        if (bx < 0) bx = 0;
+        if (by < 0) by = 0;
+        if (bx + side > fullW) bx = fullW - side;
+        if (by + side > fullH) by = fullH - side;
+
+        for (int y = 0; y < side; y++) {
+            const uint8_t *src = gray + (size_t)(by + y) * fullW + bx;
+            uint8_t *dst = scratchGray + (size_t)y * side;
+            for (int x = 0; x < side; x++) dst[x] = src[x];
+        }
+
+        const int n = side * side;
+        int win;
+#if EAR_V4_MODE == 1
+        // GLINT mode: re-centre on the corneal reflection instead of the
+        // darkest blob. The glint sits ON the cornea, whereas in this footage
+        // the darkest thing near the eye is usually eyebrow or lashes.
+        (void)REFINE_PERCENTILE;
+        for (int i = 0; i < n; i++)
+            scratchMask[i] = (scratchGray[i] >= GLINT_REFINE_LEVEL) ? 1 : 0;
+        win = GLINT_REFINE_WIN;
+#else
+        // DARK mode: darkest blob. Percentile, not Otsu -- Otsu's ~50/50 split
+        // lets a diffuse shadow outvote a small genuinely dark pupil.
+        uint8_t t = percentileThreshold(scratchGray, side, side,
+                                        (float)REFINE_PERCENTILE);
+        for (int i = 0; i < n; i++) scratchMask[i] = (scratchGray[i] <= t) ? 1 : 0;
+        // Window ~ a pupil across, tied to the ROI so it scales with it.
+        win = roiSize / 2;
+#endif
+        float lx = 0.0f, ly = 0.0f;
+        if (!findDarkestWindow(scratchMask, side, side, win, 2, 2,
+                               scratchRow, lx, ly))
+            return false;
+
+        float nx = (float)bx + lx;
+        float ny = (float)by + ly;
+
+        float dx = nx - cx, dy = ny - cy;
+        if ((dx * dx + dy * dy) >
+            (float)(REFINE_MAX_SHIFT * REFINE_MAX_SHIFT))
+            return false;   // implausible jump -- keep the motion peak
+
+        cx = nx;
+        cy = ny;
+        return true;
+    }
+};
+
 // ── Localizer version selection ───────────────────────────────────────────
 // Build with -DEAR_LOCALIZER_VERSION=1 or =2 to fall back to an earlier version;
 // v1 is the frozen baseline and v2 the frame-count window. Each is
 // kept as the regression baseline. Call sites use the EyeBlinkEAR::MotionLocator
 // alias and need no change when this moves.
 #ifndef EAR_LOCALIZER_VERSION
-#define EAR_LOCALIZER_VERSION 3
+#define EAR_LOCALIZER_VERSION 4
 #endif
 
 #if EAR_LOCALIZER_VERSION == 1
@@ -934,8 +1075,10 @@ typedef MotionLocatorV1 MotionLocator;
 typedef MotionLocatorV2 MotionLocator;
 #elif EAR_LOCALIZER_VERSION == 3
 typedef MotionLocatorV3 MotionLocator;
+#elif EAR_LOCALIZER_VERSION == 4
+typedef MotionLocatorV4 MotionLocator;
 #else
-#error "EAR_LOCALIZER_VERSION must be 1, 2 or 3"
+#error "EAR_LOCALIZER_VERSION must be 1, 2, 3 or 4"
 #endif
 
 

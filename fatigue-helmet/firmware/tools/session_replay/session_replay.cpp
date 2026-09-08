@@ -219,6 +219,15 @@ int main(int argc, char **argv) {
   bool earLockDone = false;
   uint32_t firstFrameTs = frames.front().timestampMs;
 
+#if EAR_LOCALIZER_VERSION >= 4
+  // Scratch for v4's darkest-blob re-centre. Static rather than stack: at
+  // EAR_ROI_SIZE 48 this is 25 KB, and the host stack is not the place for it.
+  static const int REFINE_SIDE = EAR_ROI_SIZE + 2 * EAR_V4_MARGIN;
+  static uint8_t  refGray[REFINE_SIDE * REFINE_SIDE];
+  static uint8_t  refMask[REFINE_SIDE * REFINE_SIDE];
+  static uint16_t refRow [REFINE_SIDE * REFINE_SIDE];
+#endif
+
   EyeBlinkEAR::RoiLock roi;
   EyeBlinkEAR::BlinkDetector blink;
   EyeBlinkEAR::GlintBlinkDetector glint;
@@ -291,6 +300,16 @@ int main(int argc, char **argv) {
         float mcx, mcy, conf;
         if (locator.peak(w, h, EAR_MOTION_MIN_FRAMES_V, mcx, mcy, conf)) {
           if (conf >= EAR_MOTION_MIN_CONF || ++motionTries >= EAR_MOTION_MAX_TRIES) {
+#if EAR_LOCALIZER_VERSION >= 4
+            // Motion energy peaks on the moving eyelid; the pupil sits a few
+            // pixels off. Re-centre before locking, so the detector's mean
+            // brightness and dark fraction are taken over a crop the pupil is
+            // in the middle of.
+            bool moved = locator.refine(earGrayBuf, w, h,
+                                        refGray, refMask, refRow, mcx, mcy);
+            printf("#STATUS: refine %s -> (%.0f, %.0f)\n",
+                   moved ? "moved" : "rejected", mcx, mcy);
+#endif
             float xs[1] = {mcx}, ys[1] = {mcy};
             EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE_V, w, h, roi);
             earLockDone = true;

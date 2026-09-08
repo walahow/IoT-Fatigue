@@ -317,6 +317,15 @@ static float g_earLockConfidence = 0.0f;
 
 // ~28 KB -- global, not a local/stack variable (see MotionLocator's own note).
 static EyeBlinkEAR::MotionLocator g_earLocator;
+#if EAR_LOCALIZER_VERSION >= 4
+// Scratch for v4's darkest-blob re-centre, allocated in PSRAM alongside the
+// other EAR buffers -- 25 KB at EAR_ROI_SIZE 48, which does not belong in the
+// 320 KB of internal DRAM when PSRAM is right there. Used once, at lock.
+static const int EAR_REFINE_SIDE = EAR_ROI_SIZE + 2 * EAR_V4_MARGIN;
+static uint8_t  *g_earRefGray = nullptr;
+static uint8_t  *g_earRefMask = nullptr;
+static uint16_t *g_earRefRow  = nullptr;
+#endif
 
 // Scratch for isolateLargestComponent(), sized to the locked EAR crop
 // (EAR_ROI_SIZE^2) -- fixed at compile time, so plain static arrays rather
@@ -372,6 +381,18 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     g_earMaskBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
     g_earFullW = w;
     g_earFullH = h;
+#if EAR_LOCALIZER_VERSION >= 4
+    const size_t refN = (size_t)EAR_REFINE_SIDE * EAR_REFINE_SIDE;
+    g_earRefGray = (uint8_t *)heap_caps_malloc(refN, MALLOC_CAP_SPIRAM);
+    g_earRefMask = (uint8_t *)heap_caps_malloc(refN, MALLOC_CAP_SPIRAM);
+    g_earRefRow  = (uint16_t *)heap_caps_malloc(refN * sizeof(uint16_t),
+                                                MALLOC_CAP_SPIRAM);
+    if (!g_earRefGray || !g_earRefMask || !g_earRefRow) {
+      // Not fatal: refine() no-ops on a null buffer and the lock falls back to
+      // the raw motion peak, which is exactly v3's behaviour.
+      Serial.println(F("#WARN: EAR refine buffers unavailable -- v4 re-centre disabled"));
+    }
+#endif
     if (!g_earRgbBuf || !g_earGrayBuf || !g_earMaskBuf) {
       Serial.println(F("#ERROR: EAR buffer alloc failed -- on-device blink detection disabled"));
       g_earDisabled = true;
@@ -423,6 +444,13 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     float mcx, mcy, conf;
     if (g_earLocator.peak(w, h, EAR_MOTION_MIN_FRAMES, mcx, mcy, conf)) {
       if (conf >= EAR_MOTION_MIN_CONF || ++g_earMotionTries >= EAR_MOTION_MAX_TRIES) {
+#if EAR_LOCALIZER_VERSION >= 4
+        // Motion energy peaks on the moving eyelid, a few pixels off the
+        // pupil. Re-centre before locking so the detector's cues are taken
+        // over a crop the pupil sits in the middle of.
+        g_earLocator.refine(g_earGrayBuf, w, h,
+                            g_earRefGray, g_earRefMask, g_earRefRow, mcx, mcy);
+#endif
         float xs[1] = {mcx}, ys[1] = {mcy};
         EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, g_earRoi);
         g_earLockDone = true;
