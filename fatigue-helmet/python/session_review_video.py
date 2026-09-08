@@ -123,8 +123,10 @@ rep_lock = load_replay(os.path.join(sess, "pc_replay.csv"))
 rep_pin  = load_replay(os.path.join(sess, "pc_replay_pinned.csv"))
 print("replay rows: locked=%d pinned=%d" % (len(rep_lock), len(rep_pin)))
 
-blink_ts = [t for t, v in sorted(rep_pin.items()) if v["blink"]]
-print("pinned blinks:", len(blink_ts))
+blink_ts      = [t for t, v in sorted(rep_pin.items())  if v["blink"]]   # reference
+blink_ts_lock = [t for t, v in sorted(rep_lock.items()) if v["blink"]]   # what shipped
+print("blinks -- locked ROI: %d, pinned reference: %d"
+      % (len(blink_ts_lock), len(blink_ts)))
 
 t0, t1 = fts[0], fts[-1]
 span = max(1, t1 - t0)
@@ -151,10 +153,19 @@ if ear_vals:
     put(tl, "%.0f" % mx, (PAD_L - 30, L1_Y + 8), 0.36, INK3)
     put(tl, "0", (PAD_L - 14, L1_Y + L1_H + 4), 0.36, INK3)
 cv2.line(tl, (PAD_L, L1_Y + L1_H), (W - PAD_R, L1_Y + L1_H), RULE, 1)
+# Two blink series so the cost of an imperfect lock is visible: what the
+# shipped pipeline actually detected at its locked ROI, against what the same
+# detector finds with the ROI placed on the pupil by hand.
 for bt in blink_ts:
     x = tx(bt)
+    cv2.line(tl, (x, L1_Y + L1_H - 14), (x, L1_Y + L1_H), GOOD, 2, cv2.LINE_AA)
+    cv2.circle(tl, (x, L1_Y + L1_H - 17), 3, GOOD, -1, cv2.LINE_AA)
+for bt in blink_ts_lock:
+    x = tx(bt)
     cv2.line(tl, (x, L1_Y), (x, L1_Y + L1_H), FLAG, 1, cv2.LINE_AA)
-    cv2.circle(tl, (x, L1_Y - 3), 3, FLAG, -1, cv2.LINE_AA)
+    cv2.circle(tl, (x, L1_Y - 3), 4, FLAG, -1, cv2.LINE_AA)
+put(tl, "detected at locked ROI", (PAD_L + 232, L1_Y - 6), 0.4, FLAG)
+put(tl, "same detector, ROI pinned on pupil", (PAD_L + 402, L1_Y - 6), 0.4, GOOD)
 
 # --- lane 2: heart rate ---
 L2_Y, L2_H = 152, 62
@@ -195,7 +206,7 @@ for i, (path, ts) in enumerate(render_list):
 
     pin = rep_pin.get(ts)
     lok = rep_lock.get(ts)
-    recent_blink = any(0 <= ts - bt <= BLINK_HOLD_MS for bt in blink_ts)
+    recent_blink = any(0 <= ts - bt <= BLINK_HOLD_MS for bt in blink_ts_lock)
 
     # ── video panel ──────────────────────────────────────────────
     big = cv2.resize(frame, (VID_W, VID_H), interpolation=cv2.INTER_NEAREST)
@@ -259,16 +270,18 @@ for i, (path, ts) in enumerate(render_list):
     put(canvas, "BLINK DETECTION", (px0 + 22, yy), 0.46, INK, 1)
     yy += 28
 
-    esp_rate = float(s["blink_rate"]) if s else 0.0
-    put(canvas, "ESP (as recorded)", (px0 + 22, yy), 0.40, INK3)
-    put(canvas, "%.0f blinks/min" % esp_rate, (px0 + 200, yy), 0.52, HOT, 2)
+    lok_rate = lok["rate"] if lok else 0.0
+    put(canvas, "at locked ROI", (px0 + 22, yy), 0.40, INK3)
+    put(canvas, "%.0f blinks/min" % lok_rate, (px0 + 200, yy), 0.52, FLAG, 2)
     yy += 28
     pin_rate = pin["rate"] if pin else 0.0
-    put(canvas, "PC, ROI pinned", (px0 + 22, yy), 0.40, INK3)
+    put(canvas, "ROI pinned on pupil", (px0 + 22, yy), 0.40, INK3)
     put(canvas, "%.0f blinks/min" % pin_rate, (px0 + 200, yy), 0.52, GOOD, 2)
     yy += 30
+    nl = sum(1 for bt in blink_ts_lock if bt <= ts)
     nb = sum(1 for bt in blink_ts if bt <= ts)
-    put(canvas, "blinks so far: %d" % nb, (px0 + 22, yy), 0.44, INK2)
+    put(canvas, "blinks so far:  %d locked  /  %d pinned" % (nl, nb),
+        (px0 + 22, yy), 0.44, INK2)
 
     # ── timeline with playhead ───────────────────────────────────
     lane = tl.copy()
