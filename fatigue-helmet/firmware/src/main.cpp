@@ -40,6 +40,7 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <Arduino.h>
+#include <stdarg.h>
 #include <Wire.h>
 #include <math.h>
 #include "FuzzyFatigue.h"  // Mamdani FIS (heap-free, STL-free, header-only)
@@ -368,6 +369,39 @@ static void earThresholdToMask(const uint8_t *gray, uint8_t *mask, int n) {
   uint8_t t = EyeBlinkEAR::otsuThreshold(gray, n, 1);
   for (int i = 0; i < n; i++) mask[i] = (gray[i] <= t) ? 1 : 0;
 }
+// ─────────────────────────────────────────────────────────────────────────
+// earPrintf() — serial output from the EAR pipeline, mutex-protected.
+//
+// In USB mode this task is also streaming binary JPEG frames, and
+// sendJpegFrame() takes g_serialMutex around each one. These status prints
+// did not, so a line like "#STATUS: EAR ROI motion-locked at ..." was routinely
+// cut in half by frame bytes landing mid-write. The firmware was reporting the
+// lock correctly; the line simply never arrived intact, so live_ear_preview.py
+// never matched it and a working localizer looked completely dead through two
+// preview sessions.
+//
+// Same mutex, same 20 ms timeout as sendJpegFrame. On timeout the message is
+// dropped rather than emitted corrupt -- a lost status line is recoverable, a
+// shredded one poisons the parser. In SD mode the mutex still exists (setup()
+// creates it in both modes) so this path is identical there.
+// ─────────────────────────────────────────────────────────────────────────
+static void earPrintf(const char *fmt, ...) {
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+
+  if (g_serialMutex == nullptr) {   // before setup() creates it
+    Serial.print(buf);
+    return;
+  }
+  if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    Serial.print(buf);
+    xSemaphoreGive(g_serialMutex);
+  }
+}
+
 
 void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   int w = (int)fb->width;
@@ -390,11 +424,11 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     if (!g_earRefGray || !g_earRefMask || !g_earRefRow) {
       // Not fatal: refine() no-ops on a null buffer and the lock falls back to
       // the raw motion peak, which is exactly v3's behaviour.
-      Serial.println(F("#WARN: EAR refine buffers unavailable -- v4 re-centre disabled"));
+      earPrintf("#WARN: EAR refine buffers unavailable -- v4 re-centre disabled\n");
     }
 #endif
     if (!g_earRgbBuf || !g_earGrayBuf || !g_earMaskBuf) {
-      Serial.println(F("#ERROR: EAR buffer alloc failed -- on-device blink detection disabled"));
+      earPrintf("#ERROR: EAR buffer alloc failed -- on-device blink detection disabled\n");
       g_earDisabled = true;
       return;
     }
@@ -408,7 +442,16 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   // pixel count suggested. Do not "optimise" it back to a scaled decode
   // without profiling again.
   if (!fmt2rgb888(fb->buf, fb->len, PIXFORMAT_JPEG, g_earRgbBuf)) {
-    return;  // decode failed this frame, try again next frame
+    // A decode failure used to return in total silence, so a build where EVERY
+    // frame failed to decode looked identical to one that was simply still
+    // accumulating: perfect video, perfect sensors, and no eye output ever.
+    // Report it, throttled, so that state is visible.
+    static uint32_t decodeFails = 0;
+    if (++decodeFails % 20 == 1) {
+      earPrintf("#WARN: EAR jpeg decode failed (%lu so far)\n",
+                    (unsigned long)decodeFails);
+    }
+    return;  // try again next frame
   }
 
 #if defined(EAR_ROI_MANUAL_X)
@@ -418,12 +461,27 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     g_earRoi.size = EAR_ROI_SIZE;
     g_earRoi.locked = true;
     g_earLockDone = true;
-    Serial.printf("#STATUS: EAR ROI manually pinned at x=%d y=%d size=%d\n",
+    earPrintf("#STATUS: EAR ROI manually pinned at x=%d y=%d size=%d\n",
                   g_earRoi.x, g_earRoi.y, g_earRoi.size);
   }
 #endif
 
   if (!g_earLockDone) {
+    // Progress while the localizer accumulates. Without this the lock phase is
+    // completely silent until it succeeds or is rejected, which on a build
+    // that never reaches either is indistinguishable from the pipeline not
+    // running at all -- exactly the ambiguity that made a live preview session
+    // impossible to interpret.
+    static uint32_t lastLockReport = 0;
+    if (timestampMs - lastLockReport >= 2000) {
+      lastLockReport = timestampMs;
+      earPrintf("#EARLOCK: accumulating frames=%d elapsed=%lums tries=%d\n",
+                    g_earLocator.framesAccumulated,
+                    (unsigned long)(g_earLocator.haveTime
+                                    ? (g_earLocator.lastMs - g_earLocator.firstMs) : 0),
+                    g_earMotionTries);
+    }
+
     // Full-frame motion energy -- no assumption about where in the frame
     // the eye sits (session_023 found it was NOT centered).
     earExtractGray(g_earRgbBuf, w, h, 0, 0, w, h, g_earGrayBuf);
@@ -455,10 +513,10 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
         EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, g_earRoi);
         g_earLockDone = true;
         g_earLockConfidence = conf;
-        Serial.printf("#STATUS: EAR ROI motion-locked at x=%d y=%d size=%d conf=%.2f (%d tries)\n",
+        earPrintf("#STATUS: EAR ROI motion-locked at x=%d y=%d size=%d conf=%.2f (%d tries)\n",
                       g_earRoi.x, g_earRoi.y, g_earRoi.size, conf, g_earMotionTries + 1);
       } else {
-        Serial.printf("#STATUS: EAR motion lock rejected conf=%.2f (<%.2f), retrying\n",
+        earPrintf("#STATUS: EAR motion lock rejected conf=%.2f (<%.2f), retrying\n",
                       conf, EAR_MOTION_MIN_CONF);
         g_earLocator.reset();
       }
@@ -524,7 +582,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
       EyeBlinkEAR::GlintBlinkDetector::DARK_OFFSET_BELOW_MEAN);
 
   if (g_earGlint.update(glintPx, roiBrightness, wideDarkPx, timestampMs)) {
-    Serial.printf("#STATUS: blink (glint) t=%u\n", timestampMs);
+    earPrintf("#STATUS: blink (glint) t=%u\n", timestampMs);
   }
   g_onDeviceBlinkRate = g_earGlint.rollingRateBpm(timestampMs);
 }
