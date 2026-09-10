@@ -11,12 +11,15 @@ from a motorcycle helmet to train a fatigue-detection model.
 ## Table of Contents
 1. [Hardware](#1-hardware)
 2. [Firmware Setup](#2-firmware-setup-platformio)
-3. [Python Setup](#3-python-setup)
-4. [Recording a Session](#4-recording-a-session)
-5. [EAR Validation](#5-ear-validation-webcam)
-6. [CSV Dataset Format](#6-csv-dataset-format)
-7. [Recording Protocol](#7-recording-protocol)
-8. [Sensor Placement](#8-sensor-placement)
+3. [Firmware Environments](#3-firmware-environments)
+4. [Python Setup](#4-python-setup)
+5. [Recording a Session](#5-recording-a-session)
+6. [Live Monitoring & On-Device Blink Debug Tools](#6-live-monitoring--on-device-blink-debug-tools)
+7. [Labeling a Session](#7-labeling-a-session)
+8. [EAR Validation](#8-ear-validation-webcam)
+9. [CSV Dataset Format](#9-csv-dataset-format)
+10. [Recording Protocol](#10-recording-protocol)
+11. [Sensor Placement](#11-sensor-placement)
 
 ---
 
@@ -138,7 +141,27 @@ The built-in LED blinks **3 times** at boot to confirm the firmware loaded.
 
 ---
 
-## 3. Python Setup
+## 3. Firmware Environments
+
+`platformio.ini` defines several build environments. Pick one with `pio run -e <env>` /
+`pio run -e <env> --target upload`; only one can be flashed at a time.
+
+| Environment | Purpose | Monitor baud |
+|-------------|---------|---------------|
+| `esp32s3cam` (default) | USB debug mode — camera frames + sensor CSV streamed live to `debug_recorder.py` | 921600 |
+| `esp32s3cam_sd` | **Production mode** — everything (CSV + MJPEG video) saved to microSD, no PC needed; GPIO 21 button starts/stops a session | 115200 |
+| `esp32s3cam_test_sd` | Hardware test mode — validates buzzer + sensors, SD enabled | 115200 |
+| `esp32s3cam_ear_preview` | Debug — same USB video stream as `esp32s3cam`, but also runs the real on-device blink/EAR pipeline on each frame so `live_ear_preview.py` can overlay the ESP's own ROI lock + blink events on the live feed | 921600 |
+| `esp32s3cam_frame_inject` | Debug — no live camera; the ESP receives pre-recorded JPEG frames one at a time over serial from `frame_inject_replay.py` and runs the real on-device pipeline on each, for validating firmware against reference footage | 921600 |
+| `sensor_test` | Standalone 30s-per-sensor stability test (pulse, IMU, camera), independent of `main.cpp` | 921600 |
+| `native` | Host-side (PC) unit tests for hardware-independent algorithm code — `pio test -e native -f test_eye_blink_ear -v` | — |
+
+For day-to-day recording use `esp32s3cam_sd` (standalone) or `esp32s3cam` (tethered debug).
+The others exist purely to debug the on-device blink detector without needing a full recording.
+
+---
+
+## 4. Python Setup
 
 ```bash
 cd fatigue-helmet/python
@@ -156,7 +179,7 @@ pip install -r requirements.txt
 
 ---
 
-## 4. Recording a Session
+## 5. Recording a Session
 
 Recording depends on which firmware environment is flashed.
 
@@ -196,7 +219,66 @@ GPIO 21 button to start/stop a session. Pull the card afterwards and use
 
 ---
 
-## 5. EAR Validation (Webcam)
+## 6. Live Monitoring & On-Device Blink Debug Tools
+
+These are diagnostic tools for watching or validating the on-device blink detector —
+none of them are required for a normal recording session.
+
+**`live_view.py`** — real-time terminal dashboard while `esp32s3cam_sd` (or any env
+printing the 1 Hz debug block) is connected over USB:
+
+```bash
+python live_view.py [COM_PORT] [BAUD]
+# defaults: COM3, 115200
+```
+
+Renders heart rate, blink rate, IMU status, and fatigue risk as a single
+refreshing screen instead of a scrolling log. Ctrl+C to stop.
+
+**`live_ear_preview.py`** — live camera feed with the ESP's own eye-ROI lock and
+blink events drawn on top (not a PC-side guess):
+
+```bash
+# flash first:
+pio run -e esp32s3cam_ear_preview --target upload
+# then:
+python live_ear_preview.py --port COM3
+```
+
+Press `q` to quit.
+
+**`frame_inject_replay.py`** — replays a folder of previously recorded frames
+(`{timestamp_ms}.jpg`, as produced by `debug_recorder.py`/`unpack_session.py`)
+through the real compiled firmware to check its blink/ROI output against
+reference footage:
+
+```bash
+pio run -e esp32s3cam_frame_inject --target upload
+python frame_inject_replay.py --frames-dir ../../sessions/session_067/frames --out session_067_esp_result.csv
+```
+
+Compare its output CSV against `tools/session_replay`'s PC-side replay of the
+same algorithm — if they disagree, something differs between the host build
+and the actual ESP32 binary.
+
+---
+
+## 7. Labeling a Session
+
+Standalone SD-card sessions (`esp32s3cam_sd`) write `sensor_data.csv` straight
+from the firmware with no `label` column. Attach a KSS score after the ride:
+
+```bash
+python label_session.py --session ../../sessions/session_023 --kss 3
+python label_session.py --session ../../sessions/session_023 --kss 3 --condition rested
+```
+
+Writes a new `sensor_data_labeled.csv` (raw file untouched) with the KSS value
+repeated on every row, and records `kss=`/`condition=` in `metadata.txt`.
+
+---
+
+## 8. EAR Validation (Webcam)
 
 This script tests blink detection using your laptop webcam. Run it once
 before a recording session to confirm MediaPipe is working on your machine.
@@ -219,7 +301,7 @@ Normal EAR range:
 
 ---
 
-## 6. CSV Dataset Format
+## 9. CSV Dataset Format
 
 Each row in the output CSV represents one 100 ms sensor snapshot.
 
@@ -245,7 +327,7 @@ the startup calibration. Values represent dynamic movement only.
 
 ---
 
-## 7. Recording Protocol
+## 10. Recording Protocol
 
 ### Session Duration
 Minimum **20 minutes** per session. 30–40 minutes is ideal for model training.
@@ -299,7 +381,7 @@ and no validity flag.
 
 ---
 
-## 8. Sensor Placement
+## 11. Sensor Placement
 
 ```
           Top view of helmet
