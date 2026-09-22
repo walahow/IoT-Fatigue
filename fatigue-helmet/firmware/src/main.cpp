@@ -2288,6 +2288,12 @@ void loop() {
     const unsigned eyeBlinks = 0, eyeNeed = 0;
 #endif
 
+    // Signed: a button press earlier in this same loop() pass can run
+    // armingBegin(), which takes its own millis() and can land at now+1 --
+    // the unsigned now - g_armStartMs would then underflow to ~4294967295
+    // and trip the timeout on the spot.
+    const int32_t armElapsed = (int32_t)(now - g_armStartMs);
+
     static uint32_t lastArmReport = 0;
     if (now - lastArmReport >= 2000) {
       lastArmReport = now;
@@ -2297,13 +2303,13 @@ void loop() {
                     (unsigned)g_hrBase.progress(), (unsigned)HrBaseline::NEEDED,
                     eyeOk ? 1 : 0,
                     eyeBlinks, eyeNeed,
-                    (unsigned long)((now - g_armStartMs) / 1000),
+                    (unsigned long)(armElapsed > 0 ? armElapsed : 0) / 1000,
                     (unsigned long)(ARMING_TIMEOUT_MS / 1000));
     }
 
     if (imuOk && hrOk && eyeOk) {
       recordingBegin();
-    } else if (now - g_armStartMs >= ARMING_TIMEOUT_MS) {
+    } else if (armElapsed >= (int32_t)ARMING_TIMEOUT_MS) {
       g_armTimedOut = true;
       Serial.println(F("#WARNING: Arming timed out -- recording anyway; check armed_* in metadata.txt"));
       recordingBegin();
