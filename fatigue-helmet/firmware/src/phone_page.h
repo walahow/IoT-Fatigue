@@ -168,7 +168,11 @@ function staleTest(t, s) {
 // checks only run during ARMING, so outside it they show as waiting.
 function armingRows(s) {
   const arming = s.state === 'ARMING';
-  const eye = s.eye_check === 'pass'
+  // IDLE shows a latched eye_check from boot or the previous session -- keep
+  // it neutral like the IMU/HR rows until the next ARM restarts the check.
+  const eye = s.state === 'IDLE'
+      ? { ok: null, label: 'eye check (starts at ARM)' }
+    : s.eye_check === 'pass'
       ? { ok: true, label: 'eye check passed (' + s.blinks_since_lock + ' blinks after lock)' }
     : s.eye_check === 'fail'
       ? { ok: false, label: 'eye check failed -- blink channel off this session',

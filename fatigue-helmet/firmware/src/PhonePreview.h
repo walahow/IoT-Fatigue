@@ -22,7 +22,8 @@
 #ifndef PHONE_AP_PASS
 #error "PHONE_AP_PASS must be set in platformio.ini (WPA2, 8+ characters)"
 #endif
-static_assert(sizeof(PHONE_AP_PASS) - 1 >= 8, "PHONE_AP_PASS is empty or too short: set the HELMET_AP_PASS environment variable (8+ characters) before building esp32s3cam_sd");
+static_assert(sizeof(PHONE_AP_PASS) - 1 >= 8 && sizeof(PHONE_AP_PASS) - 1 <= 63,
+              "PHONE_AP_PASS must be 8-63 characters: set the HELMET_AP_PASS environment variable before building esp32s3cam_sd");
 
 namespace PhonePreview {
 

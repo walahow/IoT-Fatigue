@@ -117,5 +117,9 @@ assert.strictEqual(arming[0].ok, true);
 assert.strictEqual(arming[1].ok, false);
 assert.strictEqual(P.armingRows({ state: 'ARMING', imu: 1, hr: 1, hr_n: 30, hr_need: 30, eye_check: 'fail', roi: null, blinks_since_lock: 0, blinks_need: 3 })[2].ok, false);
 assert.strictEqual(P.armingRows({ state: 'ARMING', imu: 1, hr: 1, hr_n: 30, hr_need: 30, eye_check: 'pass', roi: null, blinks_since_lock: 3, blinks_need: 3 })[2].ok, true);
+// IDLE shows a latched result from boot or the previous session -- neutral
+// like the IMU/HR rows until the next ARM, regardless of what eye_check says.
+assert.strictEqual(P.armingRows({ state: 'IDLE', imu: 0, hr: 0, hr_n: 0, hr_need: 30, eye_check: 'fail', roi: null, blinks_since_lock: 0, blinks_need: 3 })[2].ok, null);
+assert.strictEqual(P.armingRows({ state: 'RECORDING', imu: 1, hr: 1, hr_n: 30, hr_need: 30, eye_check: 'pass', roi: null, blinks_since_lock: 3, blinks_need: 3 })[2].ok, true);
 
 console.log('phone_page: all checks passed');

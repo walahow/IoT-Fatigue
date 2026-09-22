@@ -89,6 +89,10 @@
 #error "PHONE_PREVIEW is for the SD build: it reports the arming state that only exists there"
 #endif
 #include "PhonePreview.h"
+// Wi-Fi stays up this long into RECORDING so the page can show that recording
+// started, then goes off for the ride (spec: "Wi-Fi lifecycle"). Declared
+// here, not in the phoneTick block below, so openSession() can also see it.
+static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 15000;
 #endif
 
 // ── Camera Pins (Freenove ESP32-S3-WROOM CAM) ───────────────────────────
@@ -1180,6 +1184,11 @@ bool openSession() {
                                   g_eyeCheck == EYECHECK_FAIL ? "fail" : "pending");
     meta.printf("eye_check_blinks=%u\n", (unsigned)g_earBlinksSinceLock);
     meta.printf("arming_timed_out=%d\n", g_armTimedOut ? 1 : 0);
+#if defined(PHONE_PREVIEW)
+    // Wi-Fi stays on for this many seconds from the start of the recording,
+    // then goes off; pulse/HR in that window may carry radio noise.
+    meta.printf("phone_preview_wifi_on_s=%lu\n", (unsigned long)(PHONE_WIFI_OFF_AFTER_MS / 1000));
+#endif
     // Where the eye crop came from. A "stored" ROI is only as good as the
     // arming check that confirmed it, so a session that reports no blinks can
     // be told apart from one whose ROI was pointing at a cheek.
@@ -2104,6 +2113,7 @@ void handleCommandLine(const char *line, unsigned long now) {
   // live_ear_preview.py --arm.
   if (strncmp(line, "ROI:", 4) == 0) {
     int cx = 0, cy = 0;
+    bool roiSet = false;
     if (strcmp(line + 4, "auto") == 0) {
       earClearStoredRoi();
       g_earLockDone = false;
@@ -2113,6 +2123,7 @@ void handleCommandLine(const char *line, unsigned long now) {
       g_earDriftState = EAR_DRIFT_IDLE;   // g_earLocator is about to be reused for the boot search
       g_earMotionTries = 0;
       Serial.println(F("#STATUS: EAR ROI cleared -- searching for the eye again"));
+      roiSet = true;
     } else if (sscanf(line + 4, "%d,%d", &cx, &cy) == 2 &&
                cx >= 0 && cy >= 0 && cx < 2000 && cy < 2000) {
       earSaveStoredRoi(cx, cy);
@@ -2120,8 +2131,21 @@ void handleCommandLine(const char *line, unsigned long now) {
       g_earRoi.locked = false;
       g_earDriftState = EAR_DRIFT_IDLE;   // the ROI is about to jump; a cycle mid-accumulation is now stale
       Serial.printf("#STATUS: EAR ROI saved cx=%d cy=%d\n", cx, cy);
+      roiSet = true;
     } else {
       Serial.println(F("#ERROR: expected ROI:<cx>,<cy> or ROI:auto"));
+    }
+    // A new box is a new lock, so the eye check (EAR_CHECK_MIN_BLINKS within
+    // EAR_CHECK_WINDOW_MS of the lock) must restart from it, as armingBegin()
+    // does -- otherwise fixing a wrong box late in ARMING runs the check on
+    // the old window and can fail it (blink channel off for the whole ride)
+    // or pass it on blinks seen on the wrong box. Not while recording, where
+    // the session's result is latched; USB debug builds sit in RECORDING, so
+    // the PC tool's behaviour is unchanged.
+    if (roiSet && g_sessionState != SESSION_RECORDING) {
+      g_earValidSinceMs = 0;
+      g_earBlinksSinceLock = 0;
+      g_eyeCheck = EYECHECK_PENDING;
     }
     return;
   }
@@ -2140,10 +2164,6 @@ void handleCommandLine(const char *line, unsigned long now) {
 // ─────────────────────────────────────────────────────────────────────────
 // Phone arming preview — the loop() side of PhonePreview.h.
 // ─────────────────────────────────────────────────────────────────────────
-// Wi-Fi stays up this long into RECORDING so the page can show that recording
-// started, then goes off for the ride (spec: "Wi-Fi lifecycle").
-static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 15000;
-
 // Indexed by SessionState. The page shows these and echoes one back with a
 // press (/press?expect=), so the two must use the same names.
 static const char *const PHONE_STATE_NAME[] = {"IDLE", "ARMING", "RECORDING"};
@@ -2219,6 +2239,11 @@ static void phoneTick(unsigned long now) {
         Serial.printf("#STATUS: Phone press ignored -- page showed %s, helmet is %s\n",
                       cmd + 6, PHONE_STATE_NAME[g_sessionState]);
       }
+    } else if (strncmp(cmd, "ROI:", 4) == 0 && g_sessionState == SESSION_RECORDING) {
+      // The page only blocks this on a state that can be ~1 s old across a
+      // confirm() dialog; clearing the box mid-ride would stop blink
+      // detection and write NVS while recording.
+      Serial.println(F("#STATUS: Phone eye-box change ignored -- recording"));
     } else {
       handleCommandLine(cmd, now);
     }
