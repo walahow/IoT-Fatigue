@@ -450,7 +450,7 @@ enum EyeCheck : uint8_t { EYECHECK_PENDING = 0, EYECHECK_PASS, EYECHECK_FAIL };
 static const uint8_t  EAR_CHECK_MIN_BLINKS = 3;
 static const uint32_t EAR_CHECK_WINDOW_MS  = 30000;
 volatile uint8_t g_earBlinksSinceLock = 0;   // classifier blinks since the ROI lock (saturates at 255)
-volatile uint32_t g_earHogBlinkTotal = 0;    // classifier blinks since boot, never reset -- the phone page takes deltas
+volatile uint32_t g_earHogBlinkTotal = 0;    // classifier blinks since boot, never reset -- camera task is the only writer (volatile ++ is not atomic); the phone page takes deltas
 EyeCheck g_eyeCheck = EYECHECK_PENDING;      // resolved by loop(); latched for the session
 static const uint32_t EAR_BLINK_WARMUP_MS = 60000;  // rate is a 60 s count; a shorter window reads low
 static const uint32_t EAR_FRAME_STALE_MS  = 3000;   // no processed frame this long = camera/decode stalled
@@ -1388,6 +1388,12 @@ void cameraTask(void *arg) {
 #if defined(EAR_PROFILE)
         uint32_t tSd1 = (uint32_t)micros();
 #endif
+#if defined(PHONE_PREVIEW)
+        // Before the ~97 ms EAR pass, so the phone gets the freshest frame.
+        // Never while recording: the ride path stays as it is without Wi-Fi.
+        // (Under EAR_PROFILE this copy, ~0.5 ms, lands in ear=.)
+        if (g_sessionState != SESSION_RECORDING) PhonePreview::offerFrame(fb->buf, fb->len);
+#endif
         if (++g_earFrameCounter % EAR_THROTTLE_DIV == 0) {
           processEarFrame(fb, ts);
         }
@@ -2130,6 +2136,94 @@ void handleCommandLine(const char *line, unsigned long now) {
   }
 }
 
+#if defined(PHONE_PREVIEW)
+// ─────────────────────────────────────────────────────────────────────────
+// Phone arming preview — the loop() side of PhonePreview.h.
+// ─────────────────────────────────────────────────────────────────────────
+// Wi-Fi stays up this long into RECORDING so the page can show that recording
+// started, then goes off for the ride (spec: "Wi-Fi lifecycle").
+static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 15000;
+
+// Indexed by SessionState. The page shows these and echoes one back with a
+// press (/press?expect=), so the two must use the same names.
+static const char *const PHONE_STATE_NAME[] = {"IDLE", "ARMING", "RECORDING"};
+
+// The /status JSON. Readiness uses the same globals as the ARMING block in loop().
+static void buildPhoneStatus(char *out, size_t n, unsigned long now) {
+  static const char *const CHECK[] = {"pending", "pass", "fail"};
+  char roi[48] = "null";
+  if (g_earLockDone && g_earRoi.locked)
+    snprintf(roi, sizeof roi, "{\"x\":%d,\"y\":%d,\"size\":%d}",
+             g_earRoi.x, g_earRoi.y, g_earRoi.size);
+  const bool arming = (g_sessionState == SESSION_ARMING);
+  snprintf(out, n,
+           "{\"state\":\"%s\",\"arm_s\":%lu,\"arm_timeout_s\":%lu,\"timed_out\":%d,"
+           "\"imu\":%d,\"hr\":%d,\"hr_n\":%u,\"hr_need\":%u,"
+           "\"eye_check\":\"%s\",\"blinks_since_lock\":%u,\"blinks_need\":%u,"
+           "\"roi\":%s,\"roi_src\":\"%s\",\"roi_conf\":%.2f,\"hog_total\":%lu}",
+           PHONE_STATE_NAME[g_sessionState],
+           arming ? (unsigned long)((now - g_armStartMs) / 1000) : 0UL,
+           (unsigned long)(ARMING_TIMEOUT_MS / 1000),
+           g_armTimedOut ? 1 : 0,
+           g_armCalib.done ? 1 : 0,
+           g_baselineFormed ? 1 : 0,
+           (unsigned)g_hrBase.progress(), (unsigned)HrBaseline::NEEDED,
+           CHECK[g_eyeCheck],
+           (unsigned)g_earBlinksSinceLock, (unsigned)EAR_CHECK_MIN_BLINKS,
+           roi, g_earRoiSource, g_earLockConfidence,
+           (unsigned long)g_earHogBlinkTotal);
+}
+
+// Every loop() pass: the Wi-Fi lifecycle, commands from the page, and the
+// status snapshot. Whatever the page asks for happens here, on loop()'s task.
+static void phoneTick(unsigned long now) {
+  static SessionState prev = SESSION_IDLE;
+  static unsigned long recSince = 0;
+  if (g_sessionState != prev) {
+    if (g_sessionState == SESSION_RECORDING) recSince = now;
+    // Back from a ride. Blocks a few hundred ms, but nothing is recording.
+    if (g_sessionState == SESSION_IDLE) PhonePreview::start();
+    prev = g_sessionState;
+  }
+  if (g_sessionState == SESSION_RECORDING && PhonePreview::running() &&
+      now - recSince >= PHONE_WIFI_OFF_AFTER_MS) {
+    // ponytail: blocks loop() >= 100 ms mid-recording (httpd_stop's own wait;
+    // up to ~2 s if the server is mid-send) -- 50+ pulse samples, once per
+    // session. Logged below; move stop() to a one-shot task if the gap shows in
+    // the CSV (start() would then need a guard against a stop still in flight).
+    const unsigned long t0 = millis();
+    PhonePreview::stop();
+    Serial.printf("#STATUS: Phone preview off for the ride (took %lu ms) -- back on when the session stops\n",
+                  (unsigned long)(millis() - t0));
+  }
+  if (!PhonePreview::running()) return;
+
+  char cmd[PhonePreview::CMD_MAX];
+  if (PhonePreview::takeCommand(cmd, sizeof cmd)) {
+    if (strncmp(cmd, "PRESS:", 6) == 0) {
+      // A press means what the rider saw only if the helmet is still in the
+      // state the page showed; otherwise drop it (stale label, double tap).
+      if (strcmp(cmd + 6, PHONE_STATE_NAME[g_sessionState]) == 0) {
+        handleCommandLine("BUTTON", now);
+      } else {
+        Serial.printf("#STATUS: Phone press ignored -- page showed %s, helmet is %s\n",
+                      cmd + 6, PHONE_STATE_NAME[g_sessionState]);
+      }
+    } else {
+      handleCommandLine(cmd, now);
+    }
+  }
+
+  static unsigned long lastStatus = 0;
+  if (now - lastStatus >= 250) {
+    lastStatus = now;
+    char json[PhonePreview::STATUS_MAX];
+    buildPhoneStatus(json, sizeof json, now);
+    PhonePreview::setStatus(json);
+  }
+}
+#endif
+
 // ─────────────────────────────────────────────────────────────────────────
 // Main loop — Core 1
 //   500 Hz → readPulseSensor()
@@ -2215,6 +2309,10 @@ void loop() {
       recordingBegin();
     }
   }
+
+#if defined(PHONE_PREVIEW)
+  phoneTick(now);
+#endif
 
 
 
