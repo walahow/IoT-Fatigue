@@ -63,8 +63,11 @@ REJECT_RE = re.compile(r"EAR motion lock rejected conf=([\d.]+)")
 BLINK_RE = re.compile(r"#STATUS: blink \(glint\) t=(\d+)")
 HOG_BLINK_RE = re.compile(r"#STATUS: blink \(hog\) t=(\d+) score=(-?[\d.]+)")
 FRAME_DONE_RE = re.compile(r"#FRAME_DONE ts=(\d+)")
-TIMING_RE = re.compile(r"#FRAME_DONE ts=\d+ ear=(\d+)us hog=(\d+)us")
+TIMING_RE = re.compile(r"#FRAME_DONE ts=\d+ ear=(\d+)us hog=(\d+)us drift=(\d+)us")
 ERROR_RE = re.compile(r"#ERROR:")
+DRIFT_CORRECTED_RE = re.compile(
+    r"EAR drift corrected x=(\d+)->(\d+) y=(\d+)->(\d+) conf=([\d.]+)")
+DRIFT_NOT_CONFIDENT_RE = re.compile(r"#EARDRIFT: cycle ended, not confident")
 
 
 def list_frames(frames_dir):
@@ -109,15 +112,28 @@ def main():
     ap.add_argument("--max-frames", type=int, default=0,
                     help="stop after N frames (a whole session takes ~20 min over serial; "
                          "a few hundred frames is enough for the timing numbers)")
+    ap.add_argument("--start-frame", type=int, default=0,
+                    help="skip the first N frames without sending them. The script never resets "
+                         "the board (dtr/rts held low), so a PRIOR run's ROI/drift/lock state is "
+                         "still live on the chip -- use this to continue a long session across "
+                         "several invocations instead of re-sending frames it already saw. Sending "
+                         "from frame 0 a second time on a chip with already-advanced state is NOT "
+                         "equivalent to a fresh run: reset the board first if that's what you want.")
     args = ap.parse_args()
 
     frames = list_frames(args.frames_dir)
     if not frames:
         print(f"[ERROR] No {{timestamp}}.jpg frames found in {args.frames_dir}")
         sys.exit(1)
+    if args.start_frame:
+        frames = frames[args.start_frame:]
+        if not frames:
+            print(f"[ERROR] --start-frame {args.start_frame} is past the last frame")
+            sys.exit(1)
     if args.max_frames:
         frames = frames[:args.max_frames]
-    print(f"Found {len(frames)} frames. First ts={frames[0][0]} Last ts={frames[-1][0]}")
+    print(f"Found {len(frames)} frames (starting at index {args.start_frame}). "
+          f"First ts={frames[0][0]} Last ts={frames[-1][0]}")
 
     ser = serial.Serial()
     ser.port = args.port
@@ -144,13 +160,26 @@ def main():
     lock_conf = 0.0
     total_blinks = 0
     hog_blinks = []      # (ts, score)
-    timings = []         # (ear_us, hog_us) per frame, as measured on the chip
+    timings = []         # (ear_us, hog_us, drift_us) per frame, as measured on the chip
+    drift_corrections = []    # (roi_x, roi_y, conf) after each applied correction
+    drift_cycles_ended = 0    # corrections + not-confident cycles, i.e. total cycles seen
 
     def handle_line(text):
-        nonlocal roi_locked, roi_x, roi_y, lock_conf, total_blinks
+        nonlocal roi_locked, roi_x, roi_y, lock_conf, total_blinks, drift_cycles_ended
         m = TIMING_RE.search(text)
         if m:
-            timings.append((int(m.group(1)), int(m.group(2))))
+            timings.append((int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            return
+        m = DRIFT_CORRECTED_RE.search(text)
+        if m:
+            roi_x, roi_y, conf = int(m.group(2)), int(m.group(4)), float(m.group(5))
+            drift_corrections.append((roi_x, roi_y, conf))
+            drift_cycles_ended += 1
+            print(f"  [DRIFT] {m.group(1)}->{m.group(2)} , {m.group(3)}->{m.group(4)} conf={conf:.2f}")
+            events.append((None, "drift", (roi_x, roi_y, conf)))
+            return
+        if DRIFT_NOT_CONFIDENT_RE.search(text):
+            drift_cycles_ended += 1
             return
         m = HOG_BLINK_RE.search(text)
         if m:
@@ -230,17 +259,27 @@ def main():
           f"(x={roi_x} y={roi_y} conf={lock_conf:.2f})" if roi_locked else "ROI locked: no")
     print(f"Total blink events      : {total_blinks}")
     print(f"HOG classifier blinks   : {len(hog_blinks)}")
+    print(f"Drift cycles seen       : {drift_cycles_ended} ({len(drift_corrections)} corrected, "
+          f"{drift_cycles_ended - len(drift_corrections)} not confident)")
+    for x, y, conf in drift_corrections:
+        print(f"  -> roi=({x},{y}) conf={conf:.2f}")
     if timings:
         # Per-frame cost measured on the ESP32 itself. Compare hog against the
         # camera build's frame interval (~81 ms in session_101) to see what the
         # classifier costs the recording frame rate.
         ear = sorted(t[0] for t in timings)
         hog = sorted(t[1] for t in timings if t[1] > 0)
+        drift = sorted(t[2] for t in timings if t[2] > 0)
         med = lambda v: v[len(v) // 2] / 1000.0
         p90 = lambda v: v[int(len(v) * 0.9)] / 1000.0
         print(f"on-chip decode+EAR      : median {med(ear):.1f} ms, p90 {p90(ear):.1f} ms ({len(ear)} frames)")
         if hog:
             print(f"on-chip HOG classifier  : median {med(hog):.1f} ms, p90 {p90(hog):.1f} ms ({len(hog)} frames after lock)")
+        if drift:
+            # Only frames where a drift tick actually ran (post-lock) get a
+            # non-zero cost; this is the number that answers "does it fit" for
+            # the new motion-based drift correction.
+            print(f"on-chip drift correction: median {med(drift):.1f} ms, p90 {p90(drift):.1f} ms ({len(drift)} frames after lock)")
     print(f"Output CSV              : {args.out}")
 
 

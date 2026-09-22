@@ -173,7 +173,7 @@
 
 | Issue | Impact | Status |
 |-------|--------|--------|
-| **Drift correction** | Eye tracking drift in long sessions | ⏳ Disabled pending optimization (noise issue) |
+| **Drift correction** | Eye tracking drift in long sessions | 🔧 Re-enabled 2026-09-22, motion-based (reuses the boot lock instead of the old Otsu/darkness method); not yet run on a real ride with the new code |
 | **Camera frame drops** | Occasional lost frames on high SD write load | ⏳ Buffering optimization in progress |
 | **Low-light blink detection** | Otsu fails on very dark scenes | ⚠️ Glint fallback partially mitigates |
 | **Heart rate filtering** | Noisy signal with poor skin contact | 📖 Documented in troubleshooting; user error mostly |
@@ -186,7 +186,7 @@
 ## Next Steps & Future Work
 
 ### Short Term (1–2 weeks)
-- [ ] **Finalize drift correction** — Re-enable with noise filter or disable permanently & document
+- [ ] **Validate drift correction on a real ride** — re-enabled and reasoned from the boot lock's own validated behaviour (see `earDriftTick()` in `main.cpp`), but no session has been recorded with it running yet; check `#STATUS: EAR drift corrected` lines against the video, and an `-DEAR_PROFILE` build's `drift=` timing, the way session_116 was checked by hand
 - [ ] **Optimize frame buffering** — Investigate SD write stalls; potentially add ring buffer
 - [ ] **Test glint fallback** — Validate 3-cue detector in various lighting conditions
 - [ ] **Session merge improvements** — Handle edge cases (clock resets, incomplete frames)

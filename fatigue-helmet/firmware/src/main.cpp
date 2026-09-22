@@ -255,21 +255,24 @@ static const int   EAR_THROTTLE_DIV   = 1;   // every frame -- affordable at QVG
 // Sized to the eye region rather than tightly to the pupil, so normal gaze
 // movement keeps the corneal reflection inside the crop.
 static const int   EAR_ROI_SIZE       = 48;   // QVGA: same physical eye area as 96px at VGA
-static const int   EAR_DRIFT_PERIOD   = 40;    // processed frames between drift checks
-static const int   EAR_DRIFT_MARGIN   = 30;    // px added around the ROI when searching for drift
-static const float EAR_DRIFT_MAX_PX   = 20.0f;
-static const float EAR_DRIFT_ALPHA    = 0.3f;
+// Search room beyond the ROI on each side when checking for drift. Must leave
+// the window >= the locator's fixed 80x60 grid (EyeBlinkEAR::MotionLocator::
+// GRID_W/H, enforced below) -- at EAR_ROI_SIZE=48 that needs >= 16 px; 30
+// matches the disabled version's value, kept for continuity rather than
+// re-derived (no data yet either way -- see earDriftTick()'s comment).
+static const int   EAR_DRIFT_MARGIN   = 30;
 // Retrospective validation against a real session (2026-09-03, see
-// session_replay tool) found the periodic drift-check above can confidently
-// re-lock onto hair occluding the camera later in a session -- hair is a
-// genuinely darker/more stable feature than the eye once it drifts into
-// frame, so the Otsu+centroid drift check has no way to tell the difference.
-// That's a different problem (occlusion) than what drift-correction was
-// built to solve (small physical helmet shift). Disabled until an
-// occlusion-robust version exists: ship the validated boot lock, frozen for
-// the session, rather than let a "correction" actively track the wrong
-// thing.
-static const bool  EAR_DRIFT_ENABLED  = false;
+// session_replay tool) found the ORIGINAL periodic drift-check here could
+// confidently re-lock onto hair occluding the camera later in a session --
+// hair is a genuinely darker/more stable feature than the eye once it drifts
+// into frame, so an Otsu+centroid drift check has no way to tell the
+// difference. That is a different problem (occlusion) than what drift-
+// correction was built to solve (small physical helmet shift), and it is
+// the SAME flaw the motion-energy boot lock two sections down was itself
+// built to fix -- darkest-blob was the ORIGINAL boot lock too, replaced for
+// exactly this reason. See earDriftTick(): it reuses that boot lock instead
+// of reinventing darkness-based drift.
+static const bool  EAR_DRIFT_ENABLED  = true;
 
 // ── Motion-energy boot lock ──────────────────────────────────────────────
 // Replaces an earlier "largest Otsu-thresholded blob in the middle 60% of
@@ -310,12 +313,18 @@ static const int   EAR_MOTION_MAX_TRIES  = 12;    // accept a weak lock rather t
 
 static uint8_t *g_earRgbBuf  = nullptr;  // PSRAM, fullW*fullH*3 (decoded JPEG)
 static uint8_t *g_earGrayBuf = nullptr;  // PSRAM, fullW*fullH, reused at partial size
-static uint8_t *g_earMaskBuf = nullptr;  // PSRAM, fullW*fullH, reused at partial size
 static int      g_earFullW   = 0;
 static int      g_earFullH   = 0;
 
 static uint32_t g_earFrameCounter = 0;
-static uint32_t g_earDriftCounter = 0;
+
+// Drift correction cycle state -- see earDriftTick(). IDLE: not accumulating.
+// ACCUMULATING: g_earLocator is mid-window, searching a small area around the
+// current lock. No frame counter needed beyond this: the locator's own
+// wall-clock window (EAR_V3_WINDOW_MS) and frame floor (EAR_MOTION_MIN_FRAMES)
+// decide when a cycle is ready to evaluate, same as the boot lock.
+enum EarDriftState : uint8_t { EAR_DRIFT_IDLE = 0, EAR_DRIFT_ACCUMULATING };
+static EarDriftState g_earDriftState = EAR_DRIFT_IDLE;
 
 static bool  g_earLockDone = false;
 static bool  g_earDisabled = false;  // set true after a failed buffer allocation; never retried
@@ -406,6 +415,11 @@ static float   g_earHogFeat[EyeBlinkEAR::HOG_LEN];                     // 3 KB, 
 // frame, so the per-frame cost can be measured on a bare ESP32-S3 dev board
 // with no camera attached -- frames come in over USB instead.
 static uint32_t g_earProfHogUs = 0;
+// Drift correction's own share of ear=, same reasoning as g_earProfHogUs --
+// this is the number that answers "does it fit": drift now runs every
+// processed frame (not once per session like the boot lock), so its
+// steady-state cost has to be measured, not assumed.
+static uint32_t g_earProfDriftUs = 0;
 #endif
 volatile float g_onDeviceBlinkRate = 13.0f;  // read by the g_blinkRate fallback below
 
@@ -457,9 +471,131 @@ static void earExtractGray(const uint8_t *rgb, int fullW, int fullH,
 
 // otsuThreshold() only cares about total pixel count, not 2D shape, so a
 // flat n-pixel buffer can be passed as (n, 1) safely.
-static void earThresholdToMask(const uint8_t *gray, uint8_t *mask, int n) {
-  uint8_t t = EyeBlinkEAR::otsuThreshold(gray, n, 1);
-  for (int i = 0; i < n; i++) mask[i] = (gray[i] <= t) ? 1 : 0;
+static void earPrintf(const char *fmt, ...);   // defined below; earDriftTick logs through it
+
+static_assert(EAR_ROI_SIZE + 2 * EAR_DRIFT_MARGIN >= (int)EyeBlinkEAR::MotionLocator::GRID_W &&
+              EAR_ROI_SIZE + 2 * EAR_DRIFT_MARGIN >= (int)EyeBlinkEAR::MotionLocator::GRID_H,
+              "drift search window must be at least the locator's grid size");
+
+// ── Drift correction ────────────────────────────────────────────────────────
+// Re-runs the boot lock's own motion-energy search (EyeBlinkEAR::MotionLocator,
+// declared above) on a small window around the current ROI instead of the
+// whole frame, once per accumulation cycle. This is NOT a new algorithm: it
+// is the boot lock, reused, which is what makes it trustworthy -- see the
+// EAR_DRIFT_ENABLED comment above for why a from-scratch darkness-based
+// version was rejected. Confirmed on session_116 (a real ride, 2026-09-22):
+// the eye visibly walked out of the fixed ROI over several minutes while the
+// (disabled) old drift check would have re-locked onto skin/hair; motion
+// energy cannot make that mistake, because hair does not blink.
+//
+// State cost: reuses g_earLocator and the v4 refine scratch buffers, both
+// idle once g_earLockDone -- net new static memory is EarDriftState above,
+// a handful of bytes. This matters on an S3: the locator alone is ~28.8 KB
+// of internal SRAM (see its own declaration comment); a second copy for
+// drift was not an option on this chip's RAM budget, so there isn't one.
+//
+// UNVALIDATED end-to-end: reasoned from the boot lock's own validated
+// behaviour and confirmed the disabled version's specific failure mode
+// against session_116, but no ride has yet been recorded WITH this code
+// running. Build with -DEAR_PROFILE to confirm the added per-frame cost
+// (g_earProfDriftUs, in the #PROF line) is affordable at speed, and check
+// "#STATUS: EAR drift corrected" lines against the session's video the same
+// way session_116 was checked by hand before trusting the numbers.
+static void earDriftTick(int w, int h, uint32_t timestampMs) {
+  if (!EAR_DRIFT_ENABLED) return;
+#if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
+  uint32_t tDrift0 = (uint32_t)micros();
+#endif
+
+  if (g_earDriftState == EAR_DRIFT_IDLE) {
+    g_earLocator.reset();
+#if EAR_LOCALIZER_VERSION >= 2
+    g_earLocator.setRoiSize(EAR_ROI_SIZE);
+#endif
+#if EAR_LOCALIZER_VERSION >= 3
+    g_earLocator.setWindowMs(EAR_V3_WINDOW_MS);
+#endif
+    g_earDriftState = EAR_DRIFT_ACCUMULATING;
+  }
+
+  // Same throttled-progress idea as the boot lock's #EARLOCK line: without
+  // this, a cycle that never finds a confident peak is silent forever, which
+  // during a live test is indistinguishable from the code not running at all.
+  static uint32_t lastDriftReport = 0;
+  if (timestampMs - lastDriftReport >= 5000) {
+    lastDriftReport = timestampMs;
+    earPrintf("#EARDRIFT: accumulating frames=%d elapsed=%lums\n",
+              g_earLocator.framesAccumulated,
+              (unsigned long)(g_earLocator.haveTime
+                              ? (g_earLocator.lastMs - g_earLocator.firstMs) : 0));
+  }
+
+  // The search window: ROI + margin. earExtractGray() clamps each SOURCE
+  // pixel to the frame edge individually (see its own doc comment), so this
+  // is always exactly EAR_ROI_SIZE + 2*EAR_DRIFT_MARGIN square even when the
+  // ROI sits against a real frame edge -- no separate shrink-or-skip case
+  // needed. Recomputed from g_earRoi every tick rather than cached: safe,
+  // because g_earRoi only changes at the END of a cycle, below, never during.
+  const int dw = EAR_ROI_SIZE + 2 * EAR_DRIFT_MARGIN;
+  const int dh = dw;
+  const int dx = g_earRoi.x - EAR_DRIFT_MARGIN;
+  const int dy = g_earRoi.y - EAR_DRIFT_MARGIN;
+
+  earExtractGray(g_earRgbBuf, w, h, dx, dy, dw, dh, g_earGrayBuf);
+#if EAR_LOCALIZER_VERSION >= 3
+  g_earLocator.addFrame(g_earGrayBuf, dw, dh, timestampMs);
+#else
+  g_earLocator.addFrame(g_earGrayBuf, dw, dh);
+#endif
+
+  float peakCx, peakCy, conf;
+  if (!g_earLocator.peak(dw, dh, EAR_MOTION_MIN_FRAMES, peakCx, peakCy, conf)) {
+#if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
+    g_earProfDriftUs += (uint32_t)micros() - tDrift0;
+#endif
+    return;   // window still accumulating
+  }
+
+  g_earDriftState = EAR_DRIFT_IDLE;   // cycle consumed either way; next tick starts a fresh one
+
+  if (conf >= EAR_MOTION_MIN_CONF) {
+#if EAR_LOCALIZER_VERSION >= 4
+    // Same re-centre step the boot lock takes, on this window treated as its
+    // own "full frame" -- reuses the boot lock's scratch buffers exactly, and
+    // g_earGrayBuf still holds this tick's window crop from addFrame() above.
+    g_earLocator.refine(g_earGrayBuf, dw, dh,
+                        g_earRefGray, g_earRefMask, g_earRefRow, peakCx, peakCy);
+#endif
+
+    int newX = (int)(dx + peakCx - g_earRoi.size / 2.0f);
+    int newY = (int)(dy + peakCy - g_earRoi.size / 2.0f);
+    if (newX + g_earRoi.size > w) newX = w - g_earRoi.size;
+    if (newY + g_earRoi.size > h) newY = h - g_earRoi.size;
+    if (newX < 0) newX = 0;
+    if (newY < 0) newY = 0;
+
+    if (newX != g_earRoi.x || newY != g_earRoi.y) {
+      earPrintf("#STATUS: EAR drift corrected x=%d->%d y=%d->%d conf=%.2f\n",
+                g_earRoi.x, newX, g_earRoi.y, newY, conf);
+      g_earRoi.x = newX;
+      g_earRoi.y = newY;
+    } else {
+      earPrintf("#EARDRIFT: cycle confident (conf=%.2f) but already on target\n", conf);
+    }
+  } else {
+    // No confident motion in the window -- most likely nobody blinked in it,
+    // or the eye is not in it at all. Leaving the ROI alone here, rather than
+    // taking the best available (however weak) guess, is the actual fix: the
+    // old code always "found" something because darkness always exists
+    // somewhere.
+    earPrintf("#EARDRIFT: cycle ended, not confident (conf=%.2f < %.2f)\n",
+              conf, EAR_MOTION_MIN_CONF);
+  }
+  // A fresh cycle starts on the next tick regardless.
+
+#if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
+  g_earProfDriftUs += (uint32_t)micros() - tDrift0;
+#endif
 }
 // ─────────────────────────────────────────────────────────────────────────
 // logBlinkEvent() -- append one detected blink to blink_events.csv (SD mode).
@@ -524,7 +660,6 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     // RGB888 -- 6x smaller, and ~4x less decode work (measured below).
     g_earRgbBuf  = (uint8_t *)heap_caps_malloc((size_t)w * h * 3, MALLOC_CAP_SPIRAM);
     g_earGrayBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
-    g_earMaskBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
     g_earFullW = w;
     g_earFullH = h;
     g_earHog.threshold = BLINK_HOG_THRESHOLD;
@@ -540,7 +675,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
       earPrintf("#WARN: EAR refine buffers unavailable -- v4 re-centre disabled\n");
     }
 #endif
-    if (!g_earRgbBuf || !g_earGrayBuf || !g_earMaskBuf) {
+    if (!g_earRgbBuf || !g_earGrayBuf) {
       earPrintf("#ERROR: EAR buffer alloc failed -- on-device blink detection disabled\n");
       g_earDisabled = true;
       return;
@@ -652,37 +787,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     return;
   }
 
-  if (EAR_DRIFT_ENABLED && ++g_earDriftCounter % EAR_DRIFT_PERIOD == 0) {
-    int dx = g_earRoi.x - EAR_DRIFT_MARGIN;
-    int dy = g_earRoi.y - EAR_DRIFT_MARGIN;
-    int dw = g_earRoi.size + 2 * EAR_DRIFT_MARGIN;
-    int dh = g_earRoi.size + 2 * EAR_DRIFT_MARGIN;
-
-    earExtractGray(g_earRgbBuf, w, h, dx, dy, dw, dh, g_earGrayBuf);
-    earThresholdToMask(g_earGrayBuf, g_earMaskBuf, dw * dh);
-
-    float localCx, localCy;
-    if (EyeBlinkEAR::centroid(g_earMaskBuf, dw, dh, localCx, localCy)) {
-      float newFullCx = dx + localCx;
-      float newFullCy = dy + localCy;
-      float curCx = g_earRoi.x + g_earRoi.size / 2.0f;
-      float curCy = g_earRoi.y + g_earRoi.size / 2.0f;
-
-      float blendedCx, blendedCy;
-      if (EyeBlinkEAR::driftBlend(curCx, curCy, newFullCx, newFullCy,
-                                   EAR_DRIFT_MAX_PX, EAR_DRIFT_ALPHA,
-                                   blendedCx, blendedCy)) {
-        int rx = (int)(blendedCx - g_earRoi.size / 2.0f);
-        int ry = (int)(blendedCy - g_earRoi.size / 2.0f);
-        if (rx + g_earRoi.size > w) rx = w - g_earRoi.size;
-        if (ry + g_earRoi.size > h) ry = h - g_earRoi.size;
-        if (rx < 0) rx = 0;
-        if (ry < 0) ry = 0;
-        g_earRoi.x = rx;
-        g_earRoi.y = ry;
-      }
-    }
-  }
+  earDriftTick(w, h, timestampMs);
 
   earExtractGray(g_earRgbBuf, w, h, g_earRoi.x, g_earRoi.y,
                  g_earRoi.size, g_earRoi.size, g_earGrayBuf);
@@ -828,15 +933,17 @@ void frameInjectTask(void *arg) {
     fb.height = h;
     fb.format = PIXFORMAT_JPEG;
 
-    // ear = decode + localizer/glint + classifier for this frame; hog = the
-    // classifier's share of it. On the camera board the same work sits inside
+    // ear = decode + localizer/glint + classifier for this frame; hog/drift =
+    // their share of it. On the camera board the same work sits inside
     // cameraTask's per-frame budget (see its #PROF line).
     g_earProfHogUs = 0;
+    g_earProfDriftUs = 0;
     uint32_t tEar0 = (uint32_t)micros();
     processEarFrame(&fb, ts);
     uint32_t earUs = (uint32_t)micros() - tEar0;
-    Serial.printf("#FRAME_DONE ts=%u ear=%luus hog=%luus\n", ts,
-                  (unsigned long)earUs, (unsigned long)g_earProfHogUs);
+    Serial.printf("#FRAME_DONE ts=%u ear=%luus hog=%luus drift=%luus\n", ts,
+                  (unsigned long)earUs, (unsigned long)g_earProfHogUs,
+                  (unsigned long)g_earProfDriftUs);
   }
 }
 #endif  // FRAME_INJECT_MODE
@@ -1280,15 +1387,20 @@ void cameraTask(void *arg) {
         profSd  += (tSd1 - tSd0);
         profEar += (tEar1 - tSd1);
         if (++profCount >= 40) {
-          // hog= is the part of ear= spent in the HOG classifier.
-          Serial.printf("#PROF: sd=%luus ear=%luus hog=%luus total=%luus budget=%dus\n",
+          // hog=/drift= are the parts of ear= spent in the HOG classifier and
+          // in drift correction -- drift now runs every frame (not once per
+          // session like the boot lock), so its steady-state share is the
+          // number that answers whether it fits.
+          Serial.printf("#PROF: sd=%luus ear=%luus hog=%luus drift=%luus total=%luus budget=%dus\n",
                         (unsigned long)(profSd / profCount),
                         (unsigned long)(profEar / profCount),
                         (unsigned long)(g_earProfHogUs / profCount),
+                        (unsigned long)(g_earProfDriftUs / profCount),
                         (unsigned long)((profSd + profEar) / profCount),
                         (int)(1000000 / CAMERA_FPS));
           profCount = profSd = profEar = 0;
           g_earProfHogUs = 0;
+          g_earProfDriftUs = 0;
         }
 #endif
 #elif defined(STORAGE_MODE_USB)
@@ -1618,6 +1730,7 @@ void armingBegin() {
   g_earRoi.locked  = false;
   g_earMotionTries = 0;
   g_earLocator.reset();
+  g_earDriftState  = EAR_DRIFT_IDLE;   // g_earLocator is about to be reused for the boot search
   g_earValidSinceMs = 0;   // blink channel re-earns its "valid" after the new lock
   g_earLastFrameMs  = 0;
   g_earBlinksSinceLock = 0;
@@ -1847,7 +1960,13 @@ void setup() {
   analogReadResolution(12);
   Serial.println(F("#STATUS: Pulse sensor GPIO 1 (ADC1) — analog mode"));
 
-#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG) || defined(FRAME_INJECT_MODE)
+  // FRAME_INJECT_MODE included: the processEarFrame() branch that CONSUMES
+  // g_earStoredCx already runs unconditionally, so without this the injected
+  // firmware never sees the stored ROI and instead spends the first ~18 s of
+  // session time re-running the full-frame boot-lock search -- the wrong
+  // thing to test when the point is to compare against a known starting ROI
+  // (see tools/session_replay/drift_test.cpp, which does start there).
   earLoadStoredRoi();
   if (g_earStoredCx >= 0) {
     Serial.printf("#STATUS: stored eye coordinate cx=%d cy=%d (send ROI:auto to clear)\n",
@@ -2190,6 +2309,7 @@ void loop() {
           g_earRoi.locked = false;
           g_earRoiSource = "none";
           g_earLocator.reset();
+          g_earDriftState = EAR_DRIFT_IDLE;   // g_earLocator is about to be reused for the boot search
           g_earMotionTries = 0;
           Serial.println(F("#STATUS: EAR ROI cleared -- searching for the eye again"));
         } else if (sscanf(g_serialLineBuf + 4, "%d,%d", &cx, &cy) == 2 &&
@@ -2197,6 +2317,7 @@ void loop() {
           earSaveStoredRoi(cx, cy);
           g_earLockDone = false;      // re-applied from the stored value next frame
           g_earRoi.locked = false;
+          g_earDriftState = EAR_DRIFT_IDLE;   // the ROI is about to jump; a cycle mid-accumulation is now stale
           Serial.printf("#STATUS: EAR ROI saved cx=%d cy=%d\n", cx, cy);
         } else {
           Serial.println(F("#ERROR: expected ROI:<cx>,<cy> or ROI:auto"));
