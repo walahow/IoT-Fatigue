@@ -38,7 +38,9 @@ blink test. Works in any phone browser; no app.
 4. **The rider can place the eye box by hand**, as clicking on the PC does:
    tap the eye to store the coordinate, **Auto** to clear it and let the
    firmware search again. Same `ROI:` path, same NVS storage, so a coordinate
-   set from the phone and one set from the PC are the same thing.
+   set from the phone and one set from the PC are the same thing. A new box
+   outside recording restarts the firmware's eye check (3 blinks within 30 s
+   of the lock) from that box. While recording, the phone cannot change it.
 
 ## Rejected alternatives
 
@@ -133,7 +135,7 @@ shows in the data. Wi-Fi config is not persisted, so neither step writes flash.
 
 ## Page
 
-- **Banner**: `IDLE` · `ARMING 23 / 60 s` · `RECORDING` · `TIMED OUT`.
+- **Banner**: `IDLE` · `ARMING 23 / 60 s` · `RECORDING` · `RECORDING (arming timed out)`.
 - **Checklist**: IMU calibrated · HR baseline n / 30 (`HrBaseline::NEEDED`) · eye ROI
   (source, confidence) · eye check blinks n / 3 · classifier crop inside frame.
 - **Frame**: rotated 90° CCW, as the PC tool displays it; green ROI box,

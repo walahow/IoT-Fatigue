@@ -898,7 +898,7 @@ In `platformio.ini`, under `[env:esp32s3cam_sd]`, append to `build_flags` (after
     ; Delete these two lines for the no-Wi-Fi build. WPA2 needs 8+ characters;
     ; change the password before taking the helmet anywhere shared.
     -DPHONE_PREVIEW
-    -DPHONE_AP_PASS=\"helmet-arm\"
+    -DPHONE_AP_PASS=\"${sysenv.HELMET_AP_PASS}\"
 ```
 
 - [ ] **Step 3: Include it from `main.cpp`**
@@ -1186,7 +1186,9 @@ Press ARM and let it record for at least 2 minutes.
 Expected:
 - The page shows `RECORDING` for ~15 s.
 - The monitor then prints `#STATUS: Phone preview off for the ride (took N ms) -- ...`, and the page shows `RECORDING -- Wi-Fi now off` within ~4 s. Record N; expect roughly 100–300 ms.
-- Stop with the physical button. Expected: `#STATUS: Wrote N frames ...`, then `#STATUS: Phone preview up -- ...`. The phone can rejoin and reload.
+- Stop with the physical button. Expected: `#STATUS: Wrote N frames ...`, then `#STATUS: Phone preview up -- ...` and `#STATUS: Phone preview restart took N ms`. Record N. The phone can rejoin and reload.
+- Right after that stop line appears, give the button one quick tap. Expected: `#STATE: ARMING`. If the tap is missed, repeat it with a half-second press; the README tells riders to press and hold briefly for exactly this window. Abort afterwards.
+- Also check `metadata.txt` in the new session folder: it contains `phone_preview_wifi_on_s=15`.
 
 Repeat the same 2-minute recording with a build that has the two `PHONE_PREVIEW` lines commented out in `platformio.ini`. Expected: its `Wrote N frames` is within 5% of the Wi-Fi build's. Restore the two lines afterwards.
 
