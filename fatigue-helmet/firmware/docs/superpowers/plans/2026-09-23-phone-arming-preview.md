@@ -166,6 +166,8 @@ take exactly the serial path, and a blink counter that is never reset."
 
 ### Task 2: The page, test first
 
+> **Superseded after review:** the code below is the first cut (commit `c605cb3f`). Review fixes landed in `83f9e1f3`: fetch timeouts, `/press?expect=`, a stale-verdict clear (`roiKey`/`staleTest`), the baseline taken from the first status after the tap, `verdict(checks, t)`, `performance.now()`, prompt and verdict moved above the picture, and boundary tests. The committed `src/phone_page.h` and `tools/phone_page_test.js` are the reference.
+
 The page is one raw-string header, so the firmware needs no filesystem and no build step. The pure functions at the top of its `<script>` are the parts that are easy to get silently wrong: turning a tap into camera coordinates, the classifier-crop mirror, and the blink-test scoring. The node check extracts that script and runs it.
 
 **Files:**
@@ -784,11 +786,32 @@ static esp_err_t onFrame(httpd_req_t *req) {
   return httpd_resp_send(req, (const char *)s_send, len);
 }
 
+// A browser sends Origin on every POST. Refuse one from any other site (a
+// page open in another tab, reaching us while the phone is on this AP) so
+// only this page can arm or move the eye box. curl sends none: allowed.
+static bool fromOurPage(httpd_req_t *req) {
+  char origin[40];
+  esp_err_t e = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof origin);
+  if (e == ESP_ERR_NOT_FOUND) return true;
+  return e == ESP_OK && strcmp(origin, ("http://" + WiFi.softAPIP().toString()).c_str()) == 0;
+}
+
+// ?expect=<the state the page was showing>. loop() drops the press if the
+// helmet has moved on since (phoneTick), so a stale ABORT label cannot stop
+// a recording that just started, and a double tap cannot arm-then-abort.
 static esp_err_t onPress(httpd_req_t *req) {
-  return replyQueued(req, queueCommand("BUTTON"));
+  if (!fromOurPage(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "wrong origin");
+  char q[32], st[12], line[CMD_MAX];
+  if (httpd_req_get_url_query_str(req, q, sizeof q) != ESP_OK ||
+      httpd_query_key_value(q, "expect", st, sizeof st) != ESP_OK ||
+      (strcmp(st, "IDLE") != 0 && strcmp(st, "ARMING") != 0 && strcmp(st, "RECORDING") != 0))
+    return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected ?expect=IDLE|ARMING|RECORDING");
+  snprintf(line, sizeof line, "PRESS:%s", st);
+  return replyQueued(req, queueCommand(line));
 }
 
 static esp_err_t onRoi(httpd_req_t *req) {
+  if (!fromOurPage(req)) return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "wrong origin");
   char q[48], xs[8], ys[8], line[CMD_MAX];
   int x = 0, y = 0;
   if (httpd_req_get_url_query_str(req, q, sizeof q) != ESP_OK)
@@ -968,9 +991,12 @@ to
 // started, then goes off for the ride (spec: "Wi-Fi lifecycle").
 static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 15000;
 
+// Indexed by SessionState. The page shows these and echoes one back with a
+// press (/press?expect=), so the two must use the same names.
+static const char *const PHONE_STATE_NAME[] = {"IDLE", "ARMING", "RECORDING"};
+
 // The /status JSON. Readiness uses the same globals as the ARMING block in loop().
 static void buildPhoneStatus(char *out, size_t n, unsigned long now) {
-  static const char *const STATE[] = {"IDLE", "ARMING", "RECORDING"};
   static const char *const CHECK[] = {"pending", "pass", "fail"};
   char roi[48] = "null";
   if (g_earLockDone && g_earRoi.locked)
@@ -982,7 +1008,7 @@ static void buildPhoneStatus(char *out, size_t n, unsigned long now) {
            "\"imu\":%d,\"hr\":%d,\"hr_n\":%u,\"hr_need\":%u,"
            "\"eye_check\":\"%s\",\"blinks_since_lock\":%u,\"blinks_need\":%u,"
            "\"roi\":%s,\"roi_src\":\"%s\",\"roi_conf\":%.2f,\"hog_total\":%lu}",
-           STATE[g_sessionState],
+           PHONE_STATE_NAME[g_sessionState],
            arming ? (unsigned long)((now - g_armStartMs) / 1000) : 0UL,
            (unsigned long)(ARMING_TIMEOUT_MS / 1000),
            g_armTimedOut ? 1 : 0,
@@ -1016,7 +1042,20 @@ static void phoneTick(unsigned long now) {
   if (!PhonePreview::running()) return;
 
   char cmd[PhonePreview::CMD_MAX];
-  if (PhonePreview::takeCommand(cmd, sizeof cmd)) handleCommandLine(cmd, now);
+  if (PhonePreview::takeCommand(cmd, sizeof cmd)) {
+    if (strncmp(cmd, "PRESS:", 6) == 0) {
+      // A press means what the rider saw only if the helmet is still in the
+      // state the page showed; otherwise drop it (stale label, double tap).
+      if (strcmp(cmd + 6, PHONE_STATE_NAME[g_sessionState]) == 0) {
+        handleCommandLine("BUTTON", now);
+      } else {
+        Serial.printf("#STATUS: Phone press ignored -- page showed %s, helmet is %s\n",
+                      cmd + 6, PHONE_STATE_NAME[g_sessionState]);
+      }
+    } else {
+      handleCommandLine(cmd, now);
+    }
+  }
 
   static unsigned long lastStatus = 0;
   if (now - lastStatus >= 250) {
@@ -1067,9 +1106,14 @@ curl.exe -s -X POST "http://192.168.4.1/roi?x=abc&y=1" -w " %{http_code}\n"
 Expected: `400`, and nothing new in the monitor.
 
 ```
-curl.exe -s -X POST http://192.168.4.1/press
+curl.exe -s -X POST "http://192.168.4.1/press?expect=IDLE"
 ```
-Expected: `ok`. The monitor shows `#STATE: ARMING` and `#STATUS: Arming -- hold still, ...`. Repeat it; expected: `#STATUS: Arming aborted`.
+Expected: `ok`. The monitor shows `#STATE: ARMING` and `#STATUS: Arming -- hold still, ...`. Repeat the same command; expected: `ok`, but the monitor shows `#STATUS: Phone press ignored -- page showed IDLE, helmet is ARMING`. Then send `?expect=ARMING`; expected: `#STATUS: Arming aborted`.
+
+```
+curl.exe -s -X POST -H "Origin: http://evil.example" "http://192.168.4.1/press?expect=IDLE" -w " %{http_code}\n"
+```
+Expected: `403`, and nothing new in the monitor.
 
 Delete `frame.jpg` afterwards.
 

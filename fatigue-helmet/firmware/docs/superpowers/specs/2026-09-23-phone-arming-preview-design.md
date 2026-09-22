@@ -74,7 +74,10 @@ from inside `loop()` and stall the 500 Hz pulse sampler.
 | `GET /status` | JSON snapshot, rebuilt by `loop()` |
 | `GET /frame.jpg` | latest camera frame; IDLE and ARMING only, 503 otherwise |
 | `POST /roi?x=&y=` / `POST /roi?auto` | set / clear the stored eye coordinate |
-| `POST /press` | one button press |
+| `POST /press?expect=<state>` | one button press, dropped by `loop()` if the helmet is no longer in the state the page showed (stale label, double tap) |
+
+`POST`s carrying an `Origin` header other than the page's own are refused
+(403), so another site open on the phone cannot arm or move the eye box.
 
 `/status` fields: `state`, `arm_s`, `arm_timeout_s`, `imu`, `hr`, `hr_n`,
 `hr_need`, `eye_check` (pending/pass/fail), `blinks_since_lock`,
