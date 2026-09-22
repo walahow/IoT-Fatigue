@@ -57,7 +57,7 @@ exactly as today's firmware, which is also the A/B for the bench checks.
 | Setting | Value | Why |
 |---|---|---|
 | SSID | `HELMET-xxxx` (last two MAC bytes) | several helmets can coexist |
-| Security | WPA2, `PHONE_AP_PASS` build flag | the page can arm and move the ROI |
+| Security | WPA2; password from the `HELMET_AP_PASS` env var at build time | the page can arm and move the ROI; the repo is public, so it is not committed |
 | TX power | low (calibration knob) | phone is < 1 m away; less rail noise, less brownout risk |
 
 Pulse is on ADC1, which stays usable with Wi-Fi on (ADC2 does not).
@@ -72,7 +72,7 @@ from inside `loop()` and stall the 500 Hz pulse sampler.
 |---|---|
 | `GET /` | the page (`src/phone_page.h`, one string, no external assets — the AP has no internet) |
 | `GET /status` | JSON snapshot, rebuilt by `loop()` |
-| `GET /frame.jpg` | latest camera frame; IDLE and ARMING only, 503 otherwise |
+| `GET /frame.jpg` | latest camera frame; 204 when none is fresh (the camera only offers frames in IDLE and ARMING) |
 | `POST /roi?x=&y=` / `POST /roi?auto` | set / clear the stored eye coordinate |
 | `POST /press?expect=<state>` | one button press, dropped by `loop()` if the helmet is no longer in the state the page showed (stale label, double tap) |
 
@@ -124,10 +124,12 @@ deltas of `hog_total` for the blink flash and the blink test.
 
 Off during the ride keeps recording identical to today: no extra load on the
 core that runs SD writes and EAR, no SD timing change, no power cost, no
-radio next to the head. Turning the AP off and on blocks for up to a few
-hundred ms; that happens in `loop()` at the 15 s mark and at stop, costing a
-few pulse samples. Acceptable — move it to a one-shot task if it shows in the
-data.
+radio next to the head. Turning the AP off blocks `loop()` for at least
+100 ms (`httpd_stop`'s own wait; up to ~2 s if the server is mid-send, bounded
+by 2 s send/recv timeouts) — 50+ pulse samples, once per session at the 15 s
+mark, and the duration is logged. Turning it back on happens at IDLE, where
+nothing records. Acceptable — move `stop()` to a one-shot task if the gap
+shows in the data. Wi-Fi config is not persisted, so neither step writes flash.
 
 ## Page
 

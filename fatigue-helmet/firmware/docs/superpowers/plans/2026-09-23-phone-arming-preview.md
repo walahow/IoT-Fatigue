@@ -945,6 +945,16 @@ queue. Holds no firmware state; main.cpp wires it up next."
 
 ---
 
+> **Task 3 after review:** the code above is the first cut (`6e3dafec`). Review fixes followed:
+> - TX power set with `esp_wifi_set_max_tx_power` and reported back.
+> - `WiFi.persistent(false)` and no `softAPdisconnect`, so there are no flash writes on stop/start.
+> - httpd send/recv timeouts of 2 s and a 6 KB stack.
+> - `stop()` drops any queued command.
+> - The heap and largest DMA block go in the `up` line.
+> - The password comes from the `HELMET_AP_PASS` environment variable, since the repo is public.
+>
+> The committed `src/PhonePreview.h` and `platformio.ini` are the reference. Every build of `esp32s3cam_sd` from here on needs `HELMET_AP_PASS` set.
+
 ### Task 4: Wire it to the firmware
 
 This task connects the frames, the status JSON, the commands and the Wi-Fi on/off timing. Everything the page asks for runs in `phoneTick()` on `loop()`'s task.
@@ -1034,10 +1044,14 @@ static void phoneTick(unsigned long now) {
   }
   if (g_sessionState == SESSION_RECORDING && PhonePreview::running() &&
       now - recSince >= PHONE_WIFI_OFF_AFTER_MS) {
-    // ponytail: blocks loop() ~100 ms mid-recording (a few pulse samples, once
-    // per session); move stop() to a one-shot task if the gap shows in the CSV.
+    // ponytail: blocks loop() >= 100 ms mid-recording (httpd_stop's own wait;
+    // up to ~2 s if the server is mid-send) -- 50+ pulse samples, once per
+    // session. Logged below; move stop() to a one-shot task if the gap shows in
+    // the CSV (start() would then need a guard against a stop still in flight).
+    const unsigned long t0 = millis();
     PhonePreview::stop();
-    Serial.println(F("#STATUS: Phone preview off for the ride -- back on when the session stops"));
+    Serial.printf("#STATUS: Phone preview off for the ride (took %lu ms) -- back on when the session stops\n",
+                  (unsigned long)(millis() - t0));
   }
   if (!PhonePreview::running()) return;
 
@@ -1085,10 +1099,12 @@ Expected: all four `SUCCESS`.
 
 - [ ] **Step 5: Flash and smoke-test from a laptop**
 
-Run: `pio run -e esp32s3cam_sd -t upload`, then `pio device monitor -e esp32s3cam_sd`
-Expected in the monitor: `#STATUS: Phone preview up -- join Wi-Fi HELMET-XXXX, open http://192.168.4.1 (internal heap free N)`
+The Wi-Fi password comes from the `HELMET_AP_PASS` environment variable at build time (8+ characters; the repo is public, so it isn't committed). Set it once with `setx HELMET_AP_PASS your-pass-here` and open a new terminal.
 
-Join `HELMET-XXXX` from the laptop (password `helmet-arm`), then in PowerShell (use `curl.exe`; plain `curl` there is `Invoke-WebRequest`):
+Run: `pio run -e esp32s3cam_sd -t upload`, then `pio device monitor -e esp32s3cam_sd`
+Expected in the monitor: `#STATUS: Phone preview up -- join Wi-Fi HELMET-XXXX, open http://192.168.4.1 (...)`, which also reports the TX power, free internal heap and largest internal DMA block.
+
+Join `HELMET-XXXX` from the laptop (password: your `HELMET_AP_PASS`), then in PowerShell (use `curl.exe`; plain `curl` there is `Invoke-WebRequest`):
 
 ```
 curl.exe -s http://192.168.4.1/status
@@ -1096,9 +1112,9 @@ curl.exe -s http://192.168.4.1/status
 Expected: one JSON object starting `{"state":"IDLE",` with `"hr_need":30`, `"blinks_need":3`.
 
 ```
-curl.exe -s -o frame.jpg -w "%{http_code} %{size_download}\n" http://192.168.4.1/frame.jpg
+curl.exe -s -o frame.jpg -w "%{http_code} %{size_download}\n" http://192.168.4.1/frame.jpg ; Start-Sleep -Milliseconds 300 ; curl.exe -s -o frame.jpg -w "%{http_code} %{size_download}\n" http://192.168.4.1/frame.jpg
 ```
-Expected: the first call may print `204 0` (no frame requested yet). Repeat it. Expected: `200` and a size of roughly 5000–15000. `frame.jpg` opens as the camera picture (unrotated).
+Expected: the first line may print `204 0` (the first request only tells the camera someone is looking). The second must print `200` and a size of roughly 5000–15000. Both requests are on one line because a frame is only kept for 2 s after the last request. `frame.jpg` opens as the camera picture (unrotated).
 
 ```
 curl.exe -s -X POST "http://192.168.4.1/roi?x=abc&y=1" -w " %{http_code}\n"
@@ -1169,7 +1185,7 @@ With the page open on the phone:
 Press ARM and let it record for at least 2 minutes.
 Expected:
 - The page shows `RECORDING` for ~15 s.
-- The monitor then prints `#STATUS: Phone preview off for the ride -- back on when the session stops`, and the page shows `RECORDING -- Wi-Fi now off`.
+- The monitor then prints `#STATUS: Phone preview off for the ride (took N ms) -- ...`, and the page shows `RECORDING -- Wi-Fi now off` within ~4 s. Record N; expect roughly 100–300 ms.
 - Stop with the physical button. Expected: `#STATUS: Wrote N frames ...`, then `#STATUS: Phone preview up -- ...`. The phone can rejoin and reload.
 
 Repeat the same 2-minute recording with a build that has the two `PHONE_PREVIEW` lines commented out in `platformio.ini`. Expected: its `Wrote N frames` is within 5% of the Wi-Fi build's. Restore the two lines afterwards.
@@ -1189,13 +1205,15 @@ Reflash the normal build afterwards: `pio run -e esp32s3cam_sd -t upload`
 
 Arm 3 times with the phone page open (normal build), and 3 times with the `PHONE_PREVIEW` lines commented out. Keep the finger/sensor placement the same each time. For each arm, record the seconds from `#STATE: ARMING` to `#STATUS: Baseline HR formed: X BPM`, and the value X.
 Pass: the median time to form the baseline with Wi-Fi is within 10 s of the median without it.
-If it fails: set `TX_POWER` in `src/PhonePreview.h` to `WIFI_POWER_2dBm`, and repeat the 3 Wi-Fi arms.
+If it fails: set `TX_POWER` in `src/PhonePreview.h` to `WIFI_POWER_2dBm`, and repeat the 3 Wi-Fi arms (the `Phone preview up` line reports the TX power actually applied).
 Restore the `PHONE_PREVIEW` lines afterwards.
+
+Cleaner second A/B from the same session, with identical sensor placement: Wi-Fi is on for the first 15 s of every recording and off after. In the Step 4 recording's `sensor_data.csv`, compare the spread (standard deviation) of `pulse_raw` and the share of `signal_quality` = 1 over seconds 0–15 against seconds 15–30. Also look for a step in `pulse_raw` at the moment Wi-Fi stops.
 
 - [ ] **Step 7: Memory**
 
-From the Task 3 build output and the `Phone preview up` line, record Flash %, RAM %, and `internal heap free`.
-Pass: internal heap free ≥ 30000 bytes after the AP is up.
+From the Task 3 build output and the `Phone preview up` lines, record Flash %, RAM %, internal heap free and the largest internal DMA block. Take them from the 1st (boot), 2nd and 3rd `Phone preview up` lines, i.e. after two record/stop cycles.
+Pass: internal heap free ≥ 30000 bytes after the AP is up. The 2nd and 3rd values must not keep falling; a steady drop means a leak across start/stop.
 
 - [ ] **Step 8: Record the results and commit**
 
@@ -1245,10 +1263,18 @@ At the end of section 6 (just before `## 7. Labeling a Session`), add:
 ```markdown
 ### Phone arming preview (no laptop)
 
-The `esp32s3cam_sd` build brings up its own Wi-Fi, `HELMET-xxxx`. The password
-is `PHONE_AP_PASS` in `platformio.ini`. Join it from the phone (if the phone
-says the network has no internet, choose to stay connected) and open
-**http://192.168.4.1**:
+The `esp32s3cam_sd` build brings up its own Wi-Fi, `HELMET-xxxx`. Its password
+is read at build time from the `HELMET_AP_PASS` environment variable (8+
+characters, letters/digits/dashes); it is not in the repo, which is public.
+Set it once, then open a new terminal before building:
+
+```bash
+setx HELMET_AP_PASS your-pass-here
+```
+
+Without it, building `esp32s3cam_sd` stops with a message saying so. Join the
+network from the phone (if the phone says it has no internet, choose to stay
+connected) and open **http://192.168.4.1**:
 
 - **Banner** — `IDLE`, `ARMING n / 60 s`, `RECORDING`.
 - **Picture** — the helmet camera, rotated as in `live_ear_preview.py`, with
