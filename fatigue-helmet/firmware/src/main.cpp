@@ -83,6 +83,14 @@
 #define SD_MMC_D0_PIN 40
 #endif
 
+// ── Phone arming preview (SD build, -DPHONE_PREVIEW) ─────────────────────
+#if defined(PHONE_PREVIEW)
+#if !defined(STORAGE_MODE_SD)
+#error "PHONE_PREVIEW is for the SD build: it reports the arming state that only exists there"
+#endif
+#include "PhonePreview.h"
+#endif
+
 // ── Camera Pins (Freenove ESP32-S3-WROOM CAM) ───────────────────────────
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
@@ -2061,6 +2069,11 @@ void setup() {
   Serial.println(F("#STATUS: Idle -- press the button on GPIO 21 to arm a session"));
 #endif
   signalState(g_sessionState);
+
+#if defined(PHONE_PREVIEW)
+  // Last, so a Wi-Fi start failure cannot hold up the sensors or the camera.
+  PhonePreview::start();
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────
