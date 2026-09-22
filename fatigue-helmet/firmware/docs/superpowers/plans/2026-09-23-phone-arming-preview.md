@@ -1290,7 +1290,10 @@ connected) and open **http://192.168.4.1**:
 
 Wi-Fi goes off 15 s into a recording, so the ride records exactly as without
 it, and comes back when the session stops. Stop a recording with the button.
-The page's pure logic is checked with `node tools/phone_page_test.js`.
+If `HELMET-xxxx` never appears after boot (the serial log shows
+`#ERROR: Phone preview: ...`), press the button twice (arm, then abort) to
+retry, or power-cycle. The page's pure logic is checked with
+`node tools/phone_page_test.js`.
 ```
 
 - [ ] **Step 3: CLAUDE.md firmware table**
