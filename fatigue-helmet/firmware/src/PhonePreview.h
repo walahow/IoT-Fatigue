@@ -14,6 +14,7 @@
 #include <WiFi.h>
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "phone_page.h"
@@ -21,7 +22,7 @@
 #ifndef PHONE_AP_PASS
 #error "PHONE_AP_PASS must be set in platformio.ini (WPA2, 8+ characters)"
 #endif
-static_assert(sizeof(PHONE_AP_PASS) - 1 >= 8, "PHONE_AP_PASS: WPA2 needs 8+ characters");
+static_assert(sizeof(PHONE_AP_PASS) - 1 >= 8, "PHONE_AP_PASS is empty or too short: set the HELMET_AP_PASS environment variable (8+ characters) before building esp32s3cam_sd");
 
 namespace PhonePreview {
 
@@ -207,18 +208,32 @@ static void start() {
   const uint64_t mac = ESP.getEfuseMac();   // little-endian: bits 32-47 are the last two MAC bytes
   snprintf(ssid, sizeof ssid, "HELMET-%02X%02X",
            (unsigned)((mac >> 32) & 0xFF), (unsigned)((mac >> 40) & 0xFF));
+  WiFi.persistent(false);  // this AP is brought up/down every ride; don't wear the NVS flash for it
   WiFi.mode(WIFI_AP);
   if (!WiFi.softAP(ssid, PHONE_AP_PASS)) {
     Serial.println(F("#ERROR: Phone preview: Wi-Fi AP failed to start"));
     WiFi.mode(WIFI_OFF);
     return;
   }
-  WiFi.setTxPower(TX_POWER);
+  // WiFi.setTxPower() returns false here: it waits on the async AP_STARTED
+  // event bit, which hasn't been set yet this soon after softAP(). Set the
+  // power directly instead -- WiFi.mode(WIFI_AP) above already ran
+  // esp_wifi_start(), and wifi_power_t is already in the 0.25 dBm units
+  // esp_wifi_set_max_tx_power() takes.
+  if (esp_wifi_set_max_tx_power((int8_t)TX_POWER) != ESP_OK)
+    Serial.println(F("#WARN: Phone preview: could not set Wi-Fi TX power"));
+  int8_t txq = 0;
+  esp_wifi_get_max_tx_power(&txq);
 
-  httpd_config_t cfg   = HTTPD_DEFAULT_CONFIG();
-  cfg.core_id          = 0;     // never loop()'s core 1: the 500 Hz pulse sampler lives there
-  cfg.task_priority    = 1;     // below the camera task (2): the server only gets its slack
-  cfg.lru_purge_enable = true;  // a phone that walks off without closing must not pin sockets
+  httpd_config_t cfg      = HTTPD_DEFAULT_CONFIG();
+  cfg.core_id             = 0;     // never loop()'s core 1: the 500 Hz pulse sampler lives there
+  cfg.task_priority       = 1;     // below the camera task (2): the server only gets its slack
+  cfg.lru_purge_enable    = true;  // a phone that walks off without closing must not pin sockets
+  cfg.stack_size          = 6144;  // handlers stack a 512 B local, newlib printf, String temporaries in fromOurPage
+  // A 15 KB frame over < 1 m needs far less than the 5 s default; bounds how
+  // long stop() can block loop() if httpd_stop() catches a handler mid-send.
+  cfg.send_wait_timeout   = 2;
+  cfg.recv_wait_timeout   = 2;
   if (httpd_start(&s_server, &cfg) != ESP_OK) {
     s_server = nullptr;
     Serial.println(F("#ERROR: Phone preview: web server failed to start"));
@@ -233,9 +248,12 @@ static void start() {
     {"/roi",       HTTP_POST, onRoi,    nullptr},
   };
   for (const httpd_uri_t &r : routes) httpd_register_uri_handler(s_server, &r);
-  Serial.printf("#STATUS: Phone preview up -- join Wi-Fi %s, open http://%s (internal heap free %u)\n",
+  Serial.printf("#STATUS: Phone preview up -- join Wi-Fi %s, open http://%s "
+                "(internal heap free %u, largest internal DMA block %u, tx %.1f dBm)\n",
                 ssid, WiFi.softAPIP().toString().c_str(),
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA),
+                txq / 4.0f);
 }
 
 // Server and Wi-Fi down, for the ride. Buffers stay allocated for the next start().
@@ -244,8 +262,12 @@ static void stop() {
   httpd_handle_t h = s_server;
   s_server = nullptr;              // offerFrame() stops copying before the server goes
   httpd_stop(h);
-  WiFi.softAPdisconnect(true);
+  // WiFi.mode(WIFI_OFF) alone stops/deinits the AP and drops the phone;
+  // softAPdisconnect(true) would also rewrite the (persistent-off) NVS config.
   WiFi.mode(WIFI_OFF);
+  portENTER_CRITICAL(&s_mux);
+  s_cmdPending = false;  // don't let a command queued just before stop() apply after the ride
+  portEXIT_CRITICAL(&s_mux);
 }
 
 }  // namespace PhonePreview
