@@ -54,6 +54,7 @@
 | **CSV Logging** | ✅ Stable | 100 Hz output, timestamp syncing, signal quality tracking |
 | **Camera Integration** | ✅ Stable | OV2640 frame capture, MJPEG streaming to PC or SD card |
 | **SD Card Mode** | ✅ Stable | Standalone recording, no PC required; GPIO 21 button control |
+| **Phone Arming Preview** | ✅ Implemented | `-DPHONE_PREVIEW` on `esp32s3cam_sd`: Wi-Fi AP + page at 192.168.4.1 — arming checklist, camera with eye box, tap-to-set eye, optional blink test, ARM button; Wi-Fi off 15 s into recording |
 | **On-Device Blink Detection** | ✅ Implemented | Otsu binarization, centroid tracking, glint detection, baseline blink rate |
 | **PSRAM Management** | ✅ Fixed | Fallback logic for boards with/without PSRAM; no more init crashes |
 

@@ -149,7 +149,7 @@ The built-in LED blinks **3 times** at boot to confirm the firmware loaded.
 | Environment | Purpose | Monitor baud |
 |-------------|---------|---------------|
 | `esp32s3cam` (default) | USB debug mode — camera frames + sensor CSV streamed live to `debug_recorder.py` | 921600 |
-| `esp32s3cam_sd` | **Production mode** — everything (CSV + MJPEG video) saved to microSD, no PC needed; GPIO 21 button starts/stops a session | 115200 |
+| `esp32s3cam_sd` | **Production mode** — everything (CSV + MJPEG video) saved to microSD, no PC needed; GPIO 21 button starts/stops a session. Also runs the phone arming preview (Wi-Fi `HELMET-xxxx`, see section 6) unless the two `PHONE_PREVIEW` lines are removed | 115200 |
 | `esp32s3cam_test_sd` | Hardware test mode — validates buzzer + sensors, SD enabled | 115200 |
 | `esp32s3cam_ear_preview` | Debug — same USB video stream as `esp32s3cam`, but also runs the real on-device blink/EAR pipeline on each frame so `live_ear_preview.py` can overlay the ESP's own ROI lock + blink events on the live feed | 921600 |
 | `esp32s3cam_frame_inject` | Debug — no live camera; the ESP receives pre-recorded JPEG frames one at a time over serial from `frame_inject_replay.py` and runs the real on-device pipeline on each, for validating firmware against reference footage | 921600 |
@@ -350,6 +350,41 @@ cd ../firmware/tools/session_replay
 g++ -O2 -std=gnu++14 -Ihost_shim -o sensor_sim.exe sensor_sim.cpp
 ./sensor_sim.exe ../../../../sessions/session_101/sensor_data.csv sim.csv --baseline=86 --blinks=pc_101_hog.csv
 ```
+
+### Phone arming preview (no laptop)
+
+The `esp32s3cam_sd` build brings up its own Wi-Fi, `HELMET-xxxx`. Its password
+is read at build time from the `HELMET_AP_PASS` environment variable (8+
+characters, letters/digits/dashes); it is not in the repo, which is public.
+Set it once, then open a new terminal (restart VS Code if you build from the
+PlatformIO extension) before building:
+
+```bash
+setx HELMET_AP_PASS your-pass-here
+```
+
+Without it, building `esp32s3cam_sd` stops with a message saying so. Join the
+network from the phone (if the phone says it has no internet, choose to stay
+connected) and open **http://192.168.4.1**:
+
+- **Banner** — `IDLE`, `ARMING n / 60 s`, `RECORDING`.
+- **Picture** — the helmet camera, rotated as in `live_ear_preview.py`, with
+  the ESP's eye box (green) and the classifier's crop (yellow). Red flash on
+  each detected blink.
+- **Tap the eye** to place the eye box — the same `ROI:<cx>,<cy>` the PC tool
+  sends, stored in NVS the same way. **Auto eye** clears it.
+- **ARM / ABORT / STOP** — one more way to press the GPIO 21 button. The
+  button itself works exactly as before, phone or no phone.
+- **Arming** checklist — the firmware's own gate: IMU, HR baseline, eye check.
+- **Blink test** (optional, as SPACE in `live_ear_preview.py --arm`) — hold
+  still 8 s, then blink 10 times; READY / NOT READY. Arming never waits for it.
+
+Wi-Fi goes off 15 s into a recording, so the ride records exactly as without
+it, and comes back when the session stops. Stop a recording with the button.
+If `HELMET-xxxx` never appears after boot (the serial log shows
+`#ERROR: Phone preview: ...`), press the button twice (arm, then abort) to
+retry, or power-cycle. The page's pure logic is checked with
+`node tools/phone_page_test.js`.
 
 ---
 
