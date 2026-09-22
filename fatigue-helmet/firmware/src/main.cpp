@@ -442,6 +442,7 @@ enum EyeCheck : uint8_t { EYECHECK_PENDING = 0, EYECHECK_PASS, EYECHECK_FAIL };
 static const uint8_t  EAR_CHECK_MIN_BLINKS = 3;
 static const uint32_t EAR_CHECK_WINDOW_MS  = 30000;
 volatile uint8_t g_earBlinksSinceLock = 0;   // classifier blinks since the ROI lock (saturates at 255)
+volatile uint32_t g_earHogBlinkTotal = 0;    // classifier blinks since boot, never reset -- the phone page takes deltas
 EyeCheck g_eyeCheck = EYECHECK_PENDING;      // resolved by loop(); latched for the session
 static const uint32_t EAR_BLINK_WARMUP_MS = 60000;  // rate is a 60 s count; a shorter window reads low
 static const uint32_t EAR_FRAME_STALE_MS  = 3000;   // no processed frame this long = camera/decode stalled
@@ -835,6 +836,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   if (g_earHog.update(hogScore, false)) {
     g_earHogRate.push(timestampMs);
     if (g_earBlinksSinceLock < 255) g_earBlinksSinceLock++;
+    g_earHogBlinkTotal++;
     earPrintf("#STATUS: blink (hog) t=%u score=%.2f\n", timestampMs, hogScore);
     logBlinkEvent(timestampMs, "hog", true, hogScore);
   }
@@ -2062,6 +2064,60 @@ void setup() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// handleCommandLine() — one text command, from the serial port (loop()'s 1 Hz
+// parser) or from the phone page (phoneTick()). Both sources go through here,
+// so the phone can do nothing the serial port cannot, and the two cannot
+// drift apart. Call from loop()'s task only: it arms, stops and moves the ROI.
+// ─────────────────────────────────────────────────────────────────────────
+void handleCommandLine(const char *line, unsigned long now) {
+  // "BUTTON" is one press of the GPIO 21 button, routed through the same
+  // sessionButtonPress() dispatch. Lets the arm/record/stop flow be driven
+  // over USB or from the phone without reaching into the helmet, and cannot
+  // collide with the BLINK: format below.
+  if (strcmp(line, "BUTTON") == 0) {
+    sessionButtonPress();
+    return;
+  }
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+  // "ROI:<cx>,<cy>" stores the eye centre the PC or phone measured (kept in
+  // NVS across reboots and reflashes) and applies it immediately; "ROI:auto"
+  // clears it and goes back to searching. See earStoredRoi* and
+  // live_ear_preview.py --arm.
+  if (strncmp(line, "ROI:", 4) == 0) {
+    int cx = 0, cy = 0;
+    if (strcmp(line + 4, "auto") == 0) {
+      earClearStoredRoi();
+      g_earLockDone = false;
+      g_earRoi.locked = false;
+      g_earRoiSource = "none";
+      g_earLocator.reset();
+      g_earDriftState = EAR_DRIFT_IDLE;   // g_earLocator is about to be reused for the boot search
+      g_earMotionTries = 0;
+      Serial.println(F("#STATUS: EAR ROI cleared -- searching for the eye again"));
+    } else if (sscanf(line + 4, "%d,%d", &cx, &cy) == 2 &&
+               cx >= 0 && cy >= 0 && cx < 2000 && cy < 2000) {
+      earSaveStoredRoi(cx, cy);
+      g_earLockDone = false;      // re-applied from the stored value next frame
+      g_earRoi.locked = false;
+      g_earDriftState = EAR_DRIFT_IDLE;   // the ROI is about to jump; a cycle mid-accumulation is now stale
+      Serial.printf("#STATUS: EAR ROI saved cx=%d cy=%d\n", cx, cy);
+    } else {
+      Serial.println(F("#ERROR: expected ROI:<cx>,<cy> or ROI:auto"));
+    }
+    return;
+  }
+#endif
+  float blink_val = 0.0f;
+  if (sscanf(line, "BLINK:%f", &blink_val) == 1
+      && blink_val >= 0.0f && blink_val <= 60.0f) {
+    g_blinkRate       = blink_val;
+    g_lastValidBlink  = blink_val;
+    g_lastBlinkRxTime = now;
+    g_blinkEverRx     = true;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Main loop — Core 1
 //   500 Hz → readPulseSensor()
 //   10 Hz → IMU sampling / processing
@@ -2287,53 +2343,7 @@ void loop() {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
       g_serialLineBuf[g_serialLineBufLen] = '\0';
-      // Bench affordance: "BUTTON" over serial is treated as one press of the
-      // GPIO 21 button, routed through the same sessionButtonPress() dispatch.
-      // Lets the arm/record/stop flow be exercised over USB without reaching
-      // into the helmet, and cannot collide with the BLINK: format below.
-      if (strcmp(g_serialLineBuf, "BUTTON") == 0) {
-        g_serialLineBufLen = 0;
-        sessionButtonPress();
-        continue;
-      }
-#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
-      // "ROI:<cx>,<cy>" stores the eye centre the PC measured (kept in NVS
-      // across reboots and reflashes) and applies it immediately; "ROI:auto"
-      // clears it and goes back to searching. See earStoredRoi* and
-      // live_ear_preview.py --arm.
-      if (strncmp(g_serialLineBuf, "ROI:", 4) == 0) {
-        int cx = 0, cy = 0;
-        if (strcmp(g_serialLineBuf + 4, "auto") == 0) {
-          earClearStoredRoi();
-          g_earLockDone = false;
-          g_earRoi.locked = false;
-          g_earRoiSource = "none";
-          g_earLocator.reset();
-          g_earDriftState = EAR_DRIFT_IDLE;   // g_earLocator is about to be reused for the boot search
-          g_earMotionTries = 0;
-          Serial.println(F("#STATUS: EAR ROI cleared -- searching for the eye again"));
-        } else if (sscanf(g_serialLineBuf + 4, "%d,%d", &cx, &cy) == 2 &&
-                   cx >= 0 && cy >= 0 && cx < 2000 && cy < 2000) {
-          earSaveStoredRoi(cx, cy);
-          g_earLockDone = false;      // re-applied from the stored value next frame
-          g_earRoi.locked = false;
-          g_earDriftState = EAR_DRIFT_IDLE;   // the ROI is about to jump; a cycle mid-accumulation is now stale
-          Serial.printf("#STATUS: EAR ROI saved cx=%d cy=%d\n", cx, cy);
-        } else {
-          Serial.println(F("#ERROR: expected ROI:<cx>,<cy> or ROI:auto"));
-        }
-        g_serialLineBufLen = 0;
-        continue;
-      }
-#endif
-      float blink_val = 0.0f;
-      if (sscanf(g_serialLineBuf, "BLINK:%f", &blink_val) == 1
-          && blink_val >= 0.0f && blink_val <= 60.0f) {
-        g_blinkRate       = blink_val;
-        g_lastValidBlink  = blink_val;
-        g_lastBlinkRxTime = now;
-        g_blinkEverRx     = true;
-      }
+      handleCommandLine(g_serialLineBuf, now);
       g_serialLineBufLen = 0;
     } else if (g_serialLineBufLen < (uint8_t)(sizeof(g_serialLineBuf) - 1)) {
       g_serialLineBuf[g_serialLineBufLen++] = c;
