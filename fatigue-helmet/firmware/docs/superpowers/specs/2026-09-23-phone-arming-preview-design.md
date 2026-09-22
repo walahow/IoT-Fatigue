@@ -77,7 +77,7 @@ from inside `loop()` and stall the 500 Hz pulse sampler.
 | `POST /press` | one button press |
 
 `/status` fields: `state`, `arm_s`, `arm_timeout_s`, `imu`, `hr`, `hr_n`,
-`hr_need`, `eye`, `eye_check` (pending/pass/fail), `blinks_since_lock`,
+`hr_need`, `eye_check` (pending/pass/fail), `blinks_since_lock`,
 `blinks_need`, `roi` (`x`, `y`, `size` or null), `roi_src`, `roi_conf`,
 `hog_total`, `timed_out`.
 
@@ -129,7 +129,7 @@ data.
 ## Page
 
 - **Banner**: `IDLE` · `ARMING 23 / 60 s` · `RECORDING` · `TIMED OUT`.
-- **Checklist**: IMU calibrated · HR baseline n / 20 · eye ROI
+- **Checklist**: IMU calibrated · HR baseline n / 30 (`HrBaseline::NEEDED`) · eye ROI
   (source, confidence) · eye check blinks n / 3 · classifier crop inside frame.
 - **Frame**: rotated 90° CCW, as the PC tool displays it; green ROI box,
   yellow classifier crop box (`hogCropRect` mirror), red flash when
