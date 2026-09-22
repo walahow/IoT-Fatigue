@@ -166,7 +166,7 @@ take exactly the serial path, and a blink counter that is never reset."
 
 ### Task 2: The page, test first
 
-> **Superseded after review:** the code below is the first cut (commit `c605cb3f`). Review fixes landed in `83f9e1f3`: fetch timeouts, `/press?expect=`, a stale-verdict clear (`roiKey`/`staleTest`), the baseline taken from the first status after the tap, `verdict(checks, t)`, `performance.now()`, prompt and verdict moved above the picture, and boundary tests. The committed `src/phone_page.h` and `tools/phone_page_test.js` are the reference.
+> **Superseded after review:** the code below is the first cut (commit `c605cb3f`). Two review rounds followed (`83f9e1f3`, `5f2a756f`). They added fetch timeouts and `/press?expect=`. A finished verdict is now cleared only by a real eye-box move (`withRoi`/`staleTest`, with drift tolerated), and the test's baseline comes from the first status after the tap. `verdict(checks, t)` changed signature, timing uses `performance.now()`, and the prompt/verdict became one element above a height-capped picture, plus boundary tests. The committed `src/phone_page.h` and `tools/phone_page_test.js` are the reference.
 
 The page is one raw-string header, so the firmware needs no filesystem and no build step. The pure functions at the top of its `<script>` are the parts that are easy to get silently wrong: turning a tap into camera coordinates, the classifier-crop mirror, and the blink-test scoring. The node check extracts that script and runs it.
 
