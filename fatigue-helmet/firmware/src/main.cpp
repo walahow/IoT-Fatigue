@@ -338,7 +338,7 @@ static uint32_t g_earFrameCounter = 0;
 enum EarDriftState : uint8_t { EAR_DRIFT_IDLE = 0, EAR_DRIFT_ACCUMULATING };
 static EarDriftState g_earDriftState = EAR_DRIFT_IDLE;
 
-static bool  g_earLockDone = false;
+static volatile bool g_earLockDone = false;
 static bool  g_earDisabled = false;  // set true after a failed buffer allocation; never retried
 static int   g_earMotionTries = 0;
 static float g_earLockConfidence = 0.0f;
@@ -858,7 +858,13 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   // after the ROI lock (the lock phase returns early above); loop() then waits out
   // EAR_BLINK_WARMUP_MS before trusting the 60 s count.
   g_earLastFrameMs = timestampMs;
-  if (g_earValidSinceMs == 0) g_earValidSinceMs = timestampMs ? timestampMs : 1;  // 0 = "not yet"
+  // Only stamp while the lock this frame was decoded against still holds:
+  // loop() (a phone/serial ROI change, or armingBegin) can drop the lock and
+  // zero g_earValidSinceMs while this frame is still being processed on the
+  // old box. Stamping anyway would start the eye-check window at the tap
+  // instead of at the new lock (and a ~20 s motion search would eat most of
+  // the 30 s window).
+  if (g_earValidSinceMs == 0 && g_earLockDone) g_earValidSinceMs = timestampMs ? timestampMs : 1;  // 0 = "not yet"
 #if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
   g_earProfHogUs += (uint32_t)micros() - tHog0;
 #endif
