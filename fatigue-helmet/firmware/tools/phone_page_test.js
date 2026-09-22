@@ -11,7 +11,7 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'phone_page.h'), '
 const html = src.match(/R"HTML\(([\s\S]*)\)HTML"/)[1];
 const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 const P = vm.runInNewContext(script +
-  '\n;({displayToNative, hogCropRect, cropMargin, blinkTestStart, blinkTestStep, preflightChecks, verdict, armingRows, roiKey, staleTest})', {});
+  '\n;({displayToNative, hogCropRect, cropMargin, blinkTestStart, blinkTestStep, preflightChecks, verdict, armingRows, withRoi, staleTest})', {});
 
 // Values made inside the vm have that realm's prototypes; compare plain copies.
 const eq = (actual, expected) => assert.deepStrictEqual(JSON.parse(JSON.stringify(actual)), expected);
@@ -42,11 +42,11 @@ assert.ok(P.cropMargin({ x: 136, y: 10, size: 48 }, W, H) < 0);   // hangs off t
 assert.strictEqual(P.cropMargin({ x: 136, y: 66, size: 48 }, W, H), 0);   // crop y = 66+24-90 = 0
 assert.strictEqual(P.cropMargin({ x: 250, y: 96, size: 48 }, W, H), 1);   // right edge (catches a W/H swap)
 
-// ── Preflight status, reused below and as the blink test's roiKey.
+// ── Preflight status, reused below.
 const status = { roi: { x: 136, y: 96, size: 48 }, roi_src: 'motion', roi_conf: 2.4 };
 
 // ── Blink test: 8 s still, then 20 s of cued blinking; counts are hog_total deltas.
-let t = P.blinkTestStart(0, 100, P.roiKey(status));
+let t = P.blinkTestStart(0, 100);
 t = P.blinkTestStep(t, 4, 101);
 assert.strictEqual(t.phase, 'still');
 assert.strictEqual(t.count, 1);
@@ -61,11 +61,11 @@ t = P.blinkTestStep(t, 28, 110);                 // blink phase over: 9 detected
 assert.strictEqual(t.phase, 'done');
 assert.strictEqual(t.blinkDetected, 9);
 assert.strictEqual(P.blinkTestStep(t, 99, 200), t);                        // done is final
-assert.strictEqual(P.blinkTestStep(P.blinkTestStart(0, 50, 'k'), 1, 3), null);  // counter went back: ESP rebooted
+assert.strictEqual(P.blinkTestStep(P.blinkTestStart(0, 50), 1, 3), null);  // counter went back: ESP rebooted
 
 // A null hog means the tap fired before the next /status landed; the first
 // status that follows sets the baseline instead of counting pre-tap blinks.
-let u = P.blinkTestStart(0, null, 'k');
+let u = P.blinkTestStart(0, null);
 u = P.blinkTestStep(u, 0.4, 120);
 assert.strictEqual(u.base, 120);
 assert.strictEqual(u.start, 0.4);
@@ -74,6 +74,8 @@ assert.strictEqual(u.phase, 'still');
 assert.strictEqual(P.blinkTestStep(u, 3, 121).count, 1);
 
 // ── Verdict: READY only once a blink test has finished and every check passes.
+// `t` above never had a reference ROI attached (withRoi), which verdict does
+// not care about -- only staleTest does.
 assert.strictEqual(P.verdict(P.preflightChecks(status, t, W, H), t), true);
 assert.strictEqual(P.verdict(P.preflightChecks(status, null, W, H), null), null);   // test not run: no verdict
 assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi_conf: 1.5 }, t, W, H), t), false);
@@ -84,13 +86,27 @@ assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, stillFalse: 2 }, 
 assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, stillFalse: 3 }, W, H), { ...t, stillFalse: 3 }), false);
 assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, blinkDetected: 8 }, W, H), { ...t, blinkDetected: 8 }), true);
 assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, blinkDetected: 7 }, W, H), { ...t, blinkDetected: 7 }), false);
+// No frame yet (W = 0): the crop check can't be judged, so it's NOT READY,
+// not a blank verdict -- a mutant that turns this false into null must fail.
+assert.strictEqual(P.verdict(P.preflightChecks(status, t, 0, H), t), false);
+// Crop margin exactly 0 (the box's classifier crop is exactly inside the
+// frame): the CHECK must read true here, not just cropMargin() itself.
+assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi: { x: 136, y: 66, size: 48 } }, t, W, H), t), true);
 
-// ── staleTest: a finished verdict must not keep applying once the eye box
-// moves (tap, Auto, drift correction) or once recording starts.
-assert.strictEqual(P.staleTest(t, { ...status, state: 'IDLE' }), false);
-assert.strictEqual(P.staleTest(t, { ...status, state: 'RECORDING' }), true);
-assert.strictEqual(P.staleTest(t, { ...status, roi: { x: 140, y: 96, size: 48 } }), true);
-assert.strictEqual(P.staleTest({ ...t, phase: 'blink' }, { ...status, state: 'RECORDING' }), false);   // not done yet
+// ── withRoi / staleTest: the reference ROI is captured when the test
+// FINISHES, not at the tap. Drift correction (earDriftTick, runs in IDLE
+// too) nudges the box by a few px continuously, and the test's 10
+// deliberate blinks are exactly what makes a drift cycle confident -- taking
+// the reference at the tap made the verdict vanish ~1 s after it appeared.
+const doneWithRoi = P.withRoi(t, status);
+eq({ roi: doneWithRoi.roi, roiSrc: doneWithRoi.roiSrc }, { roi: status.roi, roiSrc: status.roi_src });
+assert.strictEqual(P.staleTest(doneWithRoi, { ...status, roi: { x: 136, y: 98, size: 48 } }), false);   // 2 px drift
+assert.strictEqual(P.staleTest(doneWithRoi, { ...status, roi: { x: 136, y: 109, size: 48 } }), true);   // 13 px move
+assert.strictEqual(P.staleTest(doneWithRoi, { ...status, roi_src: 'stored' }), true);   // same x/y, source changed
+assert.strictEqual(P.staleTest(doneWithRoi, { ...status, roi: null }), true);
+assert.strictEqual(P.staleTest(doneWithRoi, { ...status, state: 'RECORDING' }), true);
+assert.strictEqual(P.staleTest(t, status), false);   // done but not yet marked with a reference ROI
+assert.strictEqual(P.staleTest({ ...doneWithRoi, phase: 'blink' }, { ...status, state: 'RECORDING' }), false);   // still running
 
 // ── armingRows: IMU/HR only judged during ARMING; eye check tracks the
 // firmware's own state regardless of phase.

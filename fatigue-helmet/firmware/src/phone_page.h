@@ -20,7 +20,7 @@ body { margin:0; padding:12px 16px 32px; background:var(--bg); color:var(--fg); 
 #banner.arming { color:var(--warn); }
 #banner.rec { color:var(--ok); }
 #banner.lost { color:var(--bad); }
-canvas { width:100%; display:block; border-radius:8px; background:#000; touch-action:manipulation; }
+canvas { display:block; margin:0 auto; width:100%; max-width:calc(60vh * 3 / 4); border-radius:8px; background:#000; touch-action:manipulation; }
 #eye { color:var(--wait); margin:6px 0 10px; font-size:14px; }
 .row { display:flex; gap:8px; margin-bottom:8px; }
 button { flex:1; font-size:17px; font-weight:600; padding:14px 8px; border-radius:10px; border:0; background:#2d2d2d; color:var(--fg); }
@@ -37,13 +37,11 @@ li .hint { display:block; color:var(--wait); font-size:13px; margin-left:3.4em; 
 .bad b { color:var(--bad); }
 .wait b { color:var(--wait); }
 #prompt { font-size:22px; font-weight:700; text-align:center; color:var(--warn); margin:8px 0; min-height:1.4em; }
-#verdict { font-size:22px; font-weight:700; text-align:center; margin:8px 0; }
 #note { color:var(--warn); font-size:14px; min-height:1.2em; text-align:center; }
 </style></head>
 <body>
 <div id="banner">CONNECTING...</div>
 <div id="prompt"></div>
-<div id="verdict"></div>
 <canvas id="cv" width="240" height="320"></canvas>
 <div id="eye"></div>
 <div class="row">
@@ -92,16 +90,10 @@ function cropMargin(roi, W, H) {
   return Math.min(c.x, c.y, W - (c.x + c.w), H - (c.y + c.h));
 }
 
-// Identifies the eye box + how it got there, so a finished blink test can
-// tell whether its verdict still applies to the box currently in use.
-function roiKey(s) {
-  return JSON.stringify([s.roi, s.roi_src]);
-}
-
 // Blink test, a port of live_ear_preview.py --arm. Detections are deltas of the
 // firmware's hog_total. Optional: nothing in the firmware waits on it.
-function blinkTestStart(nowS, hog, roiKeyAtStart) {
-  return { phase: 'still', start: nowS, base: hog, count: 0, stillFalse: null, blinkDetected: null, roiKey: roiKeyAtStart };
+function blinkTestStart(nowS, hog) {
+  return { phase: 'still', start: nowS, base: hog, count: 0, stillFalse: null, blinkDetected: null };
 }
 
 // -> the updated test, or null if the counter went backwards (the ESP rebooted).
@@ -155,10 +147,21 @@ function verdict(checks, t) {
   return checks.every(c => c.ok === true);
 }
 
-// True when a FINISHED test's verdict no longer applies: the eye box moved
-// (tap, Auto, drift correction) or a ride started since the test finished.
+// Attaches the reference ROI a finished test is judged against, taken when
+// the test FINISHES rather than at the tap (see staleTest).
+function withRoi(t, s) {
+  return Object.assign({}, t, { roi: s.roi, roiSrc: s.roi_src });
+}
+
+// True when a FINISHED test's verdict no longer applies. Drift correction
+// (earDriftTick, runs in IDLE too) nudges the ROI by a few px all the time,
+// and the test's 10 deliberate blinks are exactly what makes a drift cycle
+// confident -- so a few px of drift must NOT clear the verdict. A quarter of
+// the box (12 px at size 48) is a real move: re-tap, Auto, or a relock.
 function staleTest(t, s) {
-  return !!t && t.phase === 'done' && (s.state === 'RECORDING' || roiKey(s) !== t.roiKey);
+  return !!t && t.phase === 'done' && t.roi !== undefined && (
+    s.state === 'RECORDING' || !s.roi || !t.roi || s.roi_src !== t.roiSrc ||
+    Math.abs(s.roi.x - t.roi.x) > t.roi.size / 4 || Math.abs(s.roi.y - t.roi.y) > t.roi.size / 4);
 }
 
 // The firmware's own arming gate, as /status reports it. The IMU and HR
@@ -287,16 +290,23 @@ function boot() {
     const checks = preflightChecks(S, test, frame ? frame.width : 0, frame ? frame.height : 0);
     rows($('preflight'), checks);
     const v = verdict(checks, test);
-    $('verdict').textContent = v === null ? '' : v ? 'READY TO RECORD' : 'NOT READY -- see above';
-    $('verdict').style.color = v ? 'var(--ok)' : 'var(--bad)';
 
+    // One element for both: a running test's prompt and a finished test's
+    // verdict never show at the same time, so there is nothing to stack.
+    const prompt = $('prompt');
     let p = '';
-    if (test && test.phase === 'still')
+    if (test && test.phase === 'still') {
       p = 'HOLD STILL, EYES OPEN  ' + Math.max(0, Math.ceil(STILL_SECONDS - (now / 1000 - test.start))) + ' s';
-    else if (test && test.phase === 'blink')
+      prompt.style.color = 'var(--warn)';
+    } else if (test && test.phase === 'blink') {
       p = 'BLINK ' + BLINK_TARGET + ' TIMES  ' + Math.max(0, Math.ceil(BLINK_SECONDS - (now / 1000 - test.start))) +
           ' s  (counted ' + test.count + ')';
-    $('prompt').textContent = p;
+      prompt.style.color = 'var(--warn)';
+    } else if (v !== null) {
+      p = v ? 'READY TO RECORD' : 'NOT READY -- see below';
+      prompt.style.color = v ? 'var(--ok)' : 'var(--bad)';
+    }
+    prompt.textContent = p;
   }
 
   function pollStatus() {
@@ -308,13 +318,18 @@ function boot() {
         lastOk = performance.now();
         if (lastHog !== null && s.hog_total > lastHog) flashUntil = performance.now() + 500;
         lastHog = s.hog_total;
-        if (staleTest(test, s)) test = null;
         if (test && test.phase !== 'done' && s.state === 'RECORDING') {
           test = null;
           note('blink test abandoned -- recording started');
         } else if (test) {
           test = blinkTestStep(test, performance.now() / 1000, s.hog_total);
           if (!test) note('blink test abandoned -- the helmet restarted');
+        }
+        // Attach the reference ROI on the first status after the test finishes.
+        if (test && test.phase === 'done' && test.roi === undefined) test = withRoi(test, s);
+        if (staleTest(test, s)) {
+          test = null;
+          if (s.state !== 'RECORDING') note('eye box moved -- rerun the blink test');
         }
       })
       .catch(() => {})
@@ -357,7 +372,7 @@ function boot() {
   });
   $('test').addEventListener('click', () => {
     if (test && test.phase !== 'done') test = null;
-    else if (S) test = blinkTestStart(performance.now() / 1000, null, roiKey(S));
+    else if (S) test = blinkTestStart(performance.now() / 1000, null);
     render();
   });
 
