@@ -13,3 +13,4 @@ imu_*.txt
 recmode_*.txt
 sensor_test_output*.txt
 sensor_test_result_*.txt
+compile_commands.json
