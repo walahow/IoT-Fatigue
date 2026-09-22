@@ -11,7 +11,7 @@ const src = fs.readFileSync(path.join(__dirname, '..', 'src', 'phone_page.h'), '
 const html = src.match(/R"HTML\(([\s\S]*)\)HTML"/)[1];
 const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
 const P = vm.runInNewContext(script +
-  '\n;({displayToNative, hogCropRect, cropMargin, blinkTestStart, blinkTestStep, preflightChecks, verdict})', {});
+  '\n;({displayToNative, hogCropRect, cropMargin, blinkTestStart, blinkTestStep, preflightChecks, verdict, armingRows, roiKey, staleTest})', {});
 
 // Values made inside the vm have that realm's prototypes; compare plain copies.
 const eq = (actual, expected) => assert.deepStrictEqual(JSON.parse(JSON.stringify(actual)), expected);
@@ -39,9 +39,14 @@ eq(P.hogCropRect({ x: 136, y: 96, size: 48 }), { x: 115, y: 30, w: 90, h: 180 })
 eq(P.hogCropRect({ x: 100, y: 100, size: 50 }), { x: 79, y: 32, w: 93, h: 186 });
 assert.strictEqual(P.cropMargin({ x: 136, y: 96, size: 48 }, W, H), 30);
 assert.ok(P.cropMargin({ x: 136, y: 10, size: 48 }, W, H) < 0);   // hangs off the top
+assert.strictEqual(P.cropMargin({ x: 136, y: 66, size: 48 }, W, H), 0);   // crop y = 66+24-90 = 0
+assert.strictEqual(P.cropMargin({ x: 250, y: 96, size: 48 }, W, H), 1);   // right edge (catches a W/H swap)
+
+// ── Preflight status, reused below and as the blink test's roiKey.
+const status = { roi: { x: 136, y: 96, size: 48 }, roi_src: 'motion', roi_conf: 2.4 };
 
 // ── Blink test: 8 s still, then 20 s of cued blinking; counts are hog_total deltas.
-let t = P.blinkTestStart(0, 100);
+let t = P.blinkTestStart(0, 100, P.roiKey(status));
 t = P.blinkTestStep(t, 4, 101);
 assert.strictEqual(t.phase, 'still');
 assert.strictEqual(t.count, 1);
@@ -56,16 +61,45 @@ t = P.blinkTestStep(t, 28, 110);                 // blink phase over: 9 detected
 assert.strictEqual(t.phase, 'done');
 assert.strictEqual(t.blinkDetected, 9);
 assert.strictEqual(P.blinkTestStep(t, 99, 200), t);                        // done is final
-assert.strictEqual(P.blinkTestStep(P.blinkTestStart(0, 50), 1, 3), null);  // counter went back: ESP rebooted
+assert.strictEqual(P.blinkTestStep(P.blinkTestStart(0, 50, 'k'), 1, 3), null);  // counter went back: ESP rebooted
 
-// ── Verdict: READY only once every check is judged and passes (the PC tool's rule).
-const status = { roi: { x: 136, y: 96, size: 48 }, roi_src: 'motion', roi_conf: 2.4 };
-assert.strictEqual(P.verdict(P.preflightChecks(status, t, W, H)), true);
-assert.strictEqual(P.verdict(P.preflightChecks(status, null, W, H)), null);   // test not run: no verdict
-assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi_conf: 1.5 }, t, W, H)), false);
-assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi_src: 'stored', roi_conf: -1 }, t, W, H)), true);
-assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi: { x: 136, y: 10, size: 48 } }, t, W, H)), false);
-assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, stillFalse: 3 }, W, H)), false);
-assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, blinkDetected: 7 }, W, H)), false);
+// A null hog means the tap fired before the next /status landed; the first
+// status that follows sets the baseline instead of counting pre-tap blinks.
+let u = P.blinkTestStart(0, null, 'k');
+u = P.blinkTestStep(u, 0.4, 120);
+assert.strictEqual(u.base, 120);
+assert.strictEqual(u.start, 0.4);
+assert.strictEqual(u.count, 0);
+assert.strictEqual(u.phase, 'still');
+assert.strictEqual(P.blinkTestStep(u, 3, 121).count, 1);
+
+// ── Verdict: READY only once a blink test has finished and every check passes.
+assert.strictEqual(P.verdict(P.preflightChecks(status, t, W, H), t), true);
+assert.strictEqual(P.verdict(P.preflightChecks(status, null, W, H), null), null);   // test not run: no verdict
+assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi_conf: 1.5 }, t, W, H), t), false);
+assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi_conf: 2.0 }, t, W, H), t), true);   // right at the lock threshold
+assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi_src: 'stored', roi_conf: -1 }, t, W, H), t), true);
+assert.strictEqual(P.verdict(P.preflightChecks({ ...status, roi: { x: 136, y: 10, size: 48 } }, t, W, H), t), false);
+assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, stillFalse: 2 }, W, H), { ...t, stillFalse: 2 }), true);
+assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, stillFalse: 3 }, W, H), { ...t, stillFalse: 3 }), false);
+assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, blinkDetected: 8 }, W, H), { ...t, blinkDetected: 8 }), true);
+assert.strictEqual(P.verdict(P.preflightChecks(status, { ...t, blinkDetected: 7 }, W, H), { ...t, blinkDetected: 7 }), false);
+
+// ── staleTest: a finished verdict must not keep applying once the eye box
+// moves (tap, Auto, drift correction) or once recording starts.
+assert.strictEqual(P.staleTest(t, { ...status, state: 'IDLE' }), false);
+assert.strictEqual(P.staleTest(t, { ...status, state: 'RECORDING' }), true);
+assert.strictEqual(P.staleTest(t, { ...status, roi: { x: 140, y: 96, size: 48 } }), true);
+assert.strictEqual(P.staleTest({ ...t, phase: 'blink' }, { ...status, state: 'RECORDING' }), false);   // not done yet
+
+// ── armingRows: IMU/HR only judged during ARMING; eye check tracks the
+// firmware's own state regardless of phase.
+eq(P.armingRows({ state: 'IDLE', imu: 0, hr: 0, hr_n: 0, hr_need: 30, eye_check: 'pending', roi: null, blinks_since_lock: 0, blinks_need: 3 })
+  .slice(0, 2).map(r => r.ok), [null, null]);
+const arming = P.armingRows({ state: 'ARMING', imu: 1, hr: 0, hr_n: 5, hr_need: 30, eye_check: 'pending', roi: null, blinks_since_lock: 0, blinks_need: 3 });
+assert.strictEqual(arming[0].ok, true);
+assert.strictEqual(arming[1].ok, false);
+assert.strictEqual(P.armingRows({ state: 'ARMING', imu: 1, hr: 1, hr_n: 30, hr_need: 30, eye_check: 'fail', roi: null, blinks_since_lock: 0, blinks_need: 3 })[2].ok, false);
+assert.strictEqual(P.armingRows({ state: 'ARMING', imu: 1, hr: 1, hr_n: 30, hr_need: 30, eye_check: 'pass', roi: null, blinks_since_lock: 3, blinks_need: 3 })[2].ok, true);
 
 console.log('phone_page: all checks passed');

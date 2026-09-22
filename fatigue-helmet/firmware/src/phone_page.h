@@ -42,6 +42,8 @@ li .hint { display:block; color:var(--wait); font-size:13px; margin-left:3.4em; 
 </style></head>
 <body>
 <div id="banner">CONNECTING...</div>
+<div id="prompt"></div>
+<div id="verdict"></div>
 <canvas id="cv" width="240" height="320"></canvas>
 <div id="eye"></div>
 <div class="row">
@@ -53,9 +55,7 @@ li .hint { display:block; color:var(--wait); font-size:13px; margin-left:3.4em; 
 <h2>Arming (the helmet waits for these)</h2>
 <ul id="arming"></ul>
 <h2>Pre-flight blink test (optional)</h2>
-<div id="prompt"></div>
 <ul id="preflight"></ul>
-<div id="verdict"></div>
 <script>
 'use strict';
 // ── Mirrors of firmware / PC-tool constants: keep in step with the source named.
@@ -67,6 +67,7 @@ const BLINK_MIN_DETECTED = 8;
 const STILL_MAX_FALSE = 2;
 const FRAME_PERIOD_MS = 333;     // ~3 fps cap on /frame.jpg -- raise it if EAR slows with the page open
 const LOST_MS = 3000;            // no /status reply this long = connection lost
+const FETCH_TIMEOUT_MS = 2500;  // without it a request to a helmet whose Wi-Fi went off hangs ~1-2 min on the OS connect timeout
 
 // ── Pure logic (tools/phone_page_test.js) ────────────────────────────────────
 // The native frame (W x H) is shown rotated 90 deg CCW, as live_ear_preview.py
@@ -91,15 +92,24 @@ function cropMargin(roi, W, H) {
   return Math.min(c.x, c.y, W - (c.x + c.w), H - (c.y + c.h));
 }
 
+// Identifies the eye box + how it got there, so a finished blink test can
+// tell whether its verdict still applies to the box currently in use.
+function roiKey(s) {
+  return JSON.stringify([s.roi, s.roi_src]);
+}
+
 // Blink test, a port of live_ear_preview.py --arm. Detections are deltas of the
 // firmware's hog_total. Optional: nothing in the firmware waits on it.
-function blinkTestStart(nowS, hog) {
-  return { phase: 'still', start: nowS, base: hog, count: 0, stillFalse: null, blinkDetected: null };
+function blinkTestStart(nowS, hog, roiKeyAtStart) {
+  return { phase: 'still', start: nowS, base: hog, count: 0, stillFalse: null, blinkDetected: null, roiKey: roiKeyAtStart };
 }
 
 // -> the updated test, or null if the counter went backwards (the ESP rebooted).
 function blinkTestStep(t, nowS, hog) {
   if (!t || t.phase === 'done') return t;
+  // S can be ~1 s stale at the moment of the tap; take the baseline from the
+  // first status that lands after it instead of counting pre-tap blinks.
+  if (t.base === null) return Object.assign({}, t, { base: hog, start: nowS, count: 0 });
   if (hog < t.base) return null;
   const count = hog - t.base;
   if (t.phase === 'still' && nowS - t.start >= STILL_SECONDS)
@@ -138,10 +148,17 @@ function preflightChecks(s, t, W, H) {
   return out;
 }
 
-// READY only once every check has been judged and passed.
-function verdict(checks) {
-  if (checks.some(c => c.ok === null)) return null;
-  return checks.every(c => c.ok);
+// READY only once a blink test has actually finished and every check passes;
+// a "waiting" check after a finished test now reads NOT READY, not blank.
+function verdict(checks, t) {
+  if (!t || t.phase !== 'done') return null;
+  return checks.every(c => c.ok === true);
+}
+
+// True when a FINISHED test's verdict no longer applies: the eye box moved
+// (tap, Auto, drift correction) or a ride started since the test finished.
+function staleTest(t, s) {
+  return !!t && t.phase === 'done' && (s.state === 'RECORDING' || roiKey(s) !== t.roiKey);
 }
 
 // The firmware's own arming gate, as /status reports it. The IMU and HR
@@ -176,8 +193,16 @@ function boot() {
     noteTimer = setTimeout(() => { $('note').textContent = ''; }, 4000);
   }
 
+  // fetch with a timeout: without it a request to a helmet whose Wi-Fi just
+  // went off hangs ~1-2 min on the OS connect timeout instead of failing fast.
+  function get(url, opt) {
+    const ac = new AbortController();
+    setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+    return fetch(url, Object.assign({ cache: 'no-store', signal: ac.signal }, opt));
+  }
+
   function post(path) {
-    return fetch(path, { method: 'POST' })
+    return get(path, { method: 'POST' })
       .then(r => { if (!r.ok) note('helmet busy -- try again'); })
       .catch(() => note('no connection to the helmet'));
   }
@@ -216,7 +241,7 @@ function boot() {
       ctx.strokeRect(S.roi.x, S.roi.y, S.roi.size, S.roi.size);
     }
     ctx.setTransform(1, 0, 0, 1, 0, 0);
-    if (Date.now() < flashUntil) {
+    if (performance.now() < flashUntil) {
       ctx.lineWidth = 8;
       ctx.strokeStyle = '#ff3030';
       ctx.strokeRect(4, 4, cv.width - 8, cv.height - 8);
@@ -227,7 +252,7 @@ function boot() {
   }
 
   function render() {
-    const now = Date.now();
+    const now = performance.now();
     const lost = now - lastOk > LOST_MS;
     const st = S ? S.state : '';
     const ban = $('banner');
@@ -261,7 +286,7 @@ function boot() {
     if (S) rows($('arming'), armingRows(S));
     const checks = preflightChecks(S, test, frame ? frame.width : 0, frame ? frame.height : 0);
     rows($('preflight'), checks);
-    const v = verdict(checks);
+    const v = verdict(checks, test);
     $('verdict').textContent = v === null ? '' : v ? 'READY TO RECORD' : 'NOT READY -- see above';
     $('verdict').style.color = v ? 'var(--ok)' : 'var(--bad)';
 
@@ -275,40 +300,44 @@ function boot() {
   }
 
   function pollStatus() {
-    fetch('/status', { cache: 'no-store' })
+    get('/status')
       .then(r => r.json())
       .then(s => {
+        if (typeof s.state !== 'string' || typeof s.hog_total !== 'number') throw new Error('bad status');
         S = s;
-        lastOk = Date.now();
-        if (lastHog !== null && s.hog_total > lastHog) flashUntil = Date.now() + 500;
+        lastOk = performance.now();
+        if (lastHog !== null && s.hog_total > lastHog) flashUntil = performance.now() + 500;
         lastHog = s.hog_total;
+        if (staleTest(test, s)) test = null;
         if (test && test.phase !== 'done' && s.state === 'RECORDING') {
           test = null;
           note('blink test abandoned -- recording started');
         } else if (test) {
-          test = blinkTestStep(test, Date.now() / 1000, s.hog_total);
+          test = blinkTestStep(test, performance.now() / 1000, s.hog_total);
           if (!test) note('blink test abandoned -- the helmet restarted');
         }
       })
       .catch(() => {})
       .finally(() => {
+        // Schedule the next poll before rendering, so an exception in render
+        // can't stop polling forever.
+        setTimeout(pollStatus, test && test.phase !== 'done' ? 250 : 1000);
         render();
         draw();
-        setTimeout(pollStatus, test && test.phase !== 'done' ? 250 : 1000);
       });
   }
 
   // Pull, don't stream: the next frame is requested only after this one lands,
   // so the rate throttles itself to the link and stops when the page closes.
   function pullFrame() {
-    const t0 = Date.now();
+    const t0 = performance.now();
     if (!S || S.state === 'RECORDING' || t0 - lastOk > LOST_MS) { setTimeout(pullFrame, 1000); return; }
-    fetch('/frame.jpg', { cache: 'no-store' })
+    get('/frame.jpg')
       .then(r => r.status === 200 ? r.blob() : null)
       .then(b => b ? createImageBitmap(b) : null)
       .then(bm => { if (bm) { if (frame) frame.close(); frame = bm; draw(); } })
       .catch(() => {})
-      .finally(() => setTimeout(pullFrame, Math.max(0, FRAME_PERIOD_MS - (Date.now() - t0))));
+      .finally(() => setTimeout(pullFrame, Math.max(0, FRAME_PERIOD_MS - (performance.now() - t0))));
   }
 
   cv.addEventListener('click', e => {
@@ -324,11 +353,11 @@ function boot() {
   });
   $('arm').addEventListener('click', () => {
     if (S && S.state === 'RECORDING' && !confirm('Stop recording?')) return;
-    post('/press');
+    post('/press?expect=' + S.state);
   });
   $('test').addEventListener('click', () => {
     if (test && test.phase !== 'done') test = null;
-    else if (S) test = blinkTestStart(Date.now() / 1000, S.hog_total);
+    else if (S) test = blinkTestStart(performance.now() / 1000, null, roiKey(S));
     render();
   });
 
