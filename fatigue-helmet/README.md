@@ -372,9 +372,14 @@ connected) and open **http://192.168.4.1**:
   the ESP's eye box (green) and the classifier's crop (yellow). Red flash on
   each detected blink.
 - **Tap the eye** to place the eye box — the same `ROI:<cx>,<cy>` the PC tool
-  sends, stored in NVS the same way. **Auto eye** clears it.
+  sends, stored in NVS the same way. **Auto eye** clears it. Setting it during
+  ARMING restarts the eye check (3 blinks) from the new box; it can't be
+  changed while recording.
 - **ARM / ABORT / STOP** — one more way to press the GPIO 21 button. The
-  button itself works exactly as before, phone or no phone.
+  button itself works as before, phone or no phone — except for a moment
+  (about 0.1–0.3 s, logged as `took N ms`) when Wi-Fi switches off 15 s into a
+  recording and when it comes back after you stop: a very quick tap then can
+  be missed, so press and hold briefly.
 - **Arming** checklist — the firmware's own gate: IMU, HR baseline, eye check.
 - **Blink test** (optional, as SPACE in `live_ear_preview.py --arm`) — hold
   still 8 s, then blink 10 times; READY / NOT READY. Arming never waits for it.
@@ -383,7 +388,10 @@ Wi-Fi goes off 15 s into a recording, so the ride records exactly as without
 it, and comes back when the session stops. Stop a recording with the button.
 If `HELMET-xxxx` never appears after boot (the serial log shows
 `#ERROR: Phone preview: ...`), press the button twice (arm, then abort) to
-retry, or power-cycle. The page's pure logic is checked with
+retry, or power-cycle. If the page won't load on a phone that has used
+192.168.4.1 for something else (a router, another ESP), clear that site's
+data in the browser: the helmet rejects requests with more than 1 KB of
+headers. The page's pure logic is checked with
 `node tools/phone_page_test.js`.
 
 ---

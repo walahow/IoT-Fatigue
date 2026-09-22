@@ -215,7 +215,7 @@
 ### Recording Sessions
 1. Check `SENSOR_TEST_GUIDE.md` to validate hardware (pulse signal quality, IMU axis orientation)
 2. Decide condition: **Rested** (morning after sleep) or **Fatigued** (after activity/long awake)
-3. Flash firmware: `pio run --target upload` (use `esp32s3cam_sd` for standalone)
+3. Flash firmware: `pio run --target upload` (use `esp32s3cam_sd` for standalone) — set `HELMET_AP_PASS` first (8–63 characters; see README §6, phone arming preview)
 4. Start recording via GPIO 21 button; run 20–40 minutes
 5. Pull SD card, extract with `unpack_session.py` or `mjpeg_to_mp4.py`
 6. **Label CSV:** add `label` column with KSS score (1–9) for all rows
