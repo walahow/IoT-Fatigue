@@ -50,6 +50,7 @@ ehthumbs.db
 Thumbs.db
 
 # Project specific
+/sessions/
 fatigue-helmet/firmware/sessions/
 fatigue-helmet/firmware/test_session/
 fatigue-helmet/python/sessions/
