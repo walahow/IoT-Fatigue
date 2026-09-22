@@ -146,7 +146,8 @@ static bool listFrames(const std::string &dir, std::vector<FrameFile> &out) {
 
 int main(int argc, char **argv) {
   if (argc < 3) {
-    fprintf(stderr, "Usage: %s <frames_dir> <output_csv> [--lock=motion|dark] [--roi=X,Y]\n", argv[0]);
+    fprintf(stderr, "Usage: %s <frames_dir> <output_csv> [--lock=motion|dark] [--roi=X,Y]\n"
+                    "       [--hog-dump=feat.bin] [--hog-model=model.bin --hog-csv=hog.csv]\n", argv[0]);
     return 1;
   }
   std::string framesDir = argv[1];
@@ -158,6 +159,7 @@ int main(int argc, char **argv) {
   int  skipFrames = 0;   // drop this many leading frames
   bool manualRoi = false;
   int  manualCx = 0, manualCy = 0;
+  const char *hogDumpPath = nullptr, *hogModelPath = nullptr, *hogCsvPath = nullptr;
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
     else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
@@ -178,7 +180,34 @@ int main(int argc, char **argv) {
       // tested independently of whether the locator found the eye.
       if (sscanf(argv[i] + 6, "%d,%d", &manualCx, &manualCy) == 2) manualRoi = true;
     }
+    // HOG classifier. --hog-dump writes, per locked frame, a record of
+    // {uint32 timestamp_ms, float frame_mean, float features[HOG_LEN]} for
+    // python/train_blink_classifier.py -- features computed by THIS code, so
+    // the weights it trains match what the device computes. --hog-model reads
+    // {float weights[HOG_LEN], bias, threshold} (written by that script) and
+    // --hog-csv logs the per-frame score and blink events.
+    else if (strncmp(argv[i], "--hog-dump=", 11) == 0) hogDumpPath = argv[i] + 11;
+    else if (strncmp(argv[i], "--hog-model=", 12) == 0) hogModelPath = argv[i] + 12;
+    else if (strncmp(argv[i], "--hog-csv=", 10) == 0) hogCsvPath = argv[i] + 10;
   }
+  FILE *hogDump = hogDumpPath ? fopen(hogDumpPath, "wb") : nullptr;
+  static float hogModel[EyeBlinkEAR::HOG_LEN + 2];   // weights, bias, threshold
+  FILE *hogCsv = nullptr;
+  if (hogModelPath) {
+    FILE *mf = fopen(hogModelPath, "rb");
+    size_t got = mf ? fread(hogModel, sizeof(float), EyeBlinkEAR::HOG_LEN + 2, mf) : 0;
+    if (mf) fclose(mf);
+    if (got != (size_t)EyeBlinkEAR::HOG_LEN + 2 || !hogCsvPath) {
+      fprintf(stderr, "ERROR: --hog-model needs a %d-float model file and --hog-csv\n",
+              EyeBlinkEAR::HOG_LEN + 2);
+      return 1;
+    }
+    hogCsv = fopen(hogCsvPath, "w");
+    fprintf(hogCsv, "timestamp_ms,frame_mean,score,gated,blink\n");
+  }
+  EyeBlinkEAR::HogBlinkDetector hogDet;
+  hogDet.threshold = hogModel[EyeBlinkEAR::HOG_LEN + 1];
+  int hogBlinks = 0;
   printf("Lock mode: %s\n", useMotionLock ? "motion-energy" : "darkest-blob");
 
   std::vector<FrameFile> frames;
@@ -464,6 +493,34 @@ int main(int argc, char **argv) {
       blinkEvent = glint.update(glintPx, roiBrightness, wideDarkPx, f.timestampMs);
       rollingRate = glint.rollingRateBpm(f.timestampMs);
       if (blinkEvent) totalBlinkEvents++;
+
+      // HOG classifier -- the calls main.cpp will make, fed the same crop.
+      if (hogDump || hogCsv) {
+        int cx, cy, cw, ch;
+        EyeBlinkEAR::hogCropRect(roi, cx, cy, cw, ch);
+        earExtractGray(rgb, w, h, cx, cy, cw, ch, earGrayBuf);
+        uint8_t small[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];
+        float feat[EyeBlinkEAR::HOG_LEN];
+        EyeBlinkEAR::boxResample(earGrayBuf, cw, ch, small, EyeBlinkEAR::HOG_W, EyeBlinkEAR::HOG_H);
+        EyeBlinkEAR::hogFeatures(small, feat);
+        // Whole-frame brightness, for designing the exposure/occlusion gate.
+        uint64_t sum = 0;
+        int n = 0;
+        for (int i = 0; i < w * h; i += 4, n++) sum += (rgb[i * 3] + rgb[i * 3 + 1] + rgb[i * 3 + 2]) / 3;
+        float frameMean = (float)sum / n;
+        if (hogDump) {
+          fwrite(&f.timestampMs, sizeof(uint32_t), 1, hogDump);
+          fwrite(&frameMean, sizeof(float), 1, hogDump);
+          fwrite(feat, sizeof(float), EyeBlinkEAR::HOG_LEN, hogDump);
+        }
+        if (hogCsv) {
+          float score = EyeBlinkEAR::linearScore(feat, hogModel, hogModel[EyeBlinkEAR::HOG_LEN]);
+          bool gated = false;
+          bool ev = hogDet.update(score, gated);
+          if (ev) hogBlinks++;
+          fprintf(hogCsv, "%u,%.2f,%.4f,%d,%d\n", f.timestampMs, frameMean, score, gated ? 1 : 0, ev ? 1 : 0);
+        }
+      }
       wroteRow = true;
     }
 
@@ -480,6 +537,8 @@ int main(int argc, char **argv) {
   }
 
   fclose(csv);
+  if (hogDump) fclose(hogDump);
+  if (hogCsv) fclose(hogCsv);
 
   printf("\n=== session_replay summary ===\n");
   printf("Total frames in session : %zu\n", frames.size());
@@ -491,6 +550,7 @@ int main(int argc, char **argv) {
   if (earLockDone) printf(" (at t=%ums)", lockCompletedAtMs);
   printf("\n");
   printf("Total blink events      : %d\n", totalBlinkEvents);
+  if (hogCsv) printf("HOG classifier blinks   : %d\n", hogBlinks);
   printf("Output CSV              : %s\n", outCsvPath.c_str());
 
   return 0;

@@ -1282,4 +1282,175 @@ struct BlinkDetector {
     }
 };
 
+// ── HOG + linear eye-state classifier ────────────────────────────────────
+// Judges one frame at a time: "is the eye in this crop shut?" The glint
+// detector above needs the corneal reflection to vanish for >= 2 frames,
+// but at the ~12 fps this hardware records, 13 of 17 hand-labelled blinks
+// in session_101 showed only ONE fully-closed frame, and the glint was
+// absent or unstable for most of that session (6 blinks found against
+// ~70 labelled). A per-frame shape classifier has neither dependency.
+//
+// Pipeline: gray crop around the locked ROI -> boxResample to 32x64 ->
+// hogFeatures (756 values: edge directions per 8x8 cell, L2-Hys normalised
+// per 2x2-cell block) -> linearScore against trained weights -> threshold.
+// The weights are trained on the host from features dumped by
+// tools/session_replay, i.e. by THIS code, so host and device compute the
+// same numbers. Cost per frame: ~2k gradients + 756 multiply-adds.
+static const int HOG_W = 32, HOG_H = 64, HOG_CELL = 8, HOG_BINS = 9;
+static const int HOG_CELLS_X = HOG_W / HOG_CELL, HOG_CELLS_Y = HOG_H / HOG_CELL;
+static const int HOG_LEN = (HOG_CELLS_X - 1) * (HOG_CELLS_Y - 1) * 4 * HOG_BINS;  // 756
+
+// Area-average resample: each output pixel is the rounded mean of the
+// source pixels it covers. Handles non-integer ratios (the 90x180 QVGA crop
+// -> 32x64), and unlike nearest-neighbour it doesn't alias the eyelashes.
+inline void boxResample(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh) {
+    for (int oy = 0; oy < dh; oy++) {
+        int y0 = oy * sh / dh, y1 = (oy + 1) * sh / dh;
+        if (y1 <= y0) y1 = y0 + 1;
+        for (int ox = 0; ox < dw; ox++) {
+            int x0 = ox * sw / dw, x1 = (ox + 1) * sw / dw;
+            if (x1 <= x0) x1 = x0 + 1;
+            uint32_t sum = 0;
+            for (int y = y0; y < y1; y++)
+                for (int x = x0; x < x1; x++) sum += src[y * sw + x];
+            uint32_t n = (uint32_t)(y1 - y0) * (uint32_t)(x1 - x0);
+            dst[oy * dw + ox] = (uint8_t)((sum + n / 2) / n);
+        }
+    }
+}
+
+// img is HOG_W x HOG_H; out receives HOG_LEN floats. Unsigned orientations
+// (0-180 deg: an edge's direction matters, not which side is brighter),
+// hard-binned; blocks are 2x2 cells at a 1-cell stride.
+inline void hogFeatures(const uint8_t *img, float *out) {
+    // Static, not stack: 1.1 KB, and this runs inside the 8 KB CameraTask.
+    // Not reentrant -- only one task processes frames.
+    static float cells[HOG_CELLS_Y][HOG_CELLS_X][HOG_BINS];
+    memset(cells, 0, sizeof(cells));
+    const float RAD2BIN = (180.0f / 3.14159265f) / (180.0f / HOG_BINS);
+    for (int y = 0; y < HOG_H; y++) {
+        int ym = y > 0 ? y - 1 : 0, yp = y < HOG_H - 1 ? y + 1 : HOG_H - 1;
+        for (int x = 0; x < HOG_W; x++) {
+            int xm = x > 0 ? x - 1 : 0, xp = x < HOG_W - 1 ? x + 1 : HOG_W - 1;
+            float gx = (float)img[y * HOG_W + xp] - (float)img[y * HOG_W + xm];
+            float gy = (float)img[yp * HOG_W + x] - (float)img[ym * HOG_W + x];
+            float mag = sqrtf(gx * gx + gy * gy);
+            if (mag == 0.0f) continue;
+            float b = atan2f(gy, gx) * RAD2BIN;       // -9..9 bins
+            if (b < 0.0f) b += HOG_BINS;
+            int bin = (int)b;
+            if (bin >= HOG_BINS) bin -= HOG_BINS;     // exactly 180 deg == 0 deg
+            cells[y / HOG_CELL][x / HOG_CELL][bin] += mag;
+        }
+    }
+    // L2-Hys, with OpenCV's damping term so near-flat blocks (JPEG noise on
+    // smooth skin) are not blown up to full strength.
+    const int BLOCK = 4 * HOG_BINS;
+    int o = 0;
+    for (int by = 0; by < HOG_CELLS_Y - 1; by++) {
+        for (int bx = 0; bx < HOG_CELLS_X - 1; bx++) {
+            float *v = out + o;
+            int k = 0;
+            for (int cy = by; cy < by + 2; cy++)
+                for (int cx = bx; cx < bx + 2; cx++)
+                    for (int i = 0; i < HOG_BINS; i++) v[k++] = cells[cy][cx][i];
+            float ss = 0.0f;
+            for (int i = 0; i < BLOCK; i++) ss += v[i] * v[i];
+            float s = 1.0f / (sqrtf(ss) + 0.1f * BLOCK);
+            ss = 0.0f;
+            for (int i = 0; i < BLOCK; i++) {
+                v[i] *= s;
+                if (v[i] > 0.2f) v[i] = 0.2f;
+                ss += v[i] * v[i];
+            }
+            s = 1.0f / (sqrtf(ss) + 1e-3f);
+            for (int i = 0; i < BLOCK; i++) v[i] *= s;
+            o += BLOCK;
+        }
+    }
+}
+
+// Crop the classifier sees: centred on the locked ROI, tall enough to hold
+// both lids. 90x180 at QVGA (ROI 48); scales with the ROI for VGA builds.
+// The eye is portrait in frame because the camera is mounted beside it.
+inline void hogCropRect(const RoiLock &roi, int &x, int &y, int &w, int &h) {
+    w = roi.size * 15 / 8;
+    h = 2 * w;
+    x = roi.x + roi.size / 2 - w / 2;
+    y = roi.y + roi.size / 2 - h / 2;
+}
+
+inline float linearScore(const float *f, const float *w, float bias) {
+    float s = bias;
+    for (int i = 0; i < HOG_LEN; i++) s += w[i] * f[i];
+    return s;
+}
+
+// Turns per-frame "closed" scores into blink events. A blink is counted on
+// the FIRST closed frame (no waiting for the eye to reopen), and a closure
+// that re-crosses the threshold with fewer than REFRACTORY_FRAMES open frames
+// in between is the same blink -- the online equivalent of the +-3-frame
+// peak picking the classifier was evaluated with. A gated frame (exposure
+// dropout, hand over the camera -- decided by the caller) never counts.
+struct HogBlinkDetector {
+    static const int REFRACTORY_FRAMES = 3;
+    float threshold = 0.0f;
+    int openRun = REFRACTORY_FRAMES;   // non-closed frames since the last closed one
+
+    bool update(float score, bool gated) {
+        if (gated || score <= threshold) {
+            if (openRun < REFRACTORY_FRAMES) openRun++;
+            return false;
+        }
+        bool isNew = openRun >= REFRACTORY_FRAMES;
+        openRun = 0;
+        return isNew;
+    }
+};
+
+// Rolling blink rate over the timestamps of counted blinks -- the blink_rate the
+// fuzzy model takes. bpm() is the trailing-minute count (the glint detector's
+// rollingRateBpm()); smoothedBpm() is what the device feeds the model.
+//
+// Why smoothed: a 60 s count is a small-number statistic. For a rider whose true rate
+// is 9/min it drops below 8 in ~32% of windows on Poisson noise alone (below 6 in 12%),
+// so Blink_Low kept switching on for an alert rider. Session 101 (hand-labelled, 71
+// blinks in 9.4 min): per-minute counts 15, 6, 17, 5, 4, 8, 10, 2, 2. Over 3 minutes
+// the same noise shrinks by sqrt(3), and a true 9/min rider vs a true 5/min rider
+// (IICIP 2016 driving baseline vs fatigued) become separable.
+struct BlinkRateWindow {
+    static const int MAX_TRACKED = 128;   // 3 min at up to ~40 blinks/min (the old 60 capped the rate at 20)
+    static const uint32_t SHORT_MS = 60000;
+    static const uint32_t LONG_MS  = 180000;
+    uint32_t ts[MAX_TRACKED] = {0};
+    int n = 0;
+
+    void push(uint32_t nowMs) {
+        if (n == MAX_TRACKED) {
+            memmove(ts, ts + 1, (MAX_TRACKED - 1) * sizeof(uint32_t));
+            n--;
+        }
+        ts[n++] = nowMs;
+    }
+
+    int countWithin(uint32_t nowMs, uint32_t windowMs) const {
+        int c = 0;
+        for (int i = 0; i < n; i++) if ((uint32_t)(nowMs - ts[i]) <= windowMs) c++;
+        return c;
+    }
+
+    // Blinks in the trailing minute.
+    float bpm(uint32_t nowMs) const { return (float)countWithin(nowMs, SHORT_MS); }
+
+    // Blinks/min over the last LONG_MS. Until that much time has passed since
+    // sinceMs (the eye lock), the window is the time elapsed, but never under
+    // SHORT_MS, so a young session does not read as a low rate.
+    float smoothedBpm(uint32_t nowMs, uint32_t sinceMs) const {
+        uint32_t w = nowMs - sinceMs;
+        if (w > LONG_MS) w = LONG_MS;
+        if (w < SHORT_MS) w = SHORT_MS;
+        return (float)countWithin(nowMs, w) * 60000.0f / (float)w;
+    }
+};
+
 }  // namespace EyeBlinkEAR

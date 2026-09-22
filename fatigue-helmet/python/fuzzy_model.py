@@ -43,12 +43,12 @@ INPUT 1 — HR_Diff (%)
   Source: thresholds_walkthrough.md §1 (MePhy, FatigueSet datasets)
 
 INPUT 2 — Blink_Rate (blinks/min)
-  Source: 60-second rolling blink count from camera feature stream
+  Source: 3-minute smoothed blink rate (blinks/min) from the camera feature stream
           (USB mode: received via serial command BLINK:<float>\n from PC)
 
   MF          Shape              Breakpoints
   ──────────  ─────────────────  ────────────────────────────────────
-  Low         Left trapezoid     (0, 0, 4, 8)         full ≤ 4 bl/min
+  Low         Left trapezoid     (-inf, -inf, 3, 7)   full ≤ 3 bl/min (was 0,0,4,8)
   Normal      Trapezoid          (6, 8, 18, 20)        flat-top 8–18 bl/min
   High        Right trapezoid    (20, 24, +∞, +∞)     full ≥ 24 bl/min
 
@@ -62,8 +62,8 @@ INPUT 3 — IMU (two raw sub-values fuzzified inside FIS)
     gyro_var  — rolling variance of head_movement magnitude over last 10s
     pitch_deg — angular deviation from calibration gravity vector (°)
     nodding_score — pre-computed [0..1] from 6-second 10 Hz pitch buffer
-                    Formula: clamp(ZCR/4, 0, 1) × (slope < 0 ? 1 : 0)
-                    Engineering assumption: nodding frequency 0.5–2 Hz
+                    See firmware/src/NodDetector.h: 0 unless the window swings ≥ 10°
+                    and alternates ±(swing/4) at least 3 times, then min(alt/6, 1)
 
   Sub-MF      Shape              Breakpoints        Source
   ──────────  ─────────────────  ─────────────────  ───────────────────────
@@ -77,9 +77,12 @@ INPUT 3 — IMU (two raw sub-values fuzzified inside FIS)
   Derived IMU memberships (computed inside FIS, NOT pre-computed in firmware):
     limp_drowsy  = min(pitch_Limp, gyro_Stable)
                    ← Limp only valid if head is ALSO still (not just nodding forward)
+    nod_trusted  = min(nodding_score, gyro_Stable)
+                   ← same gate: a bump's pitch jolt can trip the nod detector too
+                     (session_116, a real ride, caught this on video -- see FuzzyFatigue.h)
     IMU_Stable   = gyro_Stable
     IMU_Fidgety  = gyro_Fidgety
-    IMU_Drowsy   = max(limp_drowsy, nodding_score)
+    IMU_Drowsy   = max(limp_drowsy, nod_trusted)
 
   Source: thresholds_walkthrough.md §5 (FatigueSet, Alparslan, Freitas 2024)
 
@@ -208,8 +211,14 @@ def hr_Dropped(v):   return _trap(v, -1e6, -1e6, -15.0,  -5.0)
 def hr_Stable(v):    return _trap(v, -15.0,  -9.0, 10.0,  15.0)
 def hr_Elevated(v):  return _trap(v,  10.0,  15.0, 1e6,   1e6)
 
+# Minimum firing strength (alpha-cut), applied to every rule in update(); mirrors
+# FIS_MIN_FIRING in FuzzyFatigue.h.
+MIN_FIRING = 0.25
+
 # Blink_Rate (blinks/min)
-def blink_Low(v):    return _trap(v,   0.0,   0.0,  4.0,   8.0)
+# Left edge -1e6, not 0: _trap returns 0 for x <= a, so a = 0 made blink_Low(0) = 0
+# and zero blinks/min fired no rule (risk fell back to 0 / Safe).
+def blink_Low(v):    return _trap(v, -1e6, -1e6,  3.0,   7.0)   # was 4..8; 8 is the alert driving baseline (see FuzzyFatigue.h)
 def blink_Normal(v): return _trap(v,   6.0,   8.0, 18.0,  20.0)
 def blink_High(v):   return _trap(v,  20.0,  24.0, 1e6,   1e6)
 
@@ -256,7 +265,8 @@ class FuzzyFatigue:
                blink_rate_bpm: float,
                gyro_var:       float,
                pitch_deg:      float,
-               nodding_score:  float) -> tuple[float, int]:
+               nodding_score:  float,
+               blink_valid:    bool = True) -> tuple[float, int]:
         """
         Run one FIS inference tick (call at 1 Hz).
 
@@ -267,6 +277,10 @@ class FuzzyFatigue:
         gyro_var       : rolling variance of head_movement (last 10 s)
         pitch_deg      : angular deviation from calibration gravity vector
         nodding_score  : pre-computed [0..1] oscillation score from 6 s buffer
+        blink_valid    : False = blink channel offline (eye not tracked, camera
+                         stalled, detector warming up). "No blinks seen" then
+                         means "can't see", not "eyes shut": every blink rule
+                         (R1, R2, R4, R6, R7) is switched off; HR + IMU decide.
 
         Returns
         -------
@@ -278,9 +292,10 @@ class FuzzyFatigue:
         hE = hr_Elevated(hr_diff_pct)
 
         # ── Step 2: Fuzzify Blink_Rate ────────────────────────────────────────
-        bL = blink_Low(blink_rate_bpm)
-        bN = blink_Normal(blink_rate_bpm)
-        bH = blink_High(blink_rate_bpm)
+        # Blink offline: zero all three, so every rule that reads blink drops out.
+        bL = blink_Low(blink_rate_bpm)    if blink_valid else 0.0
+        bN = blink_Normal(blink_rate_bpm) if blink_valid else 0.0
+        bH = blink_High(blink_rate_bpm)   if blink_valid else 0.0
 
         # ── Step 3: Fuzzify IMU sub-inputs (ALL inside FIS) ───────────────────
         gS = gyro_Stable(gyro_var)
@@ -289,7 +304,8 @@ class FuzzyFatigue:
 
         # Combine: Limp is drowsy ONLY when gyro is also Stable (head is still)
         limp_drowsy  = min(pL, gS)
-        imu_Drowsy   = max(limp_drowsy, float(nodding_score))
+        nod_trusted  = min(float(nodding_score), gS)   # a bump is not a nod -- same gate as limp_drowsy
+        imu_Drowsy   = max(limp_drowsy, nod_trusted)
         imu_Stable   = gS
         imu_Fidgety  = gF
 
@@ -303,6 +319,12 @@ class FuzzyFatigue:
         r5 = min(hE, imu_Fidgety)      # R5: Active / stressed       → Warning
         r6 = min(bH, hS)              # R6: Phase 1 fighting        → Warning
         r7 = min(bN, hS, imu_Fidgety) # R7: False-positive guard    → Safe
+
+        # Minimum firing strength (alpha-cut): a rule below MIN_FIRING counts as not
+        # firing. Critical is a clipped shoulder whose centroid barely moves with the
+        # clip height, so R2 at strength 0.01 gave the same risk 85 as at 1.0.
+        r1, r2, r3, r4, r5, r6, r7 = (0.0 if r < MIN_FIRING else r
+                                      for r in (r1, r2, r3, r4, r5, r6, r7))
 
         # ── Step 5: Aggregate (max-clip per output zone) ──────────────────────
         agg = np.zeros(21)

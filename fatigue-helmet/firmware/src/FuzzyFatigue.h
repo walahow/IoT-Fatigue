@@ -42,6 +42,14 @@
  *       activation -> centroid = 0/0 -> fallback 0% (OK) or 50% (false WARN).
  *       R7 forces defined Safe output for active-riding state.
  *
+ *   Minimum firing strength (alpha-cut): a rule that fires below MIN_FIRING (0.25)
+ *     is treated as not firing. Without it the output ignored HOW MUCH evidence a rule
+ *     had: Critical is a clipped shoulder whose centroid barely moves with the clip
+ *     height, so R2 at strength 0.01 (blink rate 6.96 against a Low ramp ending at 7)
+ *     produced the same risk 85 as at strength 1.0 -- seen on the hardware test of
+ *     2026-09-21. Rules that all fall under the cut leave no rule firing, which is the
+ *     documented "no evidence -> Safe" fallback.
+ *
  * ======================================================================
  * INPUT MEMBERSHIP FUNCTIONS
  * ======================================================================
@@ -52,7 +60,7 @@
  *     Elevated  : right-trap (+10, +15, +inf, +inf)   <- SNS stress
  *
  *   Blink_Rate (bl/min)
- *     Low       : left-trap  (0, 0, 4, 8)             <- Phase 2 collapse
+ *     Low       : left-trap  (-inf, -inf, 3, 7)       <- Phase 2 collapse (was 0,0,4,8)
  *     Normal    : trapezoid  (6, 8, 18, 20)            <- flat-top 8-18
  *     High      : right-trap (20, 24, +inf, +inf)     <- Phase 1 fighting
  *
@@ -62,14 +70,24 @@
  *     pitch_Limp    : right-trap (20, 25, +inf, +inf)
  *
  *   Derived IMU memberships (fuzzy AND / OR, not crisp):
- *     limp_drowsy = min(pitch_Limp, gyro_Stable)  <- tilt + stillness both needed
- *     IMU_Drowsy  = max(limp_drowsy, nodding_score)
- *     IMU_Stable  = gyro_Stable
- *     IMU_Fidgety = gyro_Fidgety
+ *     limp_drowsy  = min(pitch_Limp, gyro_Stable)   <- tilt + stillness both needed
+ *     nod_trusted  = min(nodding_score, gyro_Stable) <- a bump's pitch jolt is not a nod
+ *     IMU_Drowsy   = max(limp_drowsy, nod_trusted)
+ *     IMU_Stable   = gyro_Stable
+ *     IMU_Fidgety  = gyro_Fidgety
+ *
+ *     nod_trusted: session_116 (2026-09-22, real ride) caught NodDetector firing at
+ *     score 1.0 exactly inside a gyro_var 2500-4000 spike; the extracted video frames
+ *     showed the eye open and steady through it -- a road bump, not a nod. The Schmitt-
+ *     trigger alternation NodDetector.h counts can be tripped by a hard jolt's pitch
+ *     transient, same failure shape as limp_drowsy already guards against, so it gets
+ *     the same gate: gyro_Stable, not just any non-zero swing.
  *
  *   nodding_score [0..1] is the ONLY pre-computed value, passed in by caller.
  *   It is computed from a 6-second 10 Hz pitch ring buffer in main.cpp:
- *     nodding_score = clamp(ZCR / 4.0, 0, 1) * (slope < 0 ? 1 : 0)
+ *     see NodDetector.h: 0 unless the 6 s window swings >= 10 deg and alternates
+ *     between +/- (swing/4) at least 3 times; then min(alternations / 6, 1).
+ *     (The original clamp(ZCR / 4) * (slope < 0) fired in ~50% of riding seconds.)
  *
  * ======================================================================
  * OUTPUT MEMBERSHIP FUNCTIONS — Risk_Score [0..100]
@@ -150,7 +168,13 @@ static inline float mf_hr_Stable  (float v) { return _ftrap(v, -15.0f, -9.0f, 10
 static inline float mf_hr_Elevated(float v) { return _ftrap(v,  10.0f, 15.0f, 1e9f,  1e9f); }
 
 // ── Blink_Rate (bl/min) ──────────────────────────────────────────────────────
-static inline float mf_blink_Low   (float v) { return _ftrap(v,  0.0f,  0.0f,  4.0f,  8.0f); }
+// Left edge is -1e9, not 0: _ftrap returns 0 for x <= a, so a = 0 made
+// blink_Low(0) = 0 -- zero blinks/min fired no rule at all and centroid fell
+// back to risk 0 (Safe), while 0.01 blinks/min scored 1.0.
+// Full at <= 3, gone by 7 (was 4..8). 8 is the low end of the alert DRIVING baseline
+// (IICIP 2016: 8-10/min), so a ramp that only reached zero there let an alert rider's
+// ordinary variation switch Low on. Fatigued driving is 4-6/min in the same source.
+static inline float mf_blink_Low   (float v) { return _ftrap(v, -1e9f, -1e9f,  3.0f,  7.0f); }
 static inline float mf_blink_Normal(float v) { return _ftrap(v,  6.0f,  8.0f, 18.0f, 20.0f); }
 static inline float mf_blink_High  (float v) { return _ftrap(v, 20.0f, 24.0f, 1e9f,  1e9f); }
 
@@ -169,6 +193,9 @@ static inline float mf_out_Critical(float z) { return _ftrap(z,  70.0f,  85.0f, 
 // ─────────────────────────────────────────────────────────────────────────────
 // Universe of discourse  (21 points, z = 0, 5, 10, ..., 100)
 // ─────────────────────────────────────────────────────────────────────────────
+
+static const float FIS_MIN_FIRING = 0.25f;   // alpha-cut, see the header comment
+static inline float _fcut(float r) { return r < FIS_MIN_FIRING ? 0.0f : r; }
 
 static const uint8_t FIS_UNIVERSE_N = 21;
 static const float   FIS_UNIVERSE_STEP = 5.0f;   // z[i] = i * 5
@@ -193,6 +220,10 @@ public:
      * @param nodding_score  Pre-computed [0..1] from 6-s 10 Hz pitch buffer
      * @param risk_out       [out] Risk score 0..100 (%)
      * @param alert_out      [out] Alert level: ALERT_SAFE / ALERT_WARNING / ALERT_CRITICAL
+     * @param blink_valid    false = the blink channel is offline (eye not tracked, camera
+     *                       stalled, detector still warming up). "No blinks seen" then means
+     *                       "can't see", not "eyes shut", so every blink-dependent rule
+     *                       (R1, R2, R4, R6, R7) is switched off and HR + IMU decide alone.
      */
     void update(float hr_diff_pct,
                 float blink_rate_bpm,
@@ -200,7 +231,8 @@ public:
                 float pitch_deg,
                 float nodding_score,
                 float &risk_out,
-                int   &alert_out)
+                int   &alert_out,
+                bool   blink_valid = true)
     {
         // ── Step 1: Fuzzify HR_Diff ───────────────────────────────────────────
         const float hD = mf_hr_Dropped (hr_diff_pct);
@@ -208,9 +240,12 @@ public:
         const float hE = mf_hr_Elevated(hr_diff_pct);
 
         // ── Step 2: Fuzzify Blink_Rate ────────────────────────────────────────
-        const float bL = mf_blink_Low   (blink_rate_bpm);
-        const float bN = mf_blink_Normal(blink_rate_bpm);
-        const float bH = mf_blink_High  (blink_rate_bpm);
+        // Blink offline: zero all three memberships. Every rule that reads blink
+        // is a min() with one of them, so those rules drop out and nothing
+        // pretends to know the eye state.
+        const float bL = blink_valid ? mf_blink_Low   (blink_rate_bpm) : 0.0f;
+        const float bN = blink_valid ? mf_blink_Normal(blink_rate_bpm) : 0.0f;
+        const float bH = blink_valid ? mf_blink_High  (blink_rate_bpm) : 0.0f;
 
         // ── Step 3: Fuzzify IMU sub-inputs (ALL inside FIS, no crisp pre-compute)
         const float gS = mf_gyro_Stable (gyro_var);
@@ -220,7 +255,8 @@ public:
         // Composite IMU memberships (fuzzy AND / OR, not crisp logic)
         const float nod         = constrain(nodding_score, 0.0f, 1.0f);
         const float limp_drowsy = _fand2(pL, gS);   // head-drop valid only when still
-        const float imu_Drowsy  = _for2(limp_drowsy, nod);
+        const float nod_trusted = _fand2(nod, gS);  // nod valid only when still -- a bump is not a nod
+        const float imu_Drowsy  = _for2(limp_drowsy, nod_trusted);
         const float imu_Stable  = gS;
         const float imu_Fidgety = gF;
 
@@ -231,13 +267,13 @@ public:
         //   -> Without this, R4 fires at 1.0 while R2 fires at 0.9, pulling the
         //      centroid from ~87% (CRIT) down to ~68% (WARN) at full-collapse state.
 
-        const float r1 = _fand3(hS, bN, imu_Stable);           // Normal alert    -> Safe
-        const float r2 = _fand2(hD, bL);                        // Confirmed drown -> Critical
-        const float r3 = imu_Drowsy;                            // Head drop / nod -> Critical
-        const float r4 = _fand2(bL, 1.0f - hD);               // Early blink-only -> Warning  [FuzzyNOT fix]
-        const float r5 = _fand2(hE, imu_Fidgety);              // Active/stressed  -> Warning
-        const float r6 = _fand2(bH, hS);                        // Phase 1 fight   -> Warning
-        const float r7 = _fand3(bN, hS, imu_Fidgety);          // Active riding   -> Safe
+        const float r1 = _fcut(_fand3(hS, bN, imu_Stable));    // Normal alert    -> Safe
+        const float r2 = _fcut(_fand2(hD, bL));                 // Confirmed drown -> Critical
+        const float r3 = _fcut(imu_Drowsy);                     // Head drop / nod -> Critical
+        const float r4 = _fcut(_fand2(bL, 1.0f - hD));        // Early blink-only -> Warning  [FuzzyNOT fix]
+        const float r5 = _fcut(_fand2(hE, imu_Fidgety));       // Active/stressed  -> Warning
+        const float r6 = _fcut(_fand2(bH, hS));                 // Phase 1 fight   -> Warning
+        const float r7 = _fcut(_fand3(bN, hS, imu_Fidgety));   // Active riding   -> Safe
 
         // ── Step 5: Aggregate output (max-clip per zone, iterate universe) ────
         float num = 0.0f;   // SUM(z * u_agg)

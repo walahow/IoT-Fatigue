@@ -7,7 +7,7 @@ the firmware's #HEADER line, with no label column and no header row:
 
     timestamp_ms,hr_bpm,pulse_raw,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,
     head_movement,signal_quality,blink_rate,pitch_deg,gyro_var,nod_score,
-    risk_pct,alert_level,imu_valid
+    risk_pct,alert_level,imu_valid,blink_valid,alert_gated
 
 KSS (Karolinska Sleepiness Scale, 1-9) is a single self-rated number for
 the whole session, given right after the ride while it's still fresh --
@@ -39,7 +39,7 @@ SENSOR_HEADER = [
     "timestamp_ms", "hr_bpm", "pulse_raw", "ax_g", "ay_g", "az_g",
     "gx_dps", "gy_dps", "gz_dps", "head_movement", "signal_quality",
     "blink_rate", "pitch_deg", "gyro_var", "nod_score", "risk_pct",
-    "alert_level", "imu_valid",
+    "alert_level", "imu_valid", "blink_valid", "alert_gated",
 ]
 
 
@@ -74,12 +74,17 @@ def main():
     with open(sensor_path, "r", newline="") as fin, open(out_path, "w", newline="") as fout:
         reader = csv.reader(fin)
         writer = csv.writer(fout)
-        writer.writerow(SENSOR_HEADER + ["label"])
+        header_written = False
         for i, row in enumerate(reader):
             if i == 0 and has_header:
                 continue  # skip existing header, we just wrote our own
             if not row:
                 continue
+            if not header_written:
+                # 17/18-column sessions predate imu_valid / blink_valid: name only
+                # the columns the file actually has.
+                writer.writerow(SENSOR_HEADER[:len(row)] + ["label"])
+                header_written = True
             writer.writerow(row + [args.kss])
             row_count += 1
 

@@ -213,7 +213,7 @@ Stop with **Ctrl+C** — files are flushed and closed, then a summary prints:
 ```
 
 **SD card mode** (`esp32s3cam_sd`) — no PC needed. The ESP32 writes
-`sensor_data.csv`, `video.mjpeg`, and `video.idx` straight to the card; press the
+`sensor_data.csv`, `video.mjpeg`, `video.idx` and `blink_events.csv` (one row per blink: `timestamp_ms,source,score`, source `hog` = the classifier that drives `blink_rate`, `glint` = the old detector, kept for comparison; blinks seen during arming are not included) straight to the card; press the
 GPIO 21 button to start/stop a session. Pull the card afterwards and use
 `unpack_session.py` or `mjpeg_to_mp4.py` to extract the video.
 
@@ -247,6 +247,41 @@ python live_ear_preview.py --port COM3
 
 Press `q` to quit.
 
+**`live_ear_preview.py --arm`** — pre-flight arming check, run before the rider
+leaves. On top of the live preview it draws the classifier's crop (yellow) as
+well as the locked ROI, and scores a two-phase blink test:
+
+```bash
+pio run -e esp32s3cam_ear_preview --target upload
+python live_ear_preview.py --port COM3 --arm
+```
+
+**Click the eye** in the preview to set the ROI by hand. The coordinate is sent
+as `ROI:<cx>,<cy>`, kept in the ESP's NVS (it survives power cycles *and*
+reflashing to another build), and applied on the first frame of every later
+session — so detection runs from the start instead of after the localizer's
+~20 s search, which is also the search that locked 252 px off the pupil in
+session_100. `A` sends `ROI:auto`, which clears it and goes back to searching.
+`metadata.txt` records `roi_source` (`stored`/`motion`/`manual`) with the
+coordinates, so a session whose ROI was pointing at a cheek can be told apart
+from a rider who genuinely wasn't blinking.
+
+A stored coordinate is only valid while the camera sits the same way on the
+head, and a stale one fails silently — hence the blink test below, every time
+the helmet goes on.
+
+Press SPACE, hold still with eyes open for 8 s, then blink 10 times. It reports
+PASS/FAIL for: eye locked above the firmware's own confidence gate; the
+classifier's crop fully inside the frame (it must see both lids); sane
+exposure; blinks detected; and no false alarms while the eye is open. Verdict is
+READY TO RECORD or the failures with what to change. Re-test with R.
+
+The eye lock is taken once and frozen, so after moving the camera, reset the
+board before re-testing. Note that the checks are behavioural on purpose:
+image sharpness does NOT separate good footage from unusable footage here
+(session_101 and the glasses sessions 102/104 score the same), so only the
+blink test can tell you the mount will actually work.
+
 **`frame_inject_replay.py`** — replays a folder of previously recorded frames
 (`{timestamp_ms}.jpg`, as produced by `debug_recorder.py`/`unpack_session.py`)
 through the real compiled firmware to check its blink/ROI output against
@@ -260,6 +295,61 @@ python frame_inject_replay.py --frames-dir ../../sessions/session_067/frames --o
 Compare its output CSV against `tools/session_replay`'s PC-side replay of the
 same algorithm — if they disagree, something differs between the host build
 and the actual ESP32 binary.
+
+This build needs **no camera**: frames arrive over USB, so a bare ESP32-S3 dev
+board stands in for the ESP32-S3-CAM, provided it has PSRAM (the decode buffers
+are ~380 KB; `board_build.arduino.memory_type` must match the module — `qio_opi`
+for octal/R8, `qio_qspi` for quad/R2). Camera/MPU/SD init errors on boot are
+expected there and harmless. Each `#FRAME_DONE` line carries the chip's own
+per-frame cost (`ear=` decode + localizer + classifier, `hog=` the classifier's
+share), which the script summarises — this is how the classifier's cost is
+measured without the camera board. It does not exercise live capture, SD
+writes, or the sensor tasks.
+
+**`train_blink_classifier.py`** — trains the firmware's per-frame HOG blink
+classifier (`HogBlinkDetector` in `EyeBlinkEAR.h`) from hand labels. Needs
+`<session>/blink_labels.csv` (`timestamp_ms,frame_idx,state`, state =
+`open`/`closed`/`squint`/`unsure`) and a built `tools/session_replay`
+(`g++ -O2 -std=gnu++14 -o session_replay.exe session_replay.cpp`):
+
+```bash
+python train_blink_classifier.py --session ../../sessions/session_101
+```
+
+Features are computed by `session_replay --hog-dump` (the firmware's own code),
+the cross-validation is scored by running `session_replay --hog-model` (the
+firmware's scoring and blink counting), and the final model is written to
+`<session>/blink_model.bin` and, as the same numbers, to
+`firmware/src/BlinkWeights.h` for the next flash. The weights are rider- and
+mount-specific.
+
+On the device the classifier runs alongside the glint detector and prints
+`#STATUS: blink (hog) t=... score=...`; the glint detector still drives
+`blink_rate`. To check the chip reproduces the PC replay (JPEG decoder, float
+maths), inject the same frames and compare blink timestamps:
+
+```bash
+pio run -e esp32s3cam_frame_inject --target upload
+python frame_inject_replay.py --frames-dir ../../sessions/session_101/frames \
+    --out esp_101.csv --hog-out esp_101_hog.csv
+../firmware/tools/session_replay/session_replay.exe ../../sessions/session_101/frames pc_101.csv \
+    --hog-model=../../sessions/session_101/blink_model.bin --hog-csv=pc_101_hog.csv
+```
+
+**`tools/session_replay/sensor_sim`** — the firmware's 1 Hz loop on the PC:
+rebuilds the `sensor_data.csv` the ESP would have written for a recorded
+session, with `blink_rate`, `risk_pct` and `alert_level` recomputed by the
+firmware's own `FuzzyFatigue.h` from any blink source (e.g. the `--hog-csv`
+above). Without `--blinks` it uses the recorded blink rate, which must
+reproduce the recorded risk — that is the tool's self-check. The ESP forms the
+HR baseline partly during arming, before the CSV starts, so pass `--baseline`
+if the first-20-rows default doesn't reproduce the recording (86 for session_101).
+
+```bash
+cd ../firmware/tools/session_replay
+g++ -O2 -std=gnu++14 -Ihost_shim -o sensor_sim.exe sensor_sim.cpp
+./sensor_sim.exe ../../../../sessions/session_101/sensor_data.csv sim.csv --baseline=86 --blinks=pc_101_hog.csv
+```
 
 ---
 
@@ -371,6 +461,24 @@ rows carry frozen last-known-good values held while IMU reads were suspended
 (buzzer sounding, or bus down), not fresh measurements — counting them treats one
 reading as several. Sessions recorded before that column existed have 17 columns
 and no validity flag.
+
+`blink_valid` (19th column) is `0` while the on-device blink channel is offline:
+eye not locked, the arming eye check failed or is pending (fewer than 3 blinks
+within 30 s of the lock), the first 60 s of the rolling window, or no frames being
+processed. On those rows `blink_rate` is not evidence of anything -- a 0 means
+"cannot see", not "eyes closed" -- and the fuzzy model ignores blink (HR and IMU
+decide alone), so `risk_pct`/`alert_level` there rest on HR and IMU only. Drop or
+down-weight `blink_valid == 0` rows before using `blink_rate` as a feature.
+Sessions with 17/18 columns have no such flag (unknown, not assumed valid).
+`metadata.txt` records `eye_check=pass|fail|pending` and `eye_check_blinks`. The
+check proves the classifier is running on a locked ROI and saw blinks; it cannot
+prove the classifier suits the rider (it is trained on one rider without glasses).
+
+`alert_gated` (20th column) is `alert_level` after the dwell/release gate
+(`AlertGate.h`): Warning needs 5 s and Critical 8 s of sustained raw alert, and a
+level clears after 3 s below it. It is what the buzzer follows (Critical: 2 s beep
+then 30 s silence; Warning: 1 s beep then 3 s). `alert_level` stays the raw model
+output, so both are available for analysis.
 
 ### Recommended Dataset Size
 

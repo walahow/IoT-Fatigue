@@ -373,6 +373,133 @@ void test_isolate_largest_component_empty_mask_fails(void) {
     TEST_ASSERT_FALSE(found);
 }
 
+// ── HOG blink classifier ─────────────────────────────────────────────────
+void test_box_resample_averages_each_block(void) {
+    const uint8_t src[4 * 4] = {
+        10, 20,  100, 100,
+        30, 40,  100, 100,
+         0,  0,  200, 250,
+         0,  0,  150, 200,
+    };
+    uint8_t dst[2 * 2];
+    EyeBlinkEAR::boxResample(src, 4, 4, dst, 2, 2);
+    TEST_ASSERT_EQUAL_UINT8(25, dst[0]);
+    TEST_ASSERT_EQUAL_UINT8(100, dst[1]);
+    TEST_ASSERT_EQUAL_UINT8(0, dst[2]);
+    TEST_ASSERT_EQUAL_UINT8(200, dst[3]);
+}
+
+void test_hog_flat_image_has_no_gradient_energy(void) {
+    uint8_t img[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];
+    memset(img, 90, sizeof(img));
+    float f[EyeBlinkEAR::HOG_LEN];
+    EyeBlinkEAR::hogFeatures(img, f);
+    for (int i = 0; i < EyeBlinkEAR::HOG_LEN; i++) TEST_ASSERT_EQUAL_FLOAT(0.0f, f[i]);
+}
+
+void test_hog_vertical_edge_votes_only_the_horizontal_gradient_bin(void) {
+    // Dark left half, bright right half: every gradient points along +x
+    // (0 degrees), so all energy must land in orientation bin 0.
+    const int W = EyeBlinkEAR::HOG_W, H = EyeBlinkEAR::HOG_H;
+    uint8_t img[W * H];
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) img[y * W + x] = (x < W / 2) ? 20 : 200;
+    float f[EyeBlinkEAR::HOG_LEN];
+    EyeBlinkEAR::hogFeatures(img, f);
+    float bin0 = 0.0f;
+    for (int i = 0; i < EyeBlinkEAR::HOG_LEN; i++) {
+        if (i % EyeBlinkEAR::HOG_BINS == 0) bin0 += f[i];
+        else TEST_ASSERT_EQUAL_FLOAT(0.0f, f[i]);
+    }
+    TEST_ASSERT_TRUE(bin0 > 0.0f);
+}
+
+void test_hog_blocks_are_unit_normalised(void) {
+    // L2-Hys: every 36-value block ends up with L2 norm <= 1, whatever the
+    // image contrast -- this is what makes the features exposure-tolerant.
+    const int W = EyeBlinkEAR::HOG_W, H = EyeBlinkEAR::HOG_H;
+    uint8_t img[W * H];
+    for (int i = 0; i < W * H; i++) img[i] = (uint8_t)((i * 37) % 251);
+    float f[EyeBlinkEAR::HOG_LEN];
+    EyeBlinkEAR::hogFeatures(img, f);
+    const int BLOCK = 4 * EyeBlinkEAR::HOG_BINS;
+    for (int b = 0; b < EyeBlinkEAR::HOG_LEN / BLOCK; b++) {
+        float ss = 0.0f;
+        for (int i = 0; i < BLOCK; i++) ss += f[b * BLOCK + i] * f[b * BLOCK + i];
+        TEST_ASSERT_TRUE(sqrtf(ss) <= 1.0001f);
+    }
+}
+
+void test_hog_blink_counted_once_on_the_rising_edge(void) {
+    EyeBlinkEAR::HogBlinkDetector d;
+    d.threshold = 0.5f;
+    TEST_ASSERT_FALSE(d.update(-1.0f, false));
+    TEST_ASSERT_TRUE (d.update( 2.0f, false));   // eye shut: counted immediately
+    TEST_ASSERT_FALSE(d.update( 2.0f, false));   // still shut: same blink
+    TEST_ASSERT_FALSE(d.update(-1.0f, false));
+}
+
+void test_hog_blink_recrossing_within_refractory_is_the_same_blink(void) {
+    // One noisy closure that dips below threshold for a single frame must
+    // not be counted twice.
+    EyeBlinkEAR::HogBlinkDetector d;
+    d.threshold = 0.5f;
+    TEST_ASSERT_TRUE (d.update(2.0f, false));
+    TEST_ASSERT_FALSE(d.update(0.0f, false));
+    TEST_ASSERT_FALSE(d.update(2.0f, false));
+}
+
+void test_hog_blinks_separated_by_open_frames_both_count(void) {
+    EyeBlinkEAR::HogBlinkDetector d;
+    d.threshold = 0.5f;
+    TEST_ASSERT_TRUE(d.update(2.0f, false));
+    for (int i = 0; i < EyeBlinkEAR::HogBlinkDetector::REFRACTORY_FRAMES; i++)
+        TEST_ASSERT_FALSE(d.update(-1.0f, false));
+    TEST_ASSERT_TRUE(d.update(2.0f, false));
+}
+
+void test_hog_gated_frame_never_counts(void) {
+    // An exposure dropout or a hand over the camera looks "closed" to the
+    // classifier; a gated frame must never produce a blink.
+    EyeBlinkEAR::HogBlinkDetector d;
+    d.threshold = 0.5f;
+    TEST_ASSERT_FALSE(d.update(5.0f, true));
+    TEST_ASSERT_FALSE(d.update(5.0f, true));
+}
+
+void test_blink_rate_window_counts_the_last_minute(void) {
+    EyeBlinkEAR::BlinkRateWindow r;
+    r.push(1000); r.push(2000); r.push(3000);
+    TEST_ASSERT_EQUAL_FLOAT(3.0f, r.bpm(4000));
+    TEST_ASSERT_EQUAL_FLOAT(2.0f, r.bpm(61500));   // the blink at 1000 ms has aged out
+    TEST_ASSERT_EQUAL_FLOAT(0.0f, r.bpm(200000));
+}
+
+void test_smoothed_blink_rate_averages_three_minutes(void) {
+    EyeBlinkEAR::BlinkRateWindow r;
+    // session_101-style minutes: 15, 6, 17 blinks -> 38 in 3 min.
+    int perMinute[3] = {15, 6, 17};
+    for (int m = 0; m < 3; m++)
+        for (int i = 0; i < perMinute[m]; i++) r.push(m * 60000u + 1000u + i * 3000u);
+    TEST_ASSERT_EQUAL_FLOAT(38.0f / 3.0f, r.smoothedBpm(180000, 0));
+    TEST_ASSERT_EQUAL_FLOAT(17.0f, r.bpm(180000));                       // last minute only
+}
+
+void test_smoothed_blink_rate_uses_elapsed_time_when_young(void) {
+    EyeBlinkEAR::BlinkRateWindow r;
+    for (int i = 0; i < 9; i++) r.push(5000u + i * 5000u);               // 9 blinks in 45 s
+    // 90 s since lock: window is 90 s, 9 blinks -> 6/min, NOT 9/3 = 3/min.
+    TEST_ASSERT_EQUAL_FLOAT(6.0f, r.smoothedBpm(90000, 0));
+    // 20 s since lock: window floors at 60 s, so a young session is not read as slow.
+    TEST_ASSERT_EQUAL_FLOAT(9.0f, r.smoothedBpm(50000, 30000));
+}
+
+void test_blink_rate_window_is_not_capped_at_twenty_per_minute(void) {
+    EyeBlinkEAR::BlinkRateWindow r;
+    for (int i = 0; i < 100; i++) r.push(i * 1500u);                     // 40/min for 150 s
+    TEST_ASSERT_TRUE(r.smoothedBpm(150000, 0) > 39.0f);
+}
+
 int main(int argc, char **argv) {
     UNITY_BEGIN();
     RUN_TEST(test_otsu_separates_two_clusters);
@@ -402,5 +529,17 @@ int main(int argc, char **argv) {
     RUN_TEST(test_glint_gaze_shift_is_not_a_blink);
     RUN_TEST(test_glint_long_absence_is_not_a_blink);
     RUN_TEST(test_glint_rolling_rate_evicts_old_blinks);
+    RUN_TEST(test_box_resample_averages_each_block);
+    RUN_TEST(test_hog_flat_image_has_no_gradient_energy);
+    RUN_TEST(test_hog_vertical_edge_votes_only_the_horizontal_gradient_bin);
+    RUN_TEST(test_hog_blocks_are_unit_normalised);
+    RUN_TEST(test_hog_blink_counted_once_on_the_rising_edge);
+    RUN_TEST(test_hog_blink_recrossing_within_refractory_is_the_same_blink);
+    RUN_TEST(test_hog_blinks_separated_by_open_frames_both_count);
+    RUN_TEST(test_hog_gated_frame_never_counts);
+    RUN_TEST(test_blink_rate_window_counts_the_last_minute);
+    RUN_TEST(test_smoothed_blink_rate_averages_three_minutes);
+    RUN_TEST(test_smoothed_blink_rate_uses_elapsed_time_when_young);
+    RUN_TEST(test_blink_rate_window_is_not_capped_at_twenty_per_minute);
     return UNITY_END();
 }

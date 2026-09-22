@@ -44,9 +44,14 @@
 #include <Wire.h>
 #include <math.h>
 #include "FuzzyFatigue.h"  // Mamdani FIS (heap-free, STL-free, header-only)
+#include "NodDetector.h"    // nodding score from the 10 Hz pitch buffer
+#include "AlertGate.h"      // dwell + release hold between the raw alert and the buzzer
+#include "HrBaseline.h"     // resting HR baseline: median after a settling skip
 
 #if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
 #include "EyeBlinkEAR.h"        // on-device blink detection (spec section 5)
+#include "BlinkWeights.h"       // HOG classifier weights, from python/train_blink_classifier.py
+#include <Preferences.h>        // NVS: the stored eye coordinate (see earStoredRoi*)
 #include "img_converters.h"     // fmt2rgb888() -- esp32-camera
 #include "esp_heap_caps.h"      // heap_caps_malloc() / MALLOC_CAP_SPIRAM
 #endif
@@ -221,6 +226,7 @@ SemaphoreHandle_t g_sdMutex = nullptr;
 File g_csvFile;            // sensor_data.csv — kept open entire session
 File g_mjpegFile;          // video.mjpeg     — kept open entire session
 File g_idxFile;            // video.idx       — kept open entire session
+File g_blinkFile;          // blink_events.csv — one row per blink either detector counted
 uint32_t g_byteOffset = 0; // running byte offset into video.mjpeg
 uint32_t g_frameIndex = 0; // monotonic frame counter
 bool g_sdReady = false;
@@ -335,10 +341,96 @@ static int16_t  g_earLabelScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
 static uint16_t g_earQueueScratch[EAR_ROI_SIZE * EAR_ROI_SIZE];
 static uint8_t  g_earIsolatedMask[EAR_ROI_SIZE * EAR_ROI_SIZE];
 
+// ── Stored eye coordinate ────────────────────────────────────────────────
+// The motion localizer needs ~20 s of blinking to find the eye, can reject a
+// window, and has locked 252 px off the pupil before (session_100 recorded 0
+// blinks because of it). A coordinate checked once on the PC -- see
+// live_ear_preview.py --arm -- removes that whole failure mode and starts
+// detection on the first frame instead of after the lock.
+//
+// It is only valid while the camera sits the same way on the head, and a
+// stale one fails SILENTLY (the classifier scores a patch of cheek and
+// reports no blinks, which looks like a rider who isn't blinking). So the
+// arming check must confirm it every time the helmet goes on, and
+// metadata.txt records which source a session used.
+//
+// Precedence: EAR_ROI_MANUAL_X/Y build flag > stored coordinate > motion lock.
+static Preferences g_earPrefs;
+static const char *EAR_PREFS_NS = "eyeroi";
+static int  g_earStoredCx = -1;         // -1 = nothing stored
+static int  g_earStoredCy = -1;
+static const char *g_earRoiSource = "none";   // none | manual | stored | motion
+
+static void earLoadStoredRoi() {
+  if (!g_earPrefs.begin(EAR_PREFS_NS, true)) return;   // read-only; absent on first boot
+  g_earStoredCx = g_earPrefs.getInt("cx", -1);
+  g_earStoredCy = g_earPrefs.getInt("cy", -1);
+  g_earPrefs.end();
+}
+
+static void earSaveStoredRoi(int cx, int cy) {
+  if (g_earPrefs.begin(EAR_PREFS_NS, false)) {
+    g_earPrefs.putInt("cx", cx);
+    g_earPrefs.putInt("cy", cy);
+    g_earPrefs.end();
+  }
+  g_earStoredCx = cx;
+  g_earStoredCy = cy;
+}
+
+static void earClearStoredRoi() {
+  if (g_earPrefs.begin(EAR_PREFS_NS, false)) {
+    g_earPrefs.clear();
+    g_earPrefs.end();
+  }
+  g_earStoredCx = g_earStoredCy = -1;
+}
+
 EyeBlinkEAR::RoiLock      g_earRoi;
 EyeBlinkEAR::BlinkDetector g_earBlink;        // legacy shape-based path, no longer driving alerts
 EyeBlinkEAR::GlintBlinkDetector g_earGlint;   // active blink detector
+// Per-frame eye-state classifier: THIS drives g_onDeviceBlinkRate (the blink_rate
+// the fuzzy model and CSV get). The glint detector above still runs and still
+// prints "#STATUS: blink (glint)" lines, purely as a comparison -- it missed ~95%
+// of hand-labelled blinks on session_101. The weights are trained on ONE rider
+// without glasses (session_101), so a new rider needs their own labels/weights
+// before this rate means anything. SD sessions save every frame, so what it would
+// have done can be replayed on the PC (session_replay --hog-model,
+// python/train_blink_classifier.py).
+EyeBlinkEAR::HogBlinkDetector g_earHog;
+static EyeBlinkEAR::BlinkRateWindow g_earHogRate;   // g_earHog blinks, 3 min window (smoothedBpm); camera task only
+static uint8_t g_earHogSmall[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];  // 2 KB, off the task stack
+static float   g_earHogFeat[EyeBlinkEAR::HOG_LEN];                     // 3 KB, off the task stack
+#if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
+// Classifier time, summed between reports. FRAME_INJECT_MODE reports it per
+// frame, so the per-frame cost can be measured on a bare ESP32-S3 dev board
+// with no camera attached -- frames come in over USB instead.
+static uint32_t g_earProfHogUs = 0;
+#endif
 volatile float g_onDeviceBlinkRate = 13.0f;  // read by the g_blinkRate fallback below
+
+// Health of the on-device blink channel, written here by the camera task and
+// read by loop() at 1 Hz to decide blink_valid. A rate of 0 from a detector that
+// cannot see the eye is not "the rider isn't blinking", so the FIS must be told.
+// This proves the classifier is RUNNING on a locked ROI; it cannot prove the eye is
+// really in view or that the rider resembles its training data (glasses, another
+// face -- see eyeglasses sessions 102-104).
+volatile uint32_t g_earLastFrameMs  = 0;   // millis() of the last frame the classifier processed
+volatile uint32_t g_earValidSinceMs = 0;   // millis() of the first frame after the ROI lock; 0 = not yet
+// Arming eye check: after the ROI lock the rider must be seen to blink at least
+// EAR_CHECK_MIN_BLINKS times within EAR_CHECK_WINDOW_MS, or the blink channel is
+// not trusted for the session (blink_valid = 0). A lock succeeds on glasses and on
+// a cheek just as happily as on an eye, so it proves nothing about blink detection;
+// an alert rider at the start of a ride blinks several times in 30 s (session_101:
+// 12 classifier blinks; glasses sessions 102-104: 0, 0 and 2). Thresholds come from
+// those four sessions -- re-check them with more riders.
+enum EyeCheck : uint8_t { EYECHECK_PENDING = 0, EYECHECK_PASS, EYECHECK_FAIL };
+static const uint8_t  EAR_CHECK_MIN_BLINKS = 3;
+static const uint32_t EAR_CHECK_WINDOW_MS  = 30000;
+volatile uint8_t g_earBlinksSinceLock = 0;   // classifier blinks since the ROI lock (saturates at 255)
+EyeCheck g_eyeCheck = EYECHECK_PENDING;      // resolved by loop(); latched for the session
+static const uint32_t EAR_BLINK_WARMUP_MS = 60000;  // rate is a 60 s count; a shorter window reads low
+static const uint32_t EAR_FRAME_STALE_MS  = 3000;   // no processed frame this long = camera/decode stalled
 
 // Converts a rectangular region of an RGB888 buffer to grayscale (simple
 // average of R,G,B) into a caller-provided buffer sized regionW*regionH.
@@ -370,6 +462,26 @@ static void earThresholdToMask(const uint8_t *gray, uint8_t *mask, int n) {
   for (int i = 0; i < n; i++) mask[i] = (gray[i] <= t) ? 1 : 0;
 }
 // ─────────────────────────────────────────────────────────────────────────
+// logBlinkEvent() -- append one detected blink to blink_events.csv (SD mode).
+// timestamp_ms is the same millis() clock as sensor_data.csv and video.idx, so an event
+// can be laid against the saved frames and against hand labels. source is "hog" (the
+// classifier that drives blink_rate) or "glint" (logged for comparison); score is the
+// classifier score, blank for glint. Called from the camera task, which holds no other
+// lock at that point. An event that cannot get the SD mutex quickly is dropped rather
+// than stalling the frame loop.
+static void logBlinkEvent(uint32_t timestampMs, const char *source, bool hasScore, float score) {
+#if defined(STORAGE_MODE_SD)
+  if (!g_sdReady || !g_blinkFile || !g_sessionActive) return;
+  if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(20)) != pdTRUE) return;
+  if (hasScore) g_blinkFile.printf("%lu,%s,%.3f\n", (unsigned long)timestampMs, source, score);
+  else          g_blinkFile.printf("%lu,%s,\n", (unsigned long)timestampMs, source);
+  g_blinkFile.flush();   // a few rows a minute -- flush each so a power cut loses nothing
+  xSemaphoreGive(g_sdMutex);
+#else
+  (void)timestampMs; (void)source; (void)hasScore; (void)score;
+#endif
+}
+
 // earPrintf() — serial output from the EAR pipeline, mutex-protected.
 //
 // In USB mode this task is also streaming binary JPEG frames, and
@@ -415,6 +527,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     g_earMaskBuf = (uint8_t *)heap_caps_malloc((size_t)w * h, MALLOC_CAP_SPIRAM);
     g_earFullW = w;
     g_earFullH = h;
+    g_earHog.threshold = BLINK_HOG_THRESHOLD;
 #if EAR_LOCALIZER_VERSION >= 4
     const size_t refN = (size_t)EAR_REFINE_SIDE * EAR_REFINE_SIDE;
     g_earRefGray = (uint8_t *)heap_caps_malloc(refN, MALLOC_CAP_SPIRAM);
@@ -461,10 +574,24 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
     g_earRoi.size = EAR_ROI_SIZE;
     g_earRoi.locked = true;
     g_earLockDone = true;
-    earPrintf("#STATUS: EAR ROI manually pinned at x=%d y=%d size=%d\n",
+    g_earRoiSource = "manual";
+    earPrintf("#STATUS: EAR ROI manual at x=%d y=%d size=%d conf=-1.00\n",
                   g_earRoi.x, g_earRoi.y, g_earRoi.size);
   }
 #endif
+
+  // Stored coordinate from the PC (see earStoredRoi* above). Applied on the
+  // first frame, so detection runs from the start of the session instead of
+  // after a ~20 s search.
+  if (!g_earLockDone && g_earStoredCx >= 0) {
+    float xs[1] = {(float)g_earStoredCx}, ys[1] = {(float)g_earStoredCy};
+    EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, g_earRoi);
+    g_earLockDone = true;
+    g_earLockConfidence = -1.0f;      // not measured: this ROI was given, not found
+    g_earRoiSource = "stored";
+    earPrintf("#STATUS: EAR ROI stored at x=%d y=%d size=%d conf=-1.00\n",
+                  g_earRoi.x, g_earRoi.y, g_earRoi.size);
+  }
 
   if (!g_earLockDone) {
     // Progress while the localizer accumulates. Without this the lock phase is
@@ -513,6 +640,7 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
         EyeBlinkEAR::lockRoiFromSamples(xs, ys, 1, EAR_ROI_SIZE, w, h, g_earRoi);
         g_earLockDone = true;
         g_earLockConfidence = conf;
+        g_earRoiSource = "motion";
         earPrintf("#STATUS: EAR ROI motion-locked at x=%d y=%d size=%d conf=%.2f (%d tries)\n",
                       g_earRoi.x, g_earRoi.y, g_earRoi.size, conf, g_earMotionTries + 1);
       } else {
@@ -583,8 +711,38 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
 
   if (g_earGlint.update(glintPx, roiBrightness, wideDarkPx, timestampMs)) {
     earPrintf("#STATUS: blink (glint) t=%u\n", timestampMs);
+    logBlinkEvent(timestampMs, "glint", false, 0.0f);
   }
-  g_onDeviceBlinkRate = g_earGlint.rollingRateBpm(timestampMs);
+  // The glint result is logged above for comparison only; it no longer feeds blink_rate.
+
+  // Per-frame classifier on a crop holding both lids -- the same calls
+  // tools/session_replay makes, so its replay results carry over.
+#if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
+  uint32_t tHog0 = (uint32_t)micros();
+#endif
+  int hx, hy, hw, hh;
+  EyeBlinkEAR::hogCropRect(g_earRoi, hx, hy, hw, hh);
+  earExtractGray(g_earRgbBuf, w, h, hx, hy, hw, hh, g_earGrayBuf);
+  EyeBlinkEAR::boxResample(g_earGrayBuf, hw, hh, g_earHogSmall,
+                           EyeBlinkEAR::HOG_W, EyeBlinkEAR::HOG_H);
+  EyeBlinkEAR::hogFeatures(g_earHogSmall, g_earHogFeat);
+  float hogScore = EyeBlinkEAR::linearScore(g_earHogFeat, BLINK_HOG_WEIGHTS, BLINK_HOG_BIAS);
+  if (g_earHog.update(hogScore, false)) {
+    g_earHogRate.push(timestampMs);
+    if (g_earBlinksSinceLock < 255) g_earBlinksSinceLock++;
+    earPrintf("#STATUS: blink (hog) t=%u score=%.2f\n", timestampMs, hogScore);
+    logBlinkEvent(timestampMs, "hog", true, hogScore);
+  }
+  // 3-minute smoothed rate, measured from the lock (BlinkRateWindow explains why not 60 s).
+  g_onDeviceBlinkRate = g_earHogRate.smoothedBpm(timestampMs, g_earValidSinceMs ? g_earValidSinceMs : timestampMs);
+  // The classifier needs no baseline, so the channel is live from the first frame
+  // after the ROI lock (the lock phase returns early above); loop() then waits out
+  // EAR_BLINK_WARMUP_MS before trusting the 60 s count.
+  g_earLastFrameMs = timestampMs;
+  if (g_earValidSinceMs == 0) g_earValidSinceMs = timestampMs ? timestampMs : 1;  // 0 = "not yet"
+#if defined(EAR_PROFILE) || defined(FRAME_INJECT_MODE)
+  g_earProfHogUs += (uint32_t)micros() - tHog0;
+#endif
 }
 #endif  // STORAGE_MODE_SD || EAR_LIVE_DEBUG
 
@@ -670,8 +828,15 @@ void frameInjectTask(void *arg) {
     fb.height = h;
     fb.format = PIXFORMAT_JPEG;
 
+    // ear = decode + localizer/glint + classifier for this frame; hog = the
+    // classifier's share of it. On the camera board the same work sits inside
+    // cameraTask's per-frame budget (see its #PROF line).
+    g_earProfHogUs = 0;
+    uint32_t tEar0 = (uint32_t)micros();
     processEarFrame(&fb, ts);
-    Serial.printf("#FRAME_DONE ts=%u\n", ts);
+    uint32_t earUs = (uint32_t)micros() - tEar0;
+    Serial.printf("#FRAME_DONE ts=%u ear=%luus hog=%luus\n", ts,
+                  (unsigned long)earUs, (unsigned long)g_earProfHogUs);
   }
 }
 #endif  // FRAME_INJECT_MODE
@@ -682,96 +847,7 @@ static const uint8_t FRAME_SOF[4] = {0xAA, 0xBB, 0xCC, 0xDD};
 static const uint8_t FRAME_EOF[4] = {0xDD, 0xCC, 0xBB, 0xAA};
 #endif
 
-// ─────────────────────────────────────────────────────────────────────────
-// Nodding Oscillation Detector
-// 6-second rolling pitch buffer at 10 Hz → 60 samples.
-// Algorithm: detrend → ZCR → slope gate → clamp(ZCR/4, 0, 1).
-// Engineering assumption: nodding frequency 0.5–2 Hz.
-// See fuzzy_walkthrough.md §2.3 for full rationale.
-// ─────────────────────────────────────────────────────────────────────────
-struct NodDetector {
-    static const uint8_t N = 60;   // 6 s × 10 Hz
-    float   buf[N];
-    uint8_t head;
-    uint8_t count;   // saturates at N
-
-    NodDetector() : head(0), count(0) { memset(buf, 0, sizeof(buf)); }
-
-    void push(float pitch_deg) {
-        buf[head] = pitch_deg;
-        head      = (head + 1) % N;
-        if (count < N) count++;
-    }
-
-    // Returns nodding_score [0..1].
-    // Chronological index: count<N → oldest at buf[0]; count==N → oldest at buf[head].
-    // Minimum peak-to-peak pitch swing (degrees) required within the 6 s
-    // window before the zero-crossing score is trusted at all. Retrospective
-    // hardware check (2026-09-04): sitting motionless, pitch noise stayed
-    // under 0.5 deg peak-to-peak, yet the zero-crossing rate alone still hit
-    // score=1.0 in >50% of samples -- the algorithm was correctly measuring
-    // zero crossings, but at this amplitude it's measuring MEMS/quantization
-    // noise, not head motion. mf_pitch_Limp (this file's other pitch-based
-    // signal) already treats a real sustained head-drop as starting at 20 deg,
-    // so a discrete nod -- faster and smaller than a full slump, but still a
-    // deliberate real motion -- should clearly clear a couple of degrees.
-    // 2.0 deg is a conservative floor: comfortably above the measured noise
-    // floor, comfortably below a real nod. Needs retuning against real rider
-    // footage, same as every other threshold in this file.
-    static constexpr float MIN_SWING_DEG = 2.0f;
-
-    float score() const {
-        if (count < 6) return 0.0f;
-
-        // Mean for detrending, and peak-to-peak swing for the noise gate below.
-        float mean = 0.0f;
-        float lo = buf[(count < N) ? 0 : head];
-        float hi = lo;
-        for (uint8_t i = 0; i < count; i++) {
-            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
-            mean += buf[idx];
-            if (buf[idx] < lo) lo = buf[idx];
-            if (buf[idx] > hi) hi = buf[idx];
-        }
-        mean /= (float)count;
-        if ((hi - lo) < MIN_SWING_DEG) return 0.0f;  // noise floor gate
-
-        // Zero crossings of detrended signal
-        int zcr = 0;
-        uint8_t idx0 = (count < N) ? 0 : head;
-        float prev = buf[idx0] - mean;
-        for (uint8_t i = 1; i < count; i++) {
-            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
-            float v = buf[idx] - mean;
-            if ((prev < 0.0f) != (v < 0.0f)) zcr++;
-            prev = v;
-        }
-        float zcr_per_s = (float)zcr / ((float)count / 10.0f);
-
-        // Linear regression slope of raw pitch buffer.
-        // slope > 0: pitch trending upward = head drooping forward.
-        // (fuzzy_walkthrough.md spec uses slope < 0 with opposite sign convention;
-        //  here pitch_deg = acos(...) >= 0, so drooping = increasing. Flip to
-        //  slope < 0.0f if hardware tests show inverted behaviour.)
-        float fn  = (float)count;
-        float sx  = fn * (fn - 1.0f) / 2.0f;
-        float sx2 = fn * (fn - 1.0f) * (2.0f * fn - 1.0f) / 6.0f;
-        float sy  = 0.0f, sxy = 0.0f;
-        for (uint8_t i = 0; i < count; i++) {
-            uint8_t idx = (count < N) ? i : (uint8_t)((head + i) % N);
-            sy  += buf[idx];
-            sxy += (float)i * buf[idx];
-        }
-        float denom = fn * sx2 - sx * sx;
-        float slope = (fabsf(denom) > 1e-9f) ? (fn * sxy - sx * sy) / denom : 0.0f;
-        float gate  = (slope > 0.0f) ? 1.0f : 0.0f;
-
-        float s = zcr_per_s / 4.0f;
-        if (s < 0.0f) s = 0.0f;
-        if (s > 1.0f) s = 1.0f;
-        return s * gate;
-    }
-};
+// Nodding Oscillation Detector: see NodDetector.h (6 s x 10 Hz pitch ring buffer).
 
 // ─────────────────────────────────────────────────────────────────────────
 // Gyro Variance Rolling Buffer
@@ -816,15 +892,17 @@ struct GyroVarBuf {
 
 FuzzyFatigue g_fis;
 float g_riskScore  = 0.0f;
-int   g_alertLevel = ALERT_SAFE;
+int   g_alertLevel = ALERT_SAFE;   // raw fuzzy-model alert, logged as alert_level
+int   g_alertGated = ALERT_SAFE;   // after dwell/hold (AlertGate.h): drives the buzzer, logged as alert_gated
+AlertGate g_alertGate;
 
-// ── Baseline HR (count-based, frozen after N_BASELINE_SAMPLES valid readings) ─
+// ── Baseline HR (count-based, frozen once HrBaseline has SKIP+N valid readings) ─
 // "valid" = signal_quality==1 AND currentBPM>0 (implicitly 30–120 BPM by
 // beat detection: MIN_BEAT_INTERVAL=500 ms, MAX_BEAT_INTERVAL=2000 ms).
 // Frozen — not rolling — so progressive drowsiness is NOT normalised out.
-static const uint8_t N_BASELINE_SAMPLES = 20;   // ~20 s at 1 Hz with good contact
-float    g_baselineSum    = 0.0f;
-uint8_t  g_baselineCount  = 0;
+// HrBaseline.h skips the first SKIP readings (pulse channel settling) and takes the
+// median of the next N, so it needs SKIP+N = 30 valid seconds with good contact.
+HrBaseline g_hrBase;
 float    g_baselineBPM    = 0.0f;
 bool     g_baselineFormed = false;
 
@@ -837,6 +915,7 @@ float    g_blinkRate        = 13.0f;
 float    g_lastValidBlink   = 13.0f;
 uint32_t g_lastBlinkRxTime  = 0;
 bool     g_blinkEverRx      = false;
+bool     g_blinkValid       = true;   // false = blink channel offline; FIS ignores blink (see loop())
 char     g_serialLineBuf[32];
 uint8_t  g_serialLineBufLen = 0;
 
@@ -980,7 +1059,17 @@ bool openSession() {
     meta.printf("armed_imu=%d\n", g_readyImu ? 1 : 0);
     meta.printf("armed_hr=%d\n",  g_readyHr  ? 1 : 0);
     meta.printf("armed_eye=%d\n", g_readyEye ? 1 : 0);
+    meta.printf("eye_check=%s\n", g_eyeCheck == EYECHECK_PASS ? "pass" :
+                                  g_eyeCheck == EYECHECK_FAIL ? "fail" : "pending");
+    meta.printf("eye_check_blinks=%u\n", (unsigned)g_earBlinksSinceLock);
     meta.printf("arming_timed_out=%d\n", g_armTimedOut ? 1 : 0);
+    // Where the eye crop came from. A "stored" ROI is only as good as the
+    // arming check that confirmed it, so a session that reports no blinks can
+    // be told apart from one whose ROI was pointing at a cheek.
+    meta.printf("roi_source=%s\n", g_earRoiSource);
+    meta.printf("roi_x=%d\n", g_earRoi.x);
+    meta.printf("roi_y=%d\n", g_earRoi.y);
+    meta.printf("roi_size=%d\n", g_earRoi.size);
     meta.printf("arming_duration_ms=%lu\n",
                 (unsigned long)(millis() - g_armStartMs));
     meta.close();
@@ -1015,6 +1104,17 @@ bool openSession() {
   g_idxFile.println(
       F("frame_index,timestamp_ms,byte_offset,frame_size,crc32_hex"));
 
+  // ── Open blink_events.csv (not fatal if it cannot be opened) ──────────
+  char blinkPath[56];
+  snprintf(blinkPath, sizeof(blinkPath), "%s/blink_events.csv", sessionDir);
+  g_blinkFile = SD_MMC.open(blinkPath, FILE_WRITE);
+  if (g_blinkFile) {
+    g_blinkFile.println(F("timestamp_ms,source,score"));
+    g_blinkFile.flush();
+  } else {
+    Serial.println(F("#ERROR: Could not open blink_events.csv on SD -- blink events will not be logged"));
+  }
+
   // Reset session-level counters
   g_byteOffset = 0;
   g_frameIndex = 0;
@@ -1043,6 +1143,10 @@ void closeSession() {
     if (g_csvFile) {
       g_csvFile.flush();
       g_csvFile.close();
+    }
+    if (g_blinkFile) {
+      g_blinkFile.flush();
+      g_blinkFile.close();
     }
     xSemaphoreGive(g_sdMutex);
   }
@@ -1176,12 +1280,15 @@ void cameraTask(void *arg) {
         profSd  += (tSd1 - tSd0);
         profEar += (tEar1 - tSd1);
         if (++profCount >= 40) {
-          Serial.printf("#PROF: sd=%luus ear=%luus total=%luus budget=%dus\n",
+          // hog= is the part of ear= spent in the HOG classifier.
+          Serial.printf("#PROF: sd=%luus ear=%luus hog=%luus total=%luus budget=%dus\n",
                         (unsigned long)(profSd / profCount),
                         (unsigned long)(profEar / profCount),
+                        (unsigned long)(g_earProfHogUs / profCount),
                         (unsigned long)((profSd + profEar) / profCount),
                         (int)(1000000 / CAMERA_FPS));
           profCount = profSd = profEar = 0;
+          g_earProfHogUs = 0;
         }
 #endif
 #elif defined(STORAGE_MODE_USB)
@@ -1494,13 +1601,14 @@ void armingBegin() {
   g_armStartMs  = millis();
   g_armTimedOut = false;
   g_readyImu = g_readyHr = g_readyEye = false;
+  g_alertGate.reset();          // a new session starts with no dwell in progress
+  g_alertGated = ALERT_SAFE;
 
   armCalibBegin();
 
   // Fresh HR baseline. Carrying the previous session's resting rate over would
   // skew hr_diff_pct for the whole of this recording.
-  g_baselineSum    = 0.0f;
-  g_baselineCount  = 0;
+  g_hrBase.reset();
   g_baselineFormed = false;
 
 #if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
@@ -1510,6 +1618,13 @@ void armingBegin() {
   g_earRoi.locked  = false;
   g_earMotionTries = 0;
   g_earLocator.reset();
+  g_earValidSinceMs = 0;   // blink channel re-earns its "valid" after the new lock
+  g_earLastFrameMs  = 0;
+  g_earBlinksSinceLock = 0;
+  g_eyeCheck        = EYECHECK_PENDING;
+  g_earHogRate.n    = 0;   // the previous session's blinks must not count in this one's window
+  g_earHog.openRun  = EyeBlinkEAR::HogBlinkDetector::REFRACTORY_FRAMES;
+  g_onDeviceBlinkRate = 0.0f;
 #endif
 
   g_sessionState  = SESSION_ARMING;
@@ -1521,7 +1636,7 @@ void armingBegin() {
 // Enter RECORDING. Latches readiness, opens the session files, starts writing.
 void recordingBegin() {
 #if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
-  g_readyEye = g_earLockDone;
+  g_readyEye = (g_eyeCheck == EYECHECK_PASS);   // locked AND seen to blink
 #else
   g_readyEye = true;   // no EAR pipeline in this build
 #endif
@@ -1649,6 +1764,13 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
+#if defined(FRAME_INJECT_MODE)
+  // Injected frames arrive as multi-KB bursts. The default CDC receive buffer
+  // is 256 bytes, so even a 4 KB QVGA JPEG overruns it mid-frame and
+  // injectReadExact() stalls its full 5 s ("#ERROR: frame read failed,
+  // resyncing") on every frame. Must be set before begin() to take effect.
+  Serial.setRxBufferSize(16384);
+#endif
 #if defined(STORAGE_MODE_USB)
   Serial.begin(921600);
 #else
@@ -1725,6 +1847,16 @@ void setup() {
   analogReadResolution(12);
   Serial.println(F("#STATUS: Pulse sensor GPIO 1 (ADC1) — analog mode"));
 
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+  earLoadStoredRoi();
+  if (g_earStoredCx >= 0) {
+    Serial.printf("#STATUS: stored eye coordinate cx=%d cy=%d (send ROI:auto to clear)\n",
+                  g_earStoredCx, g_earStoredCy);
+  } else {
+    Serial.println(F("#STATUS: no stored eye coordinate -- the localizer will search"));
+  }
+#endif
+
   // Session Button
   pinMode(BUTTON_PIN, INPUT_PULLUP);
   Serial.println(F("#STATUS: Button GPIO 21 initialized (INPUT_PULLUP)"));
@@ -1764,7 +1896,8 @@ void setup() {
   Serial.println(
       F("#HEADER:timestamp_ms,hr_bpm,pulse_raw,"
         "ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,head_movement,signal_quality,"
-        "blink_rate,pitch_deg,gyro_var,nod_score,risk_pct,alert_level,imu_valid"));
+        "blink_rate,pitch_deg,gyro_var,nod_score,risk_pct,alert_level,imu_valid,"
+        "blink_valid,alert_gated"));
   Serial.println(F("#STATUS: Logging started"));
 
 #if defined(STORAGE_MODE_USB)
@@ -1835,6 +1968,24 @@ void loop() {
   }
   g_lastButtonState = reading;
 
+  // ── Eye check: resolve once, latch for the session ───────────────────
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+  if (g_eyeCheck == EYECHECK_PENDING && g_earValidSinceMs != 0) {   // runs in IDLE too: debug builds never arm
+    const uint32_t lockedFor = now - g_earValidSinceMs;
+    if (g_earBlinksSinceLock >= EAR_CHECK_MIN_BLINKS) {
+      g_eyeCheck = EYECHECK_PASS;
+      Serial.printf("#STATUS: Eye check PASSED -- %u blinks in %lu s after lock\n",
+                    (unsigned)g_earBlinksSinceLock, (unsigned long)(lockedFor / 1000));
+    } else if ((int32_t)lockedFor >= (int32_t)EAR_CHECK_WINDOW_MS) {
+      g_eyeCheck = EYECHECK_FAIL;
+      Serial.printf("#WARNING: Eye check FAILED -- %u blinks in %lu s after lock (need %u); "
+                    "blink channel off until the next arming\n",
+                    (unsigned)g_earBlinksSinceLock, (unsigned long)(lockedFor / 1000),
+                    (unsigned)EAR_CHECK_MIN_BLINKS);
+    }
+  }
+#endif
+
   // ── ARMING progress ──────────────────────────────────────────────────
   // Nothing is written to SD in this state. The three checks run concurrently
   // and independently; recording starts when all are ready, or when the
@@ -1846,19 +1997,24 @@ void loop() {
     bool imuOk = g_armCalib.done;
     bool hrOk  = g_baselineFormed;
 #if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
-    bool eyeOk = g_earLockDone;
+    // Ready = locked and the eye check has resolved (pass OR fail): a failed
+    // check does not hold the rider here, it just marks the blink channel off.
+    bool eyeOk = g_earLockDone && g_eyeCheck != EYECHECK_PENDING;
+    const unsigned eyeBlinks = g_earBlinksSinceLock, eyeNeed = EAR_CHECK_MIN_BLINKS;
 #else
     bool eyeOk = true;   // no EAR pipeline compiled into this build
+    const unsigned eyeBlinks = 0, eyeNeed = 0;
 #endif
 
     static uint32_t lastArmReport = 0;
     if (now - lastArmReport >= 2000) {
       lastArmReport = now;
-      Serial.printf("#ARMING: imu=%d hr=%d(%u/%u) eye=%d  %lu/%lu s\n",
+      Serial.printf("#ARMING: imu=%d hr=%d(%u/%u) eye=%d(blinks %u/%u)  %lu/%lu s\n",
                     imuOk ? 1 : 0,
                     hrOk ? 1 : 0,
-                    (unsigned)g_baselineCount, (unsigned)N_BASELINE_SAMPLES,
+                    (unsigned)g_hrBase.progress(), (unsigned)HrBaseline::NEEDED,
                     eyeOk ? 1 : 0,
+                    eyeBlinks, eyeNeed,
                     (unsigned long)((now - g_armStartMs) / 1000),
                     (unsigned long)(ARMING_TIMEOUT_MS / 1000));
     }
@@ -2021,6 +2177,34 @@ void loop() {
         sessionButtonPress();
         continue;
       }
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+      // "ROI:<cx>,<cy>" stores the eye centre the PC measured (kept in NVS
+      // across reboots and reflashes) and applies it immediately; "ROI:auto"
+      // clears it and goes back to searching. See earStoredRoi* and
+      // live_ear_preview.py --arm.
+      if (strncmp(g_serialLineBuf, "ROI:", 4) == 0) {
+        int cx = 0, cy = 0;
+        if (strcmp(g_serialLineBuf + 4, "auto") == 0) {
+          earClearStoredRoi();
+          g_earLockDone = false;
+          g_earRoi.locked = false;
+          g_earRoiSource = "none";
+          g_earLocator.reset();
+          g_earMotionTries = 0;
+          Serial.println(F("#STATUS: EAR ROI cleared -- searching for the eye again"));
+        } else if (sscanf(g_serialLineBuf + 4, "%d,%d", &cx, &cy) == 2 &&
+                   cx >= 0 && cy >= 0 && cx < 2000 && cy < 2000) {
+          earSaveStoredRoi(cx, cy);
+          g_earLockDone = false;      // re-applied from the stored value next frame
+          g_earRoi.locked = false;
+          Serial.printf("#STATUS: EAR ROI saved cx=%d cy=%d\n", cx, cy);
+        } else {
+          Serial.println(F("#ERROR: expected ROI:<cx>,<cy> or ROI:auto"));
+        }
+        g_serialLineBufLen = 0;
+        continue;
+      }
+#endif
       float blink_val = 0.0f;
       if (sscanf(g_serialLineBuf, "BLINK:%f", &blink_val) == 1
           && blink_val >= 0.0f && blink_val <= 60.0f) {
@@ -2051,6 +2235,35 @@ void loop() {
 #endif
   }
 
+  // ── Blink channel health ──────────────────────────────────────────────────────
+  // A PC-fed rate (BLINK:) is trusted as before. The on-device rate is only
+  // meaningful once the eye is locked, a full 60 s window has accumulated, and
+  // frames are still arriving. Otherwise a 0 means "cannot see", not "eyes closed", and the
+  // FIS is told to ignore blink. Signed compares: the camera task may stamp a
+  // frame a few ms after `now` was sampled.
+  bool blinkValid = true;
+  const char *blinkWhy = "";
+#if defined(STORAGE_MODE_SD) || defined(EAR_LIVE_DEBUG)
+  if (!g_blinkEverRx) {
+    const uint32_t since = g_earValidSinceMs, last = g_earLastFrameMs;
+    if (g_earDisabled)                                        blinkWhy = "EAR disabled";
+    else if (since == 0)                                      blinkWhy = "no eye lock yet";
+    else if (g_eyeCheck == EYECHECK_FAIL)                     blinkWhy = "eye check failed (too few blinks after lock)";
+    else if (g_eyeCheck == EYECHECK_PENDING)                  blinkWhy = "eye check pending";
+    else if ((int32_t)(now - since) < (int32_t)EAR_BLINK_WARMUP_MS) blinkWhy = "warming up (60 s window)";
+    else if ((int32_t)(now - last) > (int32_t)EAR_FRAME_STALE_MS)   blinkWhy = "no frames processed";
+    blinkValid = (blinkWhy[0] == '\0');
+  }
+#endif
+  if (blinkValid != g_blinkValid) {
+    if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+      if (blinkValid) Serial.println(F("#STATUS: Blink channel ONLINE"));
+      else            Serial.printf("#STATUS: Blink channel OFFLINE -- %s; FIS ignores blink\n", blinkWhy);
+      xSemaphoreGive(g_serialMutex);
+    }
+  }
+  g_blinkValid = blinkValid;
+
   // ── Warn on prolonged no-contact (non-blocking: skip if mutex busy) ────────
   if (lastSignalQuality == 0) {
     if (++noContactStreak >= NO_CONTACT_WARN_N) {
@@ -2071,14 +2284,12 @@ void loop() {
   int hr_out = (lastSignalQuality == 1 && currentBPM > 0) ? (int)currentBPM : 0;
 
   if (!g_baselineFormed && lastSignalQuality == 1 && currentBPM > 0) {
-    g_baselineSum += currentBPM;
-    g_baselineCount++;
-    if (g_baselineCount >= N_BASELINE_SAMPLES) {
-      g_baselineBPM    = g_baselineSum / (float)g_baselineCount;
+    if (g_hrBase.push(currentBPM)) {
+      g_baselineBPM    = g_hrBase.bpm;
       g_baselineFormed = true;
       if (xSemaphoreTake(g_serialMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        Serial.printf("#STATUS: Baseline HR formed: %.1f BPM (%u samples)\n",
-                      g_baselineBPM, (unsigned)g_baselineCount);
+        Serial.printf("#STATUS: Baseline HR formed: %.1f BPM (median of %u after %u settling)\n",
+                      g_baselineBPM, (unsigned)HrBaseline::N, (unsigned)HrBaseline::SKIP);
         xSemaphoreGive(g_serialMutex);
       }
     }
@@ -2098,7 +2309,9 @@ void loop() {
                g_imu_pitch_deg,
                g_imu_nod_score,
                g_riskScore,
-               g_alertLevel);
+               g_alertLevel,
+               g_blinkValid);
+  g_alertGated = g_alertGate.update(g_alertLevel, now);
 
   // ── Buzzer alert output (GPIO 14) ─────────────────────────────────────────────
   if (g_sessionBeepState == 0) { // Don't interfere with start/stop beeps
@@ -2113,8 +2326,9 @@ void loop() {
         setBuzzerState(false);
       }
 #else
-      // CRITICAL : 2s ON, 3s OFF (cooldown)
-      // WARNING  : 1s ON, 3s OFF (cooldown).
+      // Driven by the GATED alert (g_alertGated), not the raw one.
+      // CRITICAL : 2s ON, then 30s OFF (cooldown)
+      // WARNING  : 1s ON, then 3s OFF (cooldown).
       // SAFE     : buzzer off.
 #if defined(STORAGE_MODE_USB)
       setBuzzerState(false);
@@ -2124,10 +2338,12 @@ void loop() {
       static uint32_t cooldownStartTime = 0;
       static bool cooldownActive = false;
       static uint32_t currentAlertDuration = 0;
-      const uint32_t COOLDOWN_DURATION = 3000;
+      static uint32_t cooldownDuration = 3000;
+      const uint32_t COOLDOWN_AFTER_WARNING  = 3000;
+      const uint32_t COOLDOWN_AFTER_CRITICAL = 30000;   // a Critical that clears and returns must not re-beep at once
 
       if (cooldownActive) {
-        if (now - cooldownStartTime > COOLDOWN_DURATION) {
+        if (now - cooldownStartTime > cooldownDuration) {
           cooldownActive = false;
         }
       } else if (alertActive) {
@@ -2135,6 +2351,7 @@ void loop() {
           alertActive = false;
           cooldownActive = true;
           cooldownStartTime = now;
+          cooldownDuration = (currentAlertDuration == 2000) ? COOLDOWN_AFTER_CRITICAL : COOLDOWN_AFTER_WARNING;
           setBuzzerState(false);
 
           // Buzzer just went silent -- try to reconnect right now instead of
@@ -2149,7 +2366,7 @@ void loop() {
         }
       } else {
         // Idle state - wait for new alert
-        if (g_alertLevel == ALERT_CRITICAL || g_alertLevel == ALERT_WARNING) {
+        if (g_alertGated == ALERT_CRITICAL || g_alertGated == ALERT_WARNING) {
           // Force a fresh MPU reconnect/re-init right as the buzzer is about
           // to start drawing current, so it enters the noisy window in a
           // known-good state instead of whatever it drifted to since the
@@ -2161,7 +2378,7 @@ void loop() {
 
           alertActive = true;
           alertStartTime = now;
-          currentAlertDuration = (g_alertLevel == ALERT_CRITICAL) ? 2000 : 1000;
+          currentAlertDuration = (g_alertGated == ALERT_CRITICAL) ? 2000 : 1000;
           setBuzzerState(true);
         } else {
           setBuzzerState(false);
@@ -2219,14 +2436,17 @@ void loop() {
     // "[FROZEN Nms]" marks IMU values held from the last good read (buzzer
     // active or bus down) rather than sampled this tick -- so a suspicious
     // pitch/nod reading during an alert can be told apart from a live one.
-    Serial.printf("# BLINK:%.1f  PITCH:%.1fdeg  GVAR:%.0f  NOD:%.2f%s",
-                  g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var, g_imu_nod_score,
+    Serial.printf("# BLINK:%.1f%s  PITCH:%.1fdeg  GVAR:%.0f  NOD:%.2f%s",
+                  g_blinkRate, g_blinkValid ? "" : " [OFFLINE]",
+                  g_imu_pitch_deg, g_imu_gyro_var, g_imu_nod_score,
                   g_imuSampleValid ? "\n" : "");
     if (!g_imuSampleValid) {
       Serial.printf("  [FROZEN %lums]\n",
                     (unsigned long)(now - g_lastImuValidTime));
     }
-    Serial.printf("# RISK:%.1f%%  ALERT:%s\n", g_riskScore, alertStr);
+    Serial.printf("# RISK:%.1f%%  ALERT:%s  GATED:%s\n", g_riskScore, alertStr,
+                  (g_alertGated == ALERT_CRITICAL) ? "CRITICAL" :
+                  (g_alertGated == ALERT_WARNING)  ? "WARNING"  : "safe");
 
 #if defined(STORAGE_MODE_USB)
     // USB CSV line for debug_recorder.py
@@ -2234,7 +2454,12 @@ void loop() {
       // Columns: timestamp_ms, hr_bpm, pulse_raw,
       //          ax_g, ay_g, az_g, gx_dps, gy_dps, gz_dps, head_movement, signal_quality,
       //          blink_rate, pitch_deg, gyro_var, nod_score, risk_pct, alert_level,
-      //          imu_valid
+      //          imu_valid, blink_valid, alert_gated
+      // alert_gated is alert_level after the dwell/release gate (AlertGate.h) -- the
+      // level the buzzer actually followed. alert_level stays the raw model output.
+      // blink_valid=0 marks a row whose blink_rate is not evidence of anything
+      // (eye not tracked / detector warming up): the FIS ignored it, and so
+      // should any analysis or training that reads risk_pct/alert_level.
       // imu_valid=0 marks a row whose IMU fields are frozen last-known-good
       // values (reads suspended during buzzer, or bus down) rather than a live
       // sample -- exclude those rows from IMU statistics during analysis.
@@ -2255,7 +2480,9 @@ void loop() {
       Serial.print(g_imu_nod_score, 3); Serial.print(',');
       Serial.print(g_riskScore, 2);    Serial.print(',');
       Serial.print(g_alertLevel);      Serial.print(',');
-      Serial.println(g_imuSampleValid ? 1 : 0);
+      Serial.print(g_imuSampleValid ? 1 : 0); Serial.print(',');
+      Serial.print(g_blinkValid ? 1 : 0); Serial.print(',');
+      Serial.println(g_alertGated);
     }
 #endif
 
@@ -2269,14 +2496,14 @@ void loop() {
   if (g_sdReady && g_csvFile && g_sessionActive) {
     if (xSemaphoreTake(g_sdMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
       g_csvFile.printf(
-        "%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.2f,%.1f,%.3f,%.2f,%d,%d\n",
+        "%lu,%d,%d,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%d,%.2f,%.2f,%.1f,%.3f,%.2f,%d,%d,%d,%d\n",
         now, hr_out, lastPulseRaw,
         g_imu_ax_g, g_imu_ay_g, g_imu_az_g,
         g_imu_gx_dp, g_imu_gy_dp, g_imu_gz_dp,
         g_imu_head_mov, lastSignalQuality,
         g_blinkRate, g_imu_pitch_deg, g_imu_gyro_var,
         g_imu_nod_score, g_riskScore, (int)g_alertLevel,
-        g_imuSampleValid ? 1 : 0);
+        g_imuSampleValid ? 1 : 0, g_blinkValid ? 1 : 0, (int)g_alertGated);
       g_csvFile.flush();
       xSemaphoreGive(g_sdMutex);
     }

@@ -141,7 +141,7 @@ Computed as a 60-second rolling count of blink events detected by the camera pip
 
 | MF       | Shape           | Breakpoints (a, b, c, d)  | Source                                                  |
 |:---------|:----------------|:--------------------------|:--------------------------------------------------------|
-| `Low`    | Left trapezoid  | (0, 0, 4, 8)              | IICIP 2016: 4-6 bl/min = fatigued driving state         |
+| `Low`    | Left trapezoid  | (-inf, -inf, 3, 7)        | IICIP 2016: 4-6 bl/min = fatigued driving state; was (0,0,4,8), whose zero point (8) is the alert driving baseline |
 | `Normal` | Trapezoid       | (6, 8, 18, 20)            | IICIP 2016: 8-10 bl/min alert; Divjak 2009: 18±3 rest  |
 | `High`   | Right trapezoid | (20, 24, +inf, +inf)      | Divjak 2009: >24 bl/min = Phase 1 fighting fatigue      |
 

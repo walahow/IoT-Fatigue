@@ -337,7 +337,10 @@ def encode(session_path: str, fps: float, out_path: str, scale: float,
         # avc1 may not be available on all Windows builds; fall back to mp4v
         print(f"[WARN] Codec '{codec}' unavailable, falling back to mp4v.")
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h))
+        # Same frame size as the first attempt -- every frame written below is
+        # (out_w, out_h + hud_h) whenever the HUD is on, so a writer opened for
+        # out_h alone silently mismatches every write() call.
+        writer = cv2.VideoWriter(out_path, fourcc, fps, (out_w, out_h + hud_h))
     if not writer.isOpened():
         sys.exit(f"[ERROR] VideoWriter failed to open with both avc1 and mp4v.")
 
@@ -365,12 +368,17 @@ def encode(session_path: str, fps: float, out_path: str, scale: float,
 
         # Draw bounding box if we have session data
         if session_data is not None:
-            idx = np.searchsorted(session_data['timestamp_ms'].values, ts)
-            if idx >= len(session_data):
-                idx = len(session_data) - 1
-            elif idx > 0 and abs(ts - session_data['timestamp_ms'].iloc[idx-1]) < abs(session_data['timestamp_ms'].iloc[idx] - ts):
-                idx = idx - 1
-            row = session_data.iloc[idx]
+            # row_idx, not idx: idx is the outer enumerate() counter the end-of-loop
+            # progress print and gap-fill logic both key off -- reusing the name here
+            # silently clobbered it, so "encoded N/total" printed the same N many times
+            # in a row (once per source frame sharing that 1 Hz sensor row) rather than
+            # counting frames. Cosmetic only: writer.write() below never read idx.
+            row_idx = np.searchsorted(session_data['timestamp_ms'].values, ts)
+            if row_idx >= len(session_data):
+                row_idx = len(session_data) - 1
+            elif row_idx > 0 and abs(ts - session_data['timestamp_ms'].iloc[row_idx-1]) < abs(session_data['timestamp_ms'].iloc[row_idx] - ts):
+                row_idx = row_idx - 1
+            row = session_data.iloc[row_idx]
             
             if "eye_x" in row and pd.notna(row["eye_x"]) and row["eye_x"] != "":
                 try:

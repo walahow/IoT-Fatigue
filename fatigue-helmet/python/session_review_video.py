@@ -81,7 +81,7 @@ print("frames:", len(files))
 
 # ── load sensor csv (headerless, 18 cols) ────────────────────────────
 COLS = ["ts","hr","pulse","ax","ay","az","gx","gy","gz","mov","sq",
-        "blink_rate","pitch","gvar","nod","risk","alert","imu_valid"]
+        "blink_rate","pitch","gvar","nod","risk","alert","imu_valid","blink_valid","alert_gated"]
 sensor = []
 with open(os.path.join(sess, "sensor_data.csv")) as f:
     for row in csvmod.reader(f):

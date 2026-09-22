@@ -67,12 +67,21 @@ def merge(session_path: str, tolerance_ms: int) -> None:
     # fields are a live sample (1) or frozen last-known-good values held while
     # reads were suspended (0) -- drop imu_valid == 0 rows before computing IMU
     # statistics, or one held reading gets counted as several measurements.
+    #
+    # blink_valid (added after the 18-column sessions) is 0 on rows where the
+    # on-device blink channel was offline (eye not tracked / warming up): the
+    # FIS ignored blink_rate there, and blink_rate itself is not evidence of
+    # anything. Older sessions leave it NaN -- unknown, NOT assumed valid.
+    #
+    # alert_gated (last column) is alert_level after the dwell/release gate: the
+    # level the buzzer followed. alert_level is the raw model output. Older
+    # sessions leave it NaN.
     expected_sensor_cols = [
         "timestamp_ms", "hr_bpm", "pulse_raw",
         "ax_g", "ay_g", "az_g", "gx_dps", "gy_dps", "gz_dps",
         "head_movement", "signal_quality", "blink_rate",
         "pitch_deg", "gyro_var", "nod_score", "risk_pct", "alert_level",
-        "imu_valid"
+        "imu_valid", "blink_valid", "alert_gated"
     ]
     
     # Read the first line to check if it contains headers
