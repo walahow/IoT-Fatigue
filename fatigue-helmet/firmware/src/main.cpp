@@ -2147,11 +2147,13 @@ static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 15000;
 // Indexed by SessionState. The page shows these and echoes one back with a
 // press (/press?expect=), so the two must use the same names.
 static const char *const PHONE_STATE_NAME[] = {"IDLE", "ARMING", "RECORDING"};
+static_assert(sizeof(PHONE_STATE_NAME) / sizeof(PHONE_STATE_NAME[0]) == SESSION_RECORDING + 1,
+              "PHONE_STATE_NAME must name every SessionState");
 
 // The /status JSON. Readiness uses the same globals as the ARMING block in loop().
 static void buildPhoneStatus(char *out, size_t n, unsigned long now) {
   static const char *const CHECK[] = {"pending", "pass", "fail"};
-  char roi[48] = "null";
+  char roi[64] = "null";
   if (g_earLockDone && g_earRoi.locked)
     snprintf(roi, sizeof roi, "{\"x\":%d,\"y\":%d,\"size\":%d}",
              g_earRoi.x, g_earRoi.y, g_earRoi.size);
@@ -2162,7 +2164,10 @@ static void buildPhoneStatus(char *out, size_t n, unsigned long now) {
            "\"eye_check\":\"%s\",\"blinks_since_lock\":%u,\"blinks_need\":%u,"
            "\"roi\":%s,\"roi_src\":\"%s\",\"roi_conf\":%.2f,\"hog_total\":%lu}",
            PHONE_STATE_NAME[g_sessionState],
-           arming ? (unsigned long)((now - g_armStartMs) / 1000) : 0UL,
+           // Clamped like the ARMING block's own armElapsed: a phone press
+           // arming in the same pass as this rebuild can otherwise underflow
+           // now - g_armStartMs to a huge unsigned value for one poll.
+           arming ? (unsigned long)((int32_t)(now - g_armStartMs) > 0 ? (now - g_armStartMs) / 1000 : 0) : 0UL,
            (unsigned long)(ARMING_TIMEOUT_MS / 1000),
            g_armTimedOut ? 1 : 0,
            g_armCalib.done ? 1 : 0,
@@ -2181,8 +2186,13 @@ static void phoneTick(unsigned long now) {
   static unsigned long recSince = 0;
   if (g_sessionState != prev) {
     if (g_sessionState == SESSION_RECORDING) recSince = now;
-    // Back from a ride. Blocks a few hundred ms, but nothing is recording.
-    if (g_sessionState == SESSION_IDLE) PhonePreview::start();
+    if (g_sessionState == SESSION_IDLE && !PhonePreview::running()) {
+      // Blocks loop() while nothing records; a button tap shorter than this
+      // can be missed, so the bench measures it.
+      const unsigned long t0 = millis();
+      PhonePreview::start();
+      Serial.printf("#STATUS: Phone preview restart took %lu ms\n", (unsigned long)(millis() - t0));
+    }
     prev = g_sessionState;
   }
   if (g_sessionState == SESSION_RECORDING && PhonePreview::running() &&

@@ -329,7 +329,9 @@ function boot() {
         if (test && test.phase === 'done' && test.roi === undefined) test = withRoi(test, s);
         if (staleTest(test, s)) {
           test = null;
-          if (s.state !== 'RECORDING') note('eye box moved -- rerun the blink test');
+          // Arming drops and re-acquires the ROI by design (the firmware's
+          // eye check takes over), so it isn't a stale-test note either.
+          if (s.state !== 'RECORDING' && s.state !== 'ARMING') note('eye box moved -- rerun the blink test');
         }
       })
       .catch(() => {})
