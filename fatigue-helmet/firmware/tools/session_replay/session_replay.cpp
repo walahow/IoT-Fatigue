@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 #if defined(_WIN32)
@@ -147,7 +148,7 @@ static bool listFrames(const std::string &dir, std::vector<FrameFile> &out) {
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "Usage: %s <frames_dir> <output_csv> [--lock=motion|dark] [--roi=X,Y]\n"
-                    "       [--hog-dump=feat.bin] [--hog-model=model.bin --hog-csv=hog.csv]\n", argv[0]);
+                    "       [--hog-dump=feat.bin [--hog-jitter=N,J]] [--hog-model=model.bin --hog-csv=hog.csv]\n", argv[0]);
     return 1;
   }
   std::string framesDir = argv[1];
@@ -160,6 +161,7 @@ int main(int argc, char **argv) {
   bool manualRoi = false;
   int  manualCx = 0, manualCy = 0;
   const char *hogDumpPath = nullptr, *hogModelPath = nullptr, *hogCsvPath = nullptr;
+  int jitterN = 0, jitterPx = 0;   // --hog-jitter=N,J -- see the hog-dump block below
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
     else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
@@ -189,6 +191,18 @@ int main(int argc, char **argv) {
     else if (strncmp(argv[i], "--hog-dump=", 11) == 0) hogDumpPath = argv[i] + 11;
     else if (strncmp(argv[i], "--hog-model=", 12) == 0) hogModelPath = argv[i] + 12;
     else if (strncmp(argv[i], "--hog-csv=", 10) == 0) hogCsvPath = argv[i] + 10;
+    // Training-time augmentation only (see hog-dump block below): N extra
+    // copies of each dumped frame's features, each computed from the HOG
+    // crop re-centred on a random +-J px offset from the locked ROI. Trains
+    // the classifier to tolerate the few pixels of slack a moving ROI
+    // (drift correction, a re-tapped eye box) actually has in practice,
+    // instead of only the one exact framing session_101 happened to lock.
+    else if (strncmp(argv[i], "--hog-jitter=", 13) == 0) {
+      if (sscanf(argv[i] + 13, "%d,%d", &jitterN, &jitterPx) != 2) {
+        fprintf(stderr, "ERROR: --hog-jitter needs N,J (e.g. --hog-jitter=4,16)\n");
+        return 1;
+      }
+    }
   }
   FILE *hogDump = hogDumpPath ? fopen(hogDumpPath, "wb") : nullptr;
   static float hogModel[EyeBlinkEAR::HOG_LEN + 2];   // weights, bias, threshold
@@ -512,6 +526,32 @@ int main(int argc, char **argv) {
           fwrite(&f.timestampMs, sizeof(uint32_t), 1, hogDump);
           fwrite(&frameMean, sizeof(float), 1, hogDump);
           fwrite(feat, sizeof(float), EyeBlinkEAR::HOG_LEN, hogDump);
+          // Jittered copies, same timestamp -- train_blink_classifier.py maps
+          // every record's timestamp back to one label via blink_labels.csv,
+          // so duplicate timestamps just become extra training rows for that
+          // frame's label. Seeded per-frame (not by loop order) so a re-run
+          // with the same N,J reproduces the same jitter set exactly.
+          std::mt19937 jrng((uint32_t)f.timestampMs * 2654435761u + (uint32_t)jitterPx);
+          std::uniform_int_distribution<int> jdist(-jitterPx, jitterPx);
+          for (int j = 0; j < jitterN; j++) {
+            EyeBlinkEAR::RoiLock roiJ = roi;
+            roiJ.x += jdist(jrng);
+            roiJ.y += jdist(jrng);
+            if (roiJ.x + roiJ.size > w) roiJ.x = w - roiJ.size;
+            if (roiJ.y + roiJ.size > h) roiJ.y = h - roiJ.size;
+            if (roiJ.x < 0) roiJ.x = 0;
+            if (roiJ.y < 0) roiJ.y = 0;
+            int jcx, jcy, jcw, jch;
+            EyeBlinkEAR::hogCropRect(roiJ, jcx, jcy, jcw, jch);
+            earExtractGray(rgb, w, h, jcx, jcy, jcw, jch, earGrayBuf);
+            uint8_t jsmall[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];
+            float jfeat[EyeBlinkEAR::HOG_LEN];
+            EyeBlinkEAR::boxResample(earGrayBuf, jcw, jch, jsmall, EyeBlinkEAR::HOG_W, EyeBlinkEAR::HOG_H);
+            EyeBlinkEAR::hogFeatures(jsmall, jfeat);
+            fwrite(&f.timestampMs, sizeof(uint32_t), 1, hogDump);
+            fwrite(&frameMean, sizeof(float), 1, hogDump);
+            fwrite(jfeat, sizeof(float), EyeBlinkEAR::HOG_LEN, hogDump);
+          }
         }
         if (hogCsv) {
           float score = EyeBlinkEAR::linearScore(feat, hogModel, hogModel[EyeBlinkEAR::HOG_LEN]);

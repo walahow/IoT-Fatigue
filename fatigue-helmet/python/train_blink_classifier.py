@@ -107,6 +107,14 @@ def main():
                     help="score threshold for the final model (default: best F1 in cross-validation)")
     ap.add_argument("--header", default=os.path.join(HERE, "..", "firmware", "src", "BlinkWeights.h"),
                     help="where to write the firmware weights header (default: firmware/src/BlinkWeights.h)")
+    ap.add_argument("--jitter-n", type=int, default=4,
+                    help="extra training copies per labelled frame, HOG crop re-centred on a random "
+                         "+-jitter-px offset from the locked ROI (0 disables). The classifier otherwise "
+                         "only ever sees one exact framing, and a moving ROI (drift correction, a "
+                         "re-tapped eye box) is never exactly that framing -- see session-116-blink-eval "
+                         "memory: this took a held-out session from 12/28 to 19/28 blinks caught at "
+                         "2.7 FA/min, vs. 4.6 FA/min without it. Default 4,16 is that tested setting.")
+    ap.add_argument("--jitter-px", type=int, default=16, help="max +-offset in px for --jitter-n")
     args = ap.parse_args()
     s = args.session
     work = os.path.join(s, "blink_classifier")
@@ -117,8 +125,12 @@ def main():
     state = np.array([r["state"] for r in rows])
 
     dump = os.path.join(work, "hog_features.bin")
-    replay(s, work, "--hog-dump=" + dump)
+    jitter_flags = [f"--hog-jitter={args.jitter_n},{args.jitter_px}"] if args.jitter_n else []
+    replay(s, work, "--hog-dump=" + dump, *jitter_flags)
     rec = np.fromfile(dump, dtype=[("ts", "<u4"), ("mean", "<f4"), ("f", "<f4", (HOG_LEN,))])
+    # --hog-jitter dumps 1+jitter_n records per frame, same timestamp each --
+    # fidx (and everything derived from it below) just gets that many more
+    # rows per label, all sharing one frame's ground truth.
     fidx = np.array([idx_of[t] for t in rec["ts"]])      # frames after the eye lock
     X, st = rec["f"], state[fidx]
     y = (st == "closed").astype(np.int32)
@@ -128,8 +140,9 @@ def main():
     blinks = np.split(closed, np.where(np.diff(closed) > 2)[0] + 1) if len(closed) else []
     near = np.array([len(closed) > 0 and np.abs(closed - i).min() <= TOL for i in fidx])
     usable = (st != "unsure") & ((st == "closed") | ~near)  # drop half-closed transition frames
-    print(f"{len(rec)} frames after eye lock, {len(blinks)} labelled blinks, "
-          f"{(st == 'unsure').sum()} unsure frames excluded")
+    print(f"{len(set(fidx))} frames after eye lock ({len(rec)} training rows with "
+          f"{args.jitter_n}x{args.jitter_px}px jitter), {len(blinks)} labelled blinks, "
+          f"{(st == 'unsure').sum()} unsure rows excluded")
 
     thresholds = [0.0, 0.25, 0.5, 0.75]
     tally = {t: [0, 0, 0] for t in thresholds}
@@ -164,8 +177,9 @@ def main():
     model = os.path.join(s, "blink_model.bin")
     write_model(model, w, b, th)
     tp, fp, _ = tally[th] if th in tally else (0, 0, 0)
+    jitter_note = f", +-{args.jitter_px}px x{args.jitter_n} ROI jitter" if args.jitter_n else ""
     provenance = [f"Trained on {os.path.basename(os.path.normpath(s))}: {len(blinks)} labelled blinks, "
-                  f"{len(rec)} frames after eye lock."]
+                  f"{len(set(fidx))} frames after eye lock{jitter_note}."]
     if th in tally:
         provenance.append(f"Cross-validated at threshold {th:+.2f}: caught {tp}/{len(blinks)}, "
                           f"{fp} false alarms (precision {tp / max(tp + fp, 1):.0%}).")
