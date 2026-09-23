@@ -5,14 +5,46 @@ the exact steps to record → label → retrain from here.
 
 ## Branch
 
-`blink-jitter-116-labels`, branched off `phone-arming-preview` (not `main` —
-`main` is ~20 commits behind and doesn't have the HOG classifier code at all;
-building on it will not compile). Pull that branch on the new device:
+Everything below is on `main` now (fast-forwarded from `blink-jitter-116-labels`,
+which was branched off `phone-arming-preview` since that's where the HOG
+classifier code lived before this merge). Just pull main on the new device:
 
 ```bash
-git fetch origin
-git checkout blink-jitter-116-labels
+git pull origin main
 ```
+
+## Verification status — read this before trusting any of it
+
+What I actually tested this session, with before/after numbers on real
+footage: the blink classifier changes only (`session_replay.cpp`'s jitter
+flag, `train_blink_classifier.py`, the regenerated `BlinkWeights.h`). Those
+I'd stand behind.
+
+What I did **not** verify, and neither did anyone else as far as the repo
+shows:
+
+- **The actual embedded firmware build.** Every host-side test I ran
+  compiles `EyeBlinkEAR.h` in isolation with plain `g++` — that is not the
+  same as building `main.cpp` against the real Arduino/ESP32 framework.
+  I never ran `pio run` for `esp32s3cam` or `esp32s3cam_sd` (no PlatformIO
+  in the environment I had). `PhonePreview.h`, `phone_page.h`, the Wi-Fi/
+  HTTP server code — none of that got compiled by me. **Run `pio run` for
+  both environments before flashing anything.**
+- **The phone-arming-preview hardware bench test.** It was already pending
+  before this merge — frame rate with the arming page open, pulse-sensor
+  noise with Wi-Fi on/off, how long start/stop blocks the main loop, memory
+  over a full ride. Merging it into `main` didn't test any of that; it just
+  moved the code to where it'll get tested. Treat the phone preview as
+  unbenched until someone actually runs that checklist (it's in
+  `fatigue-helmet/firmware/docs/superpowers/plans/2026-09-23-phone-arming-preview.md`).
+- **Known pre-existing test failures.** 2 tests in `test_eye_blink_ear` were
+  already failing before today, not caused by this work but also not fixed.
+  Run `pio test -e sensor_test` (or the equivalent native env) to see current
+  status before assuming a clean baseline.
+- **`label_ground_truth.py`.** Committed because it was sitting there
+  uncommitted and matches the labelling schema already in use — I read it
+  fully but never ran it myself this session. Should work; hasn't been
+  exercised by me.
 
 ## What's in this branch
 
