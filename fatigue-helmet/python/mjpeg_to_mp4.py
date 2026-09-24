@@ -9,10 +9,17 @@ the index, upscales with Lanczos4, and writes straight to VideoWriter.
 Handles timestamp gaps by duplicating the last frame (same as frames_to_mp4.py).
 Corrupt / CRC-failed frames are skipped gracefully.
 
+If <session>/blink_events.csv exists (the on-device blink log), each frame
+within BLINK_HOLD_MS of a logged blink gets a red flash border + "BLINK" tag
+and a running blink count, so the on-device detector's output can be checked
+against the footage by eye without needing the native session_replay.exe
+replay tool that session_review_video.py depends on.
+
 Usage:
     python mjpeg_to_mp4.py --session D:/path/to/session_001
     python mjpeg_to_mp4.py --session D:/path/to/session_001 --scale 3
     python mjpeg_to_mp4.py --session D:/path/to/session_001 --no-timestamp
+    python mjpeg_to_mp4.py --session D:/path/to/session_001 --no-blinks
     python mjpeg_to_mp4.py --session D:/path/to/session_001 --skip-crc
     python mjpeg_to_mp4.py --session D:/path/to/session_001 --out my_clip.mp4
 
@@ -22,6 +29,7 @@ Output:
 
 import argparse
 import binascii
+import bisect
 import os
 import sys
 
@@ -41,6 +49,12 @@ OSD_SHADOW    = (0, 0, 0)
 OSD_MARGIN    = 6
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Blink overlay constants ─────────────────────────────────────────────────
+BLINK_HOLD_MS  = 350   # how long the flash stays on after a logged blink
+BLINK_COLOR    = (60, 60, 255)   # BGR red
+BLINK_BORDER   = 6
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -56,6 +70,8 @@ def parse_args() -> argparse.Namespace:
                    help="Output MP4 path (default: <session>/video.mp4)")
     p.add_argument("--no-timestamp", action="store_true",
                    help="Disable timestamp OSD overlay")
+    p.add_argument("--no-blinks", action="store_true",
+                   help="Disable blink-event overlay even if blink_events.csv exists")
     p.add_argument("--no-fill-gaps", action="store_true",
                    help="Don't duplicate frames to fill timestamp gaps")
     p.add_argument("--skip-crc", action="store_true",
@@ -75,6 +91,39 @@ def read_metadata(session_path: str) -> dict:
                     k, v = line.strip().split("=", 1)
                     meta[k.strip()] = v.strip()
     return meta
+
+
+def load_blink_events(session_path: str) -> list:
+    """Read timestamp_ms column from blink_events.csv (on-device blink log)."""
+    path = os.path.join(session_path, "blink_events.csv")
+    if not os.path.exists(path):
+        return []
+    events = []
+    with open(path) as f:
+        f.readline()  # header: timestamp_ms,source,score
+        for line in f:
+            ts_str = line.split(",", 1)[0].strip()
+            if ts_str.lstrip("-").isdigit():
+                events.append(int(ts_str))
+    events.sort()
+    return events
+
+
+def draw_blink_overlay(frame, timestamp_ms: int, blink_events: list) -> int:
+    """Flash a red border + BLINK tag near a logged blink; return running count."""
+    i = bisect.bisect_right(blink_events, timestamp_ms) - 1
+    count = i + 1
+    if i >= 0 and (timestamp_ms - blink_events[i]) <= BLINK_HOLD_MS:
+        h, w = frame.shape[:2]
+        cv2.rectangle(frame, (0, 0), (w - 1, h - 1), BLINK_COLOR, BLINK_BORDER)
+        cv2.putText(frame, "BLINK", (w - 118, 26), OSD_FONT, 0.7,
+                    BLINK_COLOR, 2, cv2.LINE_AA)
+    text = f"blinks: {count}"
+    cv2.putText(frame, text, (OSD_MARGIN + 1, 21),
+                OSD_FONT, OSD_SCALE, OSD_SHADOW, OSD_THICKNESS + 1, cv2.LINE_AA)
+    cv2.putText(frame, text, (OSD_MARGIN, 20),
+                OSD_FONT, OSD_SCALE, OSD_COLOR, OSD_THICKNESS, cv2.LINE_AA)
+    return count
 
 
 def draw_osd(frame, timestamp_ms: int, frame_num: int, total: int):
@@ -103,10 +152,18 @@ def open_writer(out_path: str, codec: str, fps: float, size: tuple):
 
 
 def convert(session_path: str, fps: float, scale: float, out_path: str,
-            show_ts: bool, fill_gaps: bool, skip_crc: bool, codec: str) -> None:
+            show_ts: bool, fill_gaps: bool, skip_crc: bool, codec: str,
+            show_blinks: bool) -> None:
 
     mjpeg_path = os.path.join(session_path, "video.mjpeg")
     idx_path   = os.path.join(session_path, "video.idx")
+
+    blink_events = load_blink_events(session_path) if show_blinks else []
+    if show_blinks:
+        if blink_events:
+            print(f"[INFO] Blink overlay : {len(blink_events)} events from blink_events.csv")
+        else:
+            print("[INFO] Blink overlay : none (no blink_events.csv found)")
 
     for p, label in [(mjpeg_path, "video.mjpeg"), (idx_path, "video.idx")]:
         if not os.path.exists(p):
@@ -233,6 +290,8 @@ def convert(session_path: str, fps: float, scale: float, out_path: str,
                     fill = prev_frame.copy()
                     if show_ts:
                         draw_osd(fill, prev_ts, written + 1, total_idx)
+                    if blink_events:
+                        draw_blink_overlay(fill, prev_ts, blink_events)
                     for _ in range(n_extra):
                         writer.write(fill)
                         written    += 1
@@ -241,6 +300,8 @@ def convert(session_path: str, fps: float, scale: float, out_path: str,
             # ── OSD + write ───────────────────────────────────────────────────
             if show_ts:
                 draw_osd(img, timestamp, written + 1, total_idx)
+            if blink_events:
+                draw_blink_overlay(img, timestamp, blink_events)
 
             writer.write(img)
             written    += 1
@@ -289,6 +350,7 @@ def main() -> None:
         fill_gaps    = not args.no_fill_gaps,
         skip_crc     = args.skip_crc,
         codec        = args.codec,
+        show_blinks  = not args.no_blinks,
     )
 
 
