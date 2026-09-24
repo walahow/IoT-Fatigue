@@ -72,7 +72,11 @@ def write_model(path, w, b, threshold):
 def write_header(path, w, b, threshold, provenance):
     """The same float32 values as write_model, as C source for main.cpp.
     %.9g round-trips a float32 exactly, so device and replay use identical numbers."""
-    f = lambda v: "%.9gf" % np.float32(v)
+    def f(v):
+        s = "%.9g" % np.float32(v)
+        if not any(c in s for c in ".eE"):
+            s += ".0"   # "0" -> "0.0f": a bare "0f" isn't a valid C++ float literal
+        return s + "f"
     body = ",\n".join("    " + ", ".join(f(v) for v in w[i:i + 6]) for i in range(0, len(w), 6))
     with open(path, "w", newline="\n") as out:
         out.write(
@@ -122,16 +126,29 @@ def main():
 
     rows = list(csv.DictReader(open(os.path.join(s, "blink_labels.csv"))))
     idx_of = {int(r["timestamp_ms"]): int(r["frame_idx"]) for r in rows}
-    state = np.array([r["state"] for r in rows])
+    # Indexed by frame_idx (not row position): session_101's labels covered
+    # every frame contiguously from 0, so row position happened to equal
+    # frame_idx there. session_119's windowed labels don't, so state must be
+    # addressable by the same frame_idx used everywhere below (fidx, closed,
+    # score_events's ev_idx) or lookups land on the wrong frame or go OOB.
+    state = np.full(max(int(r["frame_idx"]) for r in rows) + 1, "", dtype="<U10")
+    for r in rows:
+        state[int(r["frame_idx"])] = r["state"]
 
     dump = os.path.join(work, "hog_features.bin")
     jitter_flags = [f"--hog-jitter={args.jitter_n},{args.jitter_px}"] if args.jitter_n else []
     replay(s, work, "--hog-dump=" + dump, *jitter_flags)
     rec = np.fromfile(dump, dtype=[("ts", "<u4"), ("mean", "<f4"), ("f", "<f4", (HOG_LEN,))])
+    # session_replay dumps every frame after the eye lock, but blink_labels.csv
+    # may only cover representative windows rather than the whole session
+    # (session_119: 5 windows, ~9% of frames) -- keep only the dumped rows
+    # that actually have a hand label instead of assuming full contiguous
+    # coverage the way session_101's blink_labels.csv had it.
+    rec = rec[np.array([t in idx_of for t in rec["ts"]])]
     # --hog-jitter dumps 1+jitter_n records per frame, same timestamp each --
     # fidx (and everything derived from it below) just gets that many more
     # rows per label, all sharing one frame's ground truth.
-    fidx = np.array([idx_of[t] for t in rec["ts"]])      # frames after the eye lock
+    fidx = np.array([idx_of[t] for t in rec["ts"]])      # labelled frames only
     X, st = rec["f"], state[fidx]
     y = (st == "closed").astype(np.int32)
 
@@ -140,25 +157,44 @@ def main():
     blinks = np.split(closed, np.where(np.diff(closed) > 2)[0] + 1) if len(closed) else []
     near = np.array([len(closed) > 0 and np.abs(closed - i).min() <= TOL for i in fidx])
     usable = (st != "unsure") & ((st == "closed") | ~near)  # drop half-closed transition frames
+    # NOTE: excluding "squint" the same as "unsure", and auto-tuning the SVM's class
+    # weight from the actual pos/neg ratio, were both tried on session_119's full
+    # (17,100-frame) hand-labelled session to fix a badly miscalibrated classifier
+    # (non-monotonic recall/false-alarms across thresholds, ~2-4% precision). Neither
+    # helped there, and both made the small, curated 7-window result WORSE (69%/69%
+    # recall/precision fixed-weight-with-squint dropped to 44-52% precision with
+    # these changes) -- so both are reverted here. The full-session classifier
+    # appears to need a fundamentally different approach (nonlinear model, more
+    # features, per-lighting calibration), not a hyperparameter tweak.
     print(f"{len(set(fidx))} frames after eye lock ({len(rec)} training rows with "
           f"{args.jitter_n}x{args.jitter_px}px jitter), {len(blinks)} labelled blinks, "
           f"{(st == 'unsure').sum()} unsure rows excluded")
 
     thresholds = [0.0, 0.25, 0.5, 0.75]
     tally = {t: [0, 0, 0] for t in thresholds}
-    for te in np.array_split(np.arange(len(rec)), FOLDS):
+    for fold_i, te in enumerate(np.array_split(np.arange(len(rec)), FOLDS)):
         lo, hi = fidx[te[0]], fidx[te[-1]]
         tr = np.where(usable & ((fidx < lo - 5) | (fidx > hi + 5)))[0]
+        n_pos = int(y[tr].sum())
         w, b = train_svm(X[tr], y[tr])
         fold_blinks = [blk for blk in blinks if lo <= blk[0] <= hi]
+        print(f"  fold {fold_i}: frame_idx [{lo},{hi}], {len(tr)} train rows "
+              f"({n_pos} closed), {len(fold_blinks)} held-out blinks")
         for t in thresholds:
             model = os.path.join(work, "fold_model.bin")
             write_model(model, w, b, t)
             out = os.path.join(work, "fold_hog.csv")
             replay(s, work, "--hog-model=" + model, "--hog-csv=" + out)
-            ev = [idx_of[int(r["timestamp_ms"])] for r in csv.DictReader(open(out)) if r["blink"] == "1"]
+            # This replays the WHOLE session, so most detected events fall
+            # outside our labelled windows and have no ground truth -- only
+            # score events landing on a labelled frame (see the same
+            # windowed-labels note above idx_of's first use).
+            ev = [idx_of[int(r["timestamp_ms"])] for r in csv.DictReader(open(out))
+                  if r["blink"] == "1" and int(r["timestamp_ms"]) in idx_of]
             ev = [e for e in ev if lo <= e <= hi]
-            for k, v in enumerate(score_events(ev, state, fold_blinks)):
+            tp, fp, un = score_events(ev, state, fold_blinks)
+            print(f"    threshold {t:+.2f}: {tp}/{len(fold_blinks)} caught, {fp} false alarms")
+            for k, v in enumerate((tp, fp, un)):
                 tally[t][k] += v
 
     print("\nCross-validated through session_replay (firmware scoring + blink counting):")
