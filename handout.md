@@ -23,13 +23,11 @@ I'd stand behind.
 What I did **not** verify, and neither did anyone else as far as the repo
 shows:
 
-- **The actual embedded firmware build.** Every host-side test I ran
-  compiles `EyeBlinkEAR.h` in isolation with plain `g++` — that is not the
-  same as building `main.cpp` against the real Arduino/ESP32 framework.
-  I never ran `pio run` for `esp32s3cam` or `esp32s3cam_sd` (no PlatformIO
-  in the environment I had). `PhonePreview.h`, `phone_page.h`, the Wi-Fi/
-  HTTP server code — none of that got compiled by me. **Run `pio run` for
-  both environments before flashing anything.**
+- **Firmware envs other than `esp32s3cam_sd`.** `esp32s3cam_sd` is verified
+  (see the 2026-09-24 update below), but the USB-tethered `esp32s3cam` env
+  and the rest in `platformio.ini` were never built by me. The host-side
+  tests I ran compile `EyeBlinkEAR.h` alone with plain `g++`, which is not
+  the same thing as building `main.cpp` against the Arduino/ESP32 framework.
 - **The phone-arming-preview hardware bench test.** It was already pending
   before this merge — frame rate with the arming page open, pulse-sensor
   noise with Wi-Fi on/off, how long start/stop blocks the main loop, memory
@@ -45,6 +43,34 @@ shows:
   uncommitted and matches the labelling schema already in use — I read it
   fully but never ran it myself this session. Should work; hasn't been
   exercised by me.
+
+### Update 2026-09-24: recording firmware built, flashed, and booted
+
+`pio run -e esp32s3cam_sd` succeeded from clean `main` (`8f5ce2eb`; flash
+30.4%, RAM 27.5%), so the real embedded compile — `main.cpp` plus the phone
+preview — is now confirmed. It was flashed to the board (COM3, Espressif
+VID 303A:1001, hash verified) using the `HELMET_AP_PASS` already set on this
+machine, and the boot log shows:
+
+- camera, PSRAM, pulse sensor, MPU-6050 (calibrated) all initialised OK
+- **SD card mounted OK** — 30436 MB total, 28865 MB free
+- state `IDLE`, waiting for a GPIO 21 press to arm (not recording)
+- phone preview up per the firmware's own log (Wi-Fi `HELMET-A974`,
+  `http://192.168.4.1`) — not yet confirmed from an actual phone
+- HOG blink events firing (scores ~0.5–1.8) and "Eye check PASSED -- 3 blinks
+  in 9 s after lock" on the reseated camera position. That's a smoke test that
+  the pipeline runs there, not a measure of accuracy.
+
+Still not exercised: an actual arm → record → stop cycle onto the SD card with
+this build, the native tests, and the phone-preview bench measurements below.
+
+**Gotcha:** the eye coordinate is stored in the board's flash (NVS) and
+survives reflashing — it was `cx=199 cy=121` when I checked. After reseating
+the camera that may be stale. `armingBegin()` drops the lock and re-applies the
+stored coordinate, so a wrong stored spot means a wrong box for the whole
+recording. Before riding, open the phone page with the helmet on, confirm the
+eye box sits on the eye, and re-tap it if not (`ROI:auto` over serial clears
+the stored value).
 
 ## What's in this branch
 
@@ -101,7 +127,10 @@ copying the SD card's contents / the `sessions/<name>/` folder directly.
 
 1. **Record.** `esp32s3cam_sd` build, GPIO 21 to arm/start, 15-20 min is
    plenty (session_101's whole training set was 9.4 min / 70 blinks).
-   Firmware/Python setup details are in `fatigue-helmet/README.md`.
+   Firmware/Python setup details are in `fatigue-helmet/README.md`. Check the
+   stored eye box on the phone page first (see the gotcha above), and put a
+   finger on the pulse sensor while arming — with no pulse it waits the full
+   60 s, then records anyway with `armed_hr=0` in `metadata.txt`.
 2. **Unpack.** `python unpack_session.py <session dir>` to get `frames/`.
 3. **Test the current model cold, before labelling anything.** Build the
    replay tool once (`g++ -O2 -std=gnu++14 -o session_replay.exe
