@@ -41,6 +41,14 @@ FOLDS = 5
 
 
 def replay(session, out_dir, *flags):
+    # If make_roi_track.py has measured where the eye sits in this session, crop there instead of at the
+    # replay tool's own lock: that lock lands 40-60 px off the eye and differently in every session, which
+    # makes the HOG training crops incomparable across sessions. --roi pins the lock to frame 0 so every
+    # frame is scored; --roi-track then steers the HOG crop through the session.
+    track = os.path.join(session, "roi_track.csv")
+    if os.path.exists(track):
+        first = open(track).readline().split(",")
+        flags = (f"--roi={int(float(first[1]))},{int(float(first[2]))}", "--roi-track=" + track, *flags)
     cmd = [REPLAY, os.path.join(session, "frames"), os.path.join(out_dir, "replay.csv"), *flags]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
@@ -170,7 +178,7 @@ def main():
           f"{args.jitter_n}x{args.jitter_px}px jitter), {len(blinks)} labelled blinks, "
           f"{(st == 'unsure').sum()} unsure rows excluded")
 
-    thresholds = [0.0, 0.25, 0.5, 0.75]
+    thresholds = [0.0, 0.25, 0.5, 0.75, 1.0]
     tally = {t: [0, 0, 0] for t in thresholds}
     for fold_i, te in enumerate(np.array_split(np.arange(len(rec)), FOLDS)):
         lo, hi = fidx[te[0]], fidx[te[-1]]

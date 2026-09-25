@@ -25,6 +25,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <array>
 #include <vector>
 #if defined(_WIN32)
 #include <windows.h>
@@ -160,6 +161,12 @@ int main(int argc, char **argv) {
   int  skipFrames = 0;   // drop this many leading frames
   bool manualRoi = false;
   int  manualCx = 0, manualCy = 0;
+  // --roi-track=file.csv ("timestamp_ms,cx,cy" rows, eye centre measured per
+  // time window): the HOG crop follows the eye through the session instead of
+  // staying on the boot lock. Training-time alignment only -- the firmware
+  // keeps its own ROI (stored/lock + drift correction). Linear interpolation
+  // between rows; before the first / after the last row the end value holds.
+  std::vector<std::array<float, 3>> roiTrack;
   const char *hogDumpPath = nullptr, *hogModelPath = nullptr, *hogCsvPath = nullptr;
   int jitterN = 0, jitterPx = 0;   // --hog-jitter=N,J -- see the hog-dump block below
   for (int i = 3; i < argc; i++) {
@@ -181,6 +188,17 @@ int main(int argc, char **argv) {
       // EAR_ROI_MANUAL_X/Y build flags, and lets the blink algorithm be
       // tested independently of whether the locator found the eye.
       if (sscanf(argv[i] + 6, "%d,%d", &manualCx, &manualCy) == 2) manualRoi = true;
+    }
+    else if (strncmp(argv[i], "--roi-track=", 12) == 0) {
+      FILE *tf = fopen(argv[i] + 12, "r");
+      if (!tf) { fprintf(stderr, "ERROR: cannot open %s\n", argv[i] + 12); return 1; }
+      char tl[128];
+      while (fgets(tl, sizeof tl, tf)) {
+        unsigned long tts; float tx, ty;
+        if (sscanf(tl, "%lu,%f,%f", &tts, &tx, &ty) == 3) roiTrack.push_back({(float)tts, tx, ty});
+      }
+      fclose(tf);
+      if (roiTrack.empty()) { fprintf(stderr, "ERROR: no rows in %s\n", argv[i] + 12); return 1; }
     }
     // HOG classifier. --hog-dump writes, per locked frame, a record of
     // {uint32 timestamp_ms, float frame_mean, float features[HOG_LEN]} for
@@ -510,8 +528,22 @@ int main(int argc, char **argv) {
 
       // HOG classifier -- the calls main.cpp will make, fed the same crop.
       if (hogDump || hogCsv) {
+        EyeBlinkEAR::RoiLock hroi = roi;
+        if (!roiTrack.empty()) {
+          float tx = roiTrack.back()[1], ty = roiTrack.back()[2];
+          if ((float)f.timestampMs <= roiTrack.front()[0]) { tx = roiTrack.front()[1]; ty = roiTrack.front()[2]; }
+          else for (size_t k = 1; k < roiTrack.size(); k++) if ((float)f.timestampMs <= roiTrack[k][0]) {
+            float a = (roiTrack[k][0] - roiTrack[k - 1][0]);
+            float u = a > 0 ? ((float)f.timestampMs - roiTrack[k - 1][0]) / a : 1.0f;
+            tx = roiTrack[k - 1][1] + u * (roiTrack[k][1] - roiTrack[k - 1][1]);
+            ty = roiTrack[k - 1][2] + u * (roiTrack[k][2] - roiTrack[k - 1][2]);
+            break;
+          }
+          hroi.x = (int)(tx + 0.5f) - hroi.size / 2;   // crop is centred on roi.x + size/2
+          hroi.y = (int)(ty + 0.5f) - hroi.size / 2;
+        }
         int cx, cy, cw, ch;
-        EyeBlinkEAR::hogCropRect(roi, cx, cy, cw, ch);
+        EyeBlinkEAR::hogCropRect(hroi, cx, cy, cw, ch);
         earExtractGray(rgb, w, h, cx, cy, cw, ch, earGrayBuf);
         uint8_t small[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];
         float feat[EyeBlinkEAR::HOG_LEN];
@@ -534,7 +566,7 @@ int main(int argc, char **argv) {
           std::mt19937 jrng((uint32_t)f.timestampMs * 2654435761u + (uint32_t)jitterPx);
           std::uniform_int_distribution<int> jdist(-jitterPx, jitterPx);
           for (int j = 0; j < jitterN; j++) {
-            EyeBlinkEAR::RoiLock roiJ = roi;
+            EyeBlinkEAR::RoiLock roiJ = hroi;
             roiJ.x += jdist(jrng);
             roiJ.y += jdist(jrng);
             if (roiJ.x + roiJ.size > w) roiJ.x = w - roiJ.size;

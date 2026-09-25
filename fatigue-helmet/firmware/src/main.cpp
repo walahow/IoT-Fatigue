@@ -89,10 +89,11 @@
 #error "PHONE_PREVIEW is for the SD build: it reports the arming state that only exists there"
 #endif
 #include "PhonePreview.h"
-// Wi-Fi stays up this long into RECORDING so the page can show that recording
-// started, then goes off for the ride (spec: "Wi-Fi lifecycle"). Declared
+// Wi-Fi and the web server go off this long after RECORDING starts (just long
+// enough for the page's next poll to show that recording began), so the radio
+// and httpd stay out of the ride entirely (spec: "Wi-Fi lifecycle"). Declared
 // here, not in the phoneTick block below, so openSession() can also see it.
-static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 15000;
+static const uint32_t PHONE_WIFI_OFF_AFTER_MS = 3000;
 #endif
 
 // ── Camera Pins (Freenove ESP32-S3-WROOM CAM) ───────────────────────────
