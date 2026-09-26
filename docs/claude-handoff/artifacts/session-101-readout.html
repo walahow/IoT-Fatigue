@@ -1,0 +1,455 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+<title>Session 101 Readout</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+
+<style>
+:root{
+  color-scheme: light;
+  --ground:    #eef1f6;
+  --surface:   #ffffff;
+  --surface-2: #f6f8fb;
+  --ink:       #111820;
+  --ink-2:     #58626f;
+  --ink-3:     #8b95a3;
+  --rule:      #d7dde6;
+  --rule-soft: #e7ecf2;
+  --grid:      #e3e9f0;
+  --s-hr:      #2a78d6;
+  --s-pitch:   #eb6834;
+  --s-move:    #1baf7a;
+  --s-dead:    #8b95a3;
+  --band:      #2a78d614;
+  --chip-bg:   #fdf0e9;
+  --chip-ink:  #a13d13;
+  --ok-bg:     #e8f3ec;
+  --ok-ink:    #1c6b45;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --ground:    #0d1116;
+    --surface:   #171d24;
+    --surface-2: #1e252d;
+    --ink:       #eef2f7;
+    --ink-2:     #9aa5b3;
+    --ink-3:     #6b7684;
+    --rule:      #2b333d;
+    --rule-soft: #232a33;
+    --grid:      #232b34;
+    --s-hr:      #3987e5;
+    --s-pitch:   #d95926;
+    --s-move:    #199e70;
+    --s-dead:    #6b7684;
+    --band:      #3987e51f;
+    --chip-bg:   #2e1c13;
+    --chip-ink:  #f0996f;
+    --ok-bg:     #12291d;
+    --ok-ink:    #6cc596;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --ground:    #0d1116;
+  --surface:   #171d24;
+  --surface-2: #1e252d;
+  --ink:       #eef2f7;
+  --ink-2:     #9aa5b3;
+  --ink-3:     #6b7684;
+  --rule:      #2b333d;
+  --rule-soft: #232a33;
+  --grid:      #232b34;
+  --s-hr:      #3987e5;
+  --s-pitch:   #d95926;
+  --s-move:    #199e70;
+  --s-dead:    #6b7684;
+  --band:      #3987e51f;
+  --chip-bg:   #2e1c13;
+  --chip-ink:  #f0996f;
+  --ok-bg:     #12291d;
+  --ok-ink:    #6cc596;
+}
+
+*{ box-sizing: border-box; }
+body{
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap{
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 40px 22px 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.eyebrow{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11.5px; font-weight: 500; letter-spacing: .13em;
+  text-transform: uppercase; color: var(--ink-3); margin: 0 0 10px;
+}
+h1{
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700; font-size: clamp(30px, 5vw, 42px);
+  line-height: 1.05; letter-spacing: -.022em; margin: 0; text-wrap: balance;
+}
+.standfirst{ margin: 14px 0 0; max-width: 66ch; font-size: 16.5px; color: var(--ink-2); }
+
+/* capture parameters, instrument-style */
+.params{
+  display: flex; flex-wrap: wrap;
+  border: 1px solid var(--rule); border-radius: 3px;
+  background: var(--surface); overflow: hidden;
+}
+.param{ flex: 1 1 auto; min-width: 116px; padding: 10px 14px; border-right: 1px solid var(--rule-soft); }
+.param:last-child{ border-right: 0; }
+.param dt{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+  color: var(--ink-3); margin: 0 0 3px;
+}
+.param dd{
+  margin: 0; font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 14px; font-weight: 500; font-variant-numeric: tabular-nums; color: var(--ink);
+}
+
+.finding{
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 3px; padding: 20px 22px;
+}
+.finding h2{
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-size: 20px; font-weight: 600; letter-spacing: -.012em;
+  margin: 10px 0 8px; text-wrap: balance;
+}
+.finding p{ margin: 0 0 10px; max-width: 70ch; color: var(--ink-2); }
+.finding p:last-child{ margin-bottom: 0; }
+.finding b{ color: var(--ink); font-weight: 500; }
+.chip{
+  display: inline-block; font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase;
+  padding: 4px 10px; border-radius: 2px; background: var(--chip-bg); color: var(--chip-ink);
+}
+.chip.ok{ background: var(--ok-bg); color: var(--ok-ink); }
+
+.panel{
+  background: var(--surface); border: 1px solid var(--rule);
+  border-radius: 3px; padding: 18px 20px 14px;
+}
+.panel h3{
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px; font-weight: 600; margin: 0 0 2px;
+}
+.panel-note{ font-size: 13px; color: var(--ink-2); margin: 2px 0 10px; max-width: 74ch; }
+
+/* cursor readout */
+.readout{
+  display: flex; flex-wrap: wrap;
+  border: 1px solid var(--rule-soft); border-radius: 2px;
+  background: var(--surface-2); margin: 0 0 12px;
+}
+.readout div{
+  padding: 7px 13px; border-right: 1px solid var(--rule-soft);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px; font-variant-numeric: tabular-nums; color: var(--ink-2);
+}
+.readout div:last-child{ border-right: 0; }
+.readout b{ color: var(--ink); font-weight: 600; }
+.readout .lbl{
+  color: var(--ink-3); font-size: 10px; letter-spacing: .1em;
+  text-transform: uppercase; margin-right: 7px;
+}
+
+.chart-scroll{ overflow-x: auto; }
+svg.chart{ display: block; width: 100%; height: auto; min-width: 620px; touch-action: none; }
+
+details{ border-top: 1px solid var(--rule-soft); margin-top: 10px; padding-top: 10px; }
+summary{
+  cursor: pointer; font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--ink-3);
+}
+summary:focus-visible{ outline: 2px solid var(--s-hr); outline-offset: 2px; }
+.tablewrap{ overflow-x: auto; max-height: 320px; overflow-y: auto; margin-top: 10px; }
+table{
+  width: 100%; border-collapse: collapse;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px; font-variant-numeric: tabular-nums;
+}
+th, td{ text-align: right; padding: 5px 10px; border-bottom: 1px solid var(--rule-soft); white-space: nowrap; }
+th:first-child, td:first-child{ text-align: left; }
+thead th{
+  position: sticky; top: 0; background: var(--surface);
+  font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
+  color: var(--ink-3); font-weight: 500; border-bottom: 1px solid var(--rule);
+}
+
+.closing{ border-top: 1px solid var(--rule); padding-top: 22px; display: grid; grid-template-columns: 1fr 1fr; gap: 26px; }
+@media (max-width: 720px){ .closing{ grid-template-columns: 1fr; } }
+.closing h4{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10.5px; letter-spacing: .11em; text-transform: uppercase;
+  color: var(--ink-3); margin: 0 0 8px; font-weight: 500;
+}
+.closing ul{ margin: 0; padding-left: 17px; color: var(--ink-2); font-size: 14px; }
+.closing li{ margin-bottom: 6px; }
+.closing li b{ color: var(--ink); font-weight: 500; }
+
+@media (prefers-reduced-motion: reduce){ *{ animation: none !important; transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Helmet session · 9 Sep 2026 · 552 rows at 1 Hz</p>
+    <h1>Session 101 Readout</h1>
+    <p class="standfirst">Nine and a half minutes of continuous sensor data. Heart rate fell steadily
+      while head movement rose — two channels telling opposite stories. A third channel recorded
+      nothing usable, and it is quietly driving the fatigue score.</p>
+  </header>
+
+  <dl class="params" id="params"></dl>
+
+  <section class="finding">
+    <span class="chip ok">Heart rate · 100% contact</span>
+    <h2>Heart rate fell 14.3 bpm across the session.</h2>
+    <p>Contact held on <b>all 552 rows</b> — the first session with no dropouts. Rate climbs for
+      three minutes, then declines steadily from <b>93 to 76 bpm</b>, a least-squares trend of
+      <b>−1.59 bpm per minute</b>. Beat-to-beat variation averages 3.2 bpm, so this is a smooth
+      signal rather than noise.</p>
+    <p>Read it carefully, though: settling after sitting down looks the same as early drowsiness
+      over nine minutes, and <b>head movement rose 44% over the same period</b> — the opposite of
+      what drowsiness predicts. With no KSS label on this session there is nothing to resolve it
+      against.</p>
+  </section>
+
+  <section class="panel">
+    <h3>Four channels, one timeline</h3>
+    <p class="panel-note">Each channel keeps its own scale — heart rate in bpm, pitch in degrees and
+      head movement in its own magnitude units cannot share an axis. Hover anywhere to read all four
+      at that instant.</p>
+    <div class="readout" id="readout"></div>
+    <div class="chart-scroll">
+      <svg class="chart" id="chart" viewBox="0 0 980 566" role="img"
+        aria-label="Four sensor channels over 9.4 minutes: heart rate declining from 93 to 76 bpm, pitch roughly flat near 7 degrees, head movement rising in the final third, and blink rate flat at zero throughout."></svg>
+    </div>
+    <details>
+      <summary>Show the numbers (per-minute means)</summary>
+      <div class="tablewrap"><table id="tbl"></table></div>
+    </details>
+  </section>
+
+  <section class="finding">
+    <span class="chip">Fatigue score · discard</span>
+    <h2>The 44% CRITICAL reading is measuring a sensor fault.</h2>
+    <p>The fuzzy model takes blink rate as an input. This session's blink channel sat at
+      <b>0.00 for 83% of rows</b> and never exceeded 1/min, because the corneal glint the detector
+      depends on was absent in <b>97.8% of frames</b> — the eye was not lit brightly enough to throw
+      a reflection.</p>
+    <p>A rate near zero reads to the model as "almost never blinking", which is a strong drowsiness
+      cue. Rows scoring at or above 70% risk carry a mean blink rate of <b>0.11</b>. So
+      <b>risk_pct and alert_level describe the dead channel, not the rider</b>, and should be
+      dropped from this session rather than merely discounted.</p>
+  </section>
+
+  <section class="closing">
+    <div>
+      <h4>Usable from this session</h4>
+      <ul>
+        <li><b>Heart rate</b> — 552 clean rows, a real trend, the strongest data the rig has produced.</li>
+        <li><b>IMU</b> — pitch, movement, gyro variance and nod score all recorded plausibly.</li>
+        <li><b>Arming gate</b> — all three subsystems ready in 20.1 s, no timeout.</li>
+      </ul>
+    </div>
+    <div>
+      <h4>Before the next one</h4>
+      <ul>
+        <li><b>Light the eye.</b> An IR LED gives a stable glint independent of ambient light.</li>
+        <li><b>Add the KSS label.</b> Unlabelled, this cannot enter training.</li>
+        <li><b>Settle the sample rate.</b> 1 Hz here; the format assumes 100 Hz, and HRV needs beat-level timing.</li>
+      </ul>
+    </div>
+  </section>
+
+</div>
+
+<script>
+const D = {"t":[0.0,1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0,9.0,10.0,11.0,12.0,13.0,14.0,15.0,16.0,17.0,18.0,19.0,20.0,21.0,22.0,23.0,24.0,25.0,26.0,27.0,28.0,29.0,30.0,31.0,32.0,33.0,34.0,35.0,36.0,37.0,38.0,39.0,40.0,41.0,42.0,43.0,44.0,45.0,46.0,47.0,48.0,49.0,50.0,51.0,52.0,53.0,54.0,55.0,56.0,57.0,58.0,59.0,60.0,61.0,62.0,63.0,64.0,65.0,66.0,67.0,68.0,69.0,70.0,71.0,72.0,73.0,74.0,75.0,76.0,77.0,78.0,79.0,80.0,81.0,82.0,83.0,84.0,85.0,86.0,87.0,88.0,89.0,90.0,91.0,92.0,93.0,94.0,95.0,96.0,97.0,98.0,99.0,100.0,101.0,102.0,103.0,106.0,107.0,108.0,109.0,110.0,111.0,112.0,113.0,116.0,117.0,118.0,119.0,120.0,121.0,122.0,123.0,124.0,125.0,126.0,127.0,128.0,129.0,130.0,131.0,132.0,133.0,134.0,135.0,136.0,137.0,138.0,139.0,140.0,141.0,142.0,143.0,144.0,145.0,146.0,147.0,148.0,149.0,150.0,151.0,152.0,153.0,154.0,155.0,156.0,157.0,158.0,159.0,160.0,161.0,162.0,163.0,164.0,165.0,166.0,167.0,168.0,169.0,170.0,171.0,172.0,173.0,174.0,175.0,176.0,177.0,178.0,179.0,180.0,181.0,182.0,183.0,184.0,185.0,186.0,187.0,188.0,189.0,190.0,191.0,192.0,193.0,194.0,195.0,196.0,197.0,198.0,199.0,200.0,201.0,202.0,203.0,204.0,205.0,206.0,207.0,208.0,209.0,210.0,211.0,212.0,213.0,214.0,215.0,216.0,217.0,218.0,219.0,220.0,221.0,222.0,223.0,224.0,225.0,226.0,227.0,228.0,229.0,230.0,231.0,232.0,233.0,234.0,235.0,236.0,237.0,238.0,239.0,240.0,241.0,242.0,243.0,244.0,245.0,246.0,247.0,248.0,249.0,250.0,251.0,252.0,253.0,254.0,255.0,256.0,257.0,258.0,259.0,260.0,261.0,262.0,263.0,264.0,265.0,266.0,267.0,268.0,269.0,270.0,271.0,272.0,273.0,274.0,275.0,276.0,277.0,278.0,279.0,280.0,281.0,282.0,283.0,284.0,286.0,288.0,289.0,290.0,291.0,292.0,293.0,294.0,296.0,297.0,298.0,299.0,300.0,301.0,302.0,303.0,304.0,305.0,306.0,307.0,308.0,309.0,310.0,311.0,312.0,313.0,314.0,315.0,316.0,317.0,318.0,319.0,320.0,321.0,322.0,323.0,324.0,325.0,326.0,327.0,328.0,329.0,330.0,331.0,332.0,333.0,334.0,335.0,336.0,337.0,338.0,339.0,340.0,341.0,342.0,343.0,344.0,345.0,346.0,347.0,348.0,349.0,350.0,351.0,352.0,353.0,354.0,355.0,356.0,357.0,358.0,359.0,360.0,361.0,362.0,363.0,364.0,365.0,366.0,367.0,368.0,369.0,370.0,371.0,372.0,374.0,375.0,376.0,377.0,378.0,379.0,380.0,381.0,382.0,383.0,384.0,385.0,391.0,392.0,393.0,394.0,395.0,396.0,397.0,398.0,399.0,400.0,401.0,402.0,403.0,404.0,405.0,406.0,407.0,408.0,409.0,410.0,411.0,412.0,413.0,414.0,415.0,416.0,417.0,418.0,419.0,420.0,421.0,422.0,423.0,424.0,425.0,426.0,427.0,428.0,429.0,430.0,431.0,432.0,433.0,434.0,435.0,436.0,437.0,438.0,439.0,440.0,441.0,442.0,443.0,445.0,446.0,447.0,448.0,449.0,450.0,451.0,452.0,453.0,454.0,455.0,456.0,457.0,458.0,459.0,460.0,461.0,462.0,463.0,464.0,465.0,466.0,467.0,468.0,469.0,470.0,471.0,472.0,473.0,474.0,475.0,476.0,477.0,478.0,479.0,480.0,481.0,482.0,483.0,484.0,485.0,486.0,487.0,488.0,489.0,490.0,491.0,492.0,493.0,494.0,495.0,496.0,497.0,498.0,499.0,500.0,501.0,502.0,503.0,504.0,505.0,507.0,508.0,509.0,510.0,511.0,512.0,513.0,514.0,515.0,516.0,517.0,518.0,519.0,520.0,521.0,522.0,523.0,524.0,525.0,526.0,527.0,528.0,529.0,530.0,531.0,532.0,533.0,534.0,535.0,536.0,537.0,538.0,539.0,540.0,541.0,542.0,543.0,544.0,545.0,546.0,547.0,548.0,549.0,550.0,551.0,552.0,553.0,554.0,555.0,556.0,557.0,558.0,559.0,560.0,561.0,562.0,563.0,564.0,565.0,566.0],"hr":[85.0,74.0,72.0,72.0,72.0,72.0,72.0,83.0,82.0,83.0,82.0,83.0,81.0,80.0,81.0,81.0,85.0,83.0,84.0,84.0,87.0,85.0,84.0,90.0,92.0,93.0,89.0,89.0,82.0,81.0,76.0,83.0,83.0,94.0,92.0,84.0,84.0,82.0,81.0,81.0,80.0,87.0,91.0,88.0,91.0,93.0,100.0,101.0,104.0,99.0,99.0,95.0,96.0,97.0,98.0,102.0,102.0,97.0,93.0,91.0,92.0,91.0,96.0,93.0,96.0,96.0,92.0,88.0,94.0,87.0,87.0,91.0,96.0,99.0,104.0,103.0,99.0,87.0,86.0,86.0,80.0,79.0,91.0,90.0,90.0,99.0,100.0,93.0,92.0,90.0,90.0,89.0,95.0,93.0,97.0,96.0,97.0,95.0,95.0,94.0,96.0,100.0,100.0,101.0,92.0,87.0,84.0,87.0,89.0,86.0,88.0,85.0,89.0,87.0,95.0,90.0,89.0,88.0,90.0,82.0,80.0,78.0,75.0,77.0,79.0,89.0,94.0,96.0,99.0,95.0,91.0,94.0,95.0,93.0,96.0,99.0,99.0,95.0,98.0,99.0,102.0,106.0,108.0,105.0,100.0,98.0,98.0,99.0,99.0,104.0,101.0,97.0,101.0,98.0,96.0,94.0,96.0,93.0,89.0,86.0,86.0,79.0,78.0,79.0,83.0,84.0,96.0,101.0,100.0,101.0,99.0,94.0,93.0,93.0,86.0,84.0,86.0,87.0,79.0,87.0,88.0,84.0,82.0,89.0,92.0,93.0,94.0,96.0,91.0,90.0,89.0,95.0,95.0,99.0,95.0,96.0,99.0,89.0,91.0,93.0,91.0,82.0,89.0,85.0,84.0,86.0,85.0,85.0,85.0,85.0,84.0,76.0,77.0,80.0,80.0,78.0,78.0,85.0,83.0,82.0,81.0,82.0,85.0,85.0,86.0,87.0,87.0,91.0,93.0,93.0,95.0,95.0,94.0,89.0,94.0,89.0,83.0,80.0,76.0,80.0,80.0,77.0,84.0,90.0,89.0,80.0,83.0,81.0,80.0,75.0,73.0,80.0,80.0,83.0,88.0,96.0,96.0,83.0,82.0,82.0,78.0,73.0,71.0,78.0,79.0,84.0,80.0,83.0,87.0,87.0,80.0,82.0,85.0,82.0,81.0,93.0,93.0,87.0,92.0,97.0,95.0,91.0,80.0,80.0,86.0,88.0,99.0,98.0,96.0,89.0,87.0,87.0,86.0,84.0,86.0,85.0,89.0,78.0,80.0,80.0,83.0,80.0,80.0,81.0,82.0,78.0,76.0,74.0,86.0,85.0,79.0,77.0,79.0,80.0,77.0,74.0,73.0,80.0,77.0,85.0,81.0,85.0,84.0,85.0,86.0,81.0,88.0,85.0,85.0,77.0,75.0,76.0,75.0,82.0,87.0,84.0,87.0,87.0,87.0,85.0,92.0,92.0,93.0,93.0,89.0,87.0,86.0,86.0,85.0,84.0,92.0,96.0,95.0,89.0,91.0,89.0,89.0,79.0,74.0,79.0,73.0,71.0,69.0,68.0,70.0,76.0,86.0,95.0,97.0,94.0,92.0,94.0,87.0,86.0,88.0,96.0,93.0,101.0,92.0,90.0,88.0,91.0,89.0,88.0,88.0,87.0,86.0,91.0,93.0,95.0,94.0,97.0,95.0,92.0,93.0,93.0,90.0,86.0,85.0,87.0,94.0,94.0,97.0,97.0,94.0,86.0,86.0,89.0,93.0,104.0,94.0,91.0,90.0,83.0,80.0,76.0,75.0,76.0,76.0,76.0,78.0,80.0,85.0,85.0,87.0,91.0,88.0,87.0,85.0,86.0,82.0,83.0,83.0,81.0,82.0,81.0,81.0,81.0,80.0,73.0,68.0,72.0,70.0,71.0,68.0,66.0,81.0,76.0,73.0,73.0,66.0,64.0,63.0,62.0,62.0,63.0,75.0,79.0,85.0,83.0,85.0,84.0,87.0,80.0,75.0,75.0,74.0,69.0,70.0,63.0,64.0,74.0,78.0,86.0,94.0,94.0,91.0,88.0,84.0,84.0,85.0,87.0,89.0,88.0,82.0,83.0,83.0,72.0,68.0,68.0,74.0,75.0,77.0,74.0,70.0,71.0,67.0,67.0,74.0,76.0,80.0,76.0,78.0,77.0,77.0,63.0,67.0,67.0,57.0,58.0,59.0,60.0,70.0,70.0,85.0,87.0,88.0,88.0,77.0,77.0,76.0,77.0,75.0,74.0,88.0,93.0,91.0,95.0,93.0,93.0,92.0,90.0,83.0,78.0,72.0,72.0,72.0,66.0,75.0,74.0,74.0,71.0,67.0,77.0,73.0,71.0,73.0,77.0,75.0,71.0,71.0,60.0],"pitch":[5.01,7.56,4.52,1.85,0.85,1.6,1.52,0.43,0.88,3.67,3.19,3.28,3.39,4.48,4.5,5.12,4.75,2.06,3.45,5.45,4.97,23.76,35.91,31.67,28.8,28.28,22.83,8.29,4.91,4.9,16.16,4.29,4.1,5.33,7.93,7.05,8.05,8.43,7.74,4.11,1.63,8.09,6.63,9.7,6.33,5.18,6.57,8.7,7.55,2.63,9.38,6.77,8.51,7.12,5.65,6.39,5.11,2.36,1.93,8.08,6.71,8.16,1.71,2.7,6.62,13.06,10.17,15.25,8.59,6.28,0.92,13.56,12.03,17.46,3.73,10.17,7.39,17.53,6.17,18.42,8.49,13.76,12.39,8.78,8.03,14.31,2.72,7.6,10.55,9.83,6.71,4.95,8.86,7.34,5.01,6.75,8.53,4.7,6.19,8.1,8.5,8.8,8.39,9.23,6.12,8.34,6.33,6.74,4.31,4.84,10.37,9.0,7.36,11.28,4.49,12.57,3.29,1.55,7.04,2.55,9.2,10.04,10.64,12.75,2.07,5.95,3.9,7.49,5.75,8.02,7.48,11.15,5.51,6.55,4.88,8.14,6.33,4.51,5.58,6.36,5.18,4.66,4.8,4.55,1.83,5.41,6.08,5.47,3.78,4.51,6.41,5.94,6.41,11.18,10.81,10.3,5.77,12.5,8.26,4.34,8.15,10.46,9.69,4.84,3.11,2.96,9.39,9.99,9.07,8.97,9.0,8.34,4.74,4.31,6.19,3.94,1.92,7.24,9.91,7.58,10.6,4.87,7.68,5.21,2.46,8.0,5.32,8.47,9.33,6.79,9.79,9.9,8.79,10.01,5.93,7.33,7.56,2.73,3.8,6.28,6.97,10.03,6.66,3.3,6.53,13.07,6.68,6.89,8.35,7.44,5.54,7.29,6.25,6.03,7.14,4.33,3.08,12.26,15.42,11.3,8.63,6.89,6.33,8.31,7.97,10.49,9.45,7.88,5.26,8.7,2.05,10.85,6.12,11.87,22.37,10.62,12.14,9.3,8.03,14.83,10.11,17.48,11.3,13.18,12.51,12.67,15.79,14.69,8.79,5.04,14.65,8.42,7.62,6.99,7.19,8.02,7.49,11.04,14.17,8.66,10.39,5.64,9.47,9.09,7.03,3.96,10.43,6.43,8.65,2.67,7.76,21.02,9.85,3.52,10.88,12.03,11.75,7.01,12.78,12.78,10.84,7.54,4.51,5.81,4.89,3.99,4.93,8.62,9.0,7.9,4.02,4.8,6.76,5.21,14.21,7.97,8.66,10.59,5.33,9.72,4.74,6.38,7.88,7.08,8.35,11.42,16.83,6.1,7.79,4.98,6.76,9.82,5.99,5.25,3.39,7.17,5.77,4.26,6.65,6.13,8.25,8.74,3.12,3.78,3.83,13.56,16.67,6.84,9.24,8.43,5.98,7.8,7.63,11.48,5.65,7.27,4.83,7.81,5.79,6.8,5.34,13.81,5.3,15.29,7.79,2.75,5.72,5.58,5.62,10.7,10.34,15.72,11.1,8.77,8.99,4.73,4.5,3.27,4.1,2.2,2.67,0.61,1.67,7.94,7.33,4.4,7.2,4.0,1.84,5.64,7.02,2.52,7.55,3.26,7.64,5.56,5.1,6.59,7.75,5.6,7.37,4.47,7.6,6.21,5.23,4.16,8.02,10.25,28.72,24.11,9.11,2.33,13.69,11.36,11.37,9.58,11.2,8.24,10.87,1.16,8.61,8.26,5.52,7.31,9.16,6.27,10.14,5.8,20.05,41.46,9.46,8.13,17.65,6.97,16.47,10.16,12.94,13.47,6.87,13.96,12.05,8.73,12.78,8.15,11.99,6.54,7.29,4.99,8.58,4.4,4.91,3.49,7.04,7.42,6.26,7.99,7.48,14.56,6.3,11.78,7.19,12.06,6.47,5.68,5.73,6.69,2.11,2.63,3.2,8.97,6.14,11.45,8.79,5.15,5.82,2.73,6.18,9.6,17.98,6.19,6.22,7.91,5.18,5.02,14.48,13.51,19.92,7.4,7.77,10.9,15.97,4.94,13.81,8.57,10.38,4.81,6.86,7.44,2.37,3.32,6.36,4.61,4.64,9.05,5.37,6.34,3.05,4.84,1.67,4.76,10.85,6.49,6.07,5.55,13.26,11.66,7.47,22.37,10.53,17.83,2.62,12.4,1.81,5.06,3.64,11.66,14.25,2.1,9.18,13.2,3.65,5.92,7.8,16.91,3.32,2.56,8.49,4.78,4.93,15.9,11.65,4.76,3.75,10.56,11.0,12.01,14.86,9.0,8.02,12.22,7.05,11.56,7.03,6.23,9.58,4.21,12.76,10.26,3.46,3.16,3.64,10.01,6.55,13.47,10.8,12.41,6.28,4.73,8.27,4.71,7.05,1.93],"mov":[9.2,4.85,9.14,6.96,3.66,5.73,0.48,2.81,2.01,6.47,4.75,1.25,0.6,1.13,2.56,8.83,19.22,24.29,11.87,19.46,1.78,89.46,9.84,8.79,0.48,7.39,16.42,11.89,12.02,31.1,18.88,16.22,13.28,4.07,17.32,14.69,17.92,6.05,8.9,5.7,9.04,20.78,10.26,1.91,10.57,26.82,21.62,13.11,12.43,12.9,11.87,18.81,13.41,2.66,9.01,19.57,14.57,16.35,13.84,17.06,14.17,11.83,11.5,18.13,24.05,11.35,7.54,0.94,19.7,12.71,3.41,55.69,9.24,12.12,11.98,6.54,14.67,7.35,18.01,12.47,9.25,15.78,19.07,7.19,23.25,12.68,75.65,53.26,10.08,9.95,15.47,46.96,17.14,9.06,7.17,8.27,15.14,8.25,9.75,12.9,8.39,11.11,15.31,9.8,6.6,3.03,3.85,0.87,10.58,7.04,3.8,7.06,23.3,46.37,20.61,12.34,5.58,11.58,53.31,11.58,24.57,9.83,12.15,20.5,30.44,21.93,17.39,18.85,19.34,9.26,10.58,10.53,35.81,5.15,2.74,9.82,13.46,8.98,7.54,12.51,18.03,3.14,7.47,11.68,13.47,21.71,8.48,34.47,9.46,7.29,8.05,10.18,12.46,8.49,5.28,72.22,52.93,70.34,66.18,15.57,31.16,10.57,2.85,13.31,22.33,7.35,6.97,13.53,7.66,9.39,16.0,6.53,8.41,8.51,9.61,7.09,10.62,9.01,5.66,9.24,8.75,11.93,12.08,9.42,7.3,6.29,4.68,5.41,21.97,10.52,23.39,5.99,8.63,15.15,24.48,26.22,3.57,11.34,11.16,17.93,17.59,12.98,19.92,9.37,22.92,10.49,15.58,7.87,7.92,6.63,45.14,24.05,7.29,9.77,9.37,3.73,18.82,15.4,19.47,20.98,11.39,18.47,6.89,13.4,13.05,6.14,10.88,3.19,11.71,21.6,20.35,23.87,36.04,18.14,13.24,20.08,11.21,11.67,25.14,16.1,15.1,14.82,10.82,6.19,5.94,4.67,11.92,3.72,11.26,7.18,8.32,17.89,10.76,2.71,9.51,12.26,7.75,8.31,14.25,13.93,3.7,2.8,5.14,11.09,4.08,13.85,20.65,11.48,8.46,5.73,3.79,19.91,21.74,33.52,18.12,10.3,13.31,19.64,10.05,39.78,17.99,25.66,5.87,10.03,8.35,5.74,11.06,12.39,15.46,8.57,4.88,7.39,6.52,9.32,13.09,13.93,5.79,10.47,9.86,12.23,4.83,12.11,49.15,7.97,11.01,36.26,89.19,3.57,16.55,6.19,12.87,19.47,10.38,2.85,6.96,15.57,14.26,5.6,8.37,11.84,15.05,11.72,52.57,14.9,16.83,32.52,30.99,15.27,15.06,4.46,14.08,16.84,8.85,16.08,7.77,14.53,6.24,8.87,14.03,14.53,13.4,26.55,23.06,39.59,24.25,19.63,6.14,7.06,9.69,27.22,16.33,27.29,9.73,11.37,4.63,7.32,14.52,12.88,8.5,10.43,6.07,22.87,15.91,20.85,30.56,28.6,5.05,21.53,54.64,8.39,9.25,10.92,10.38,3.92,11.53,5.61,18.36,9.65,10.81,7.1,10.89,32.93,69.4,5.61,6.14,16.46,4.93,14.65,107.37,63.93,43.56,14.34,17.67,8.61,26.46,8.63,14.45,12.03,14.35,5.87,37.84,6.67,8.63,31.91,11.01,10.43,11.23,64.65,27.94,138.5,21.63,14.3,14.53,13.32,8.6,7.41,5.23,5.37,14.11,6.0,8.91,11.93,12.04,12.7,12.48,1.15,5.3,10.02,12.09,17.14,12.54,25.29,6.2,12.69,3.0,12.42,8.68,27.38,10.26,16.44,15.97,6.08,10.59,12.07,4.53,76.39,50.9,7.5,8.64,5.18,13.46,4.72,10.81,24.55,14.62,38.6,10.61,7.75,47.26,10.39,27.23,16.74,4.45,15.49,11.6,32.81,211.47,34.84,40.53,21.79,12.25,20.92,16.44,5.76,13.37,10.03,8.02,5.25,6.48,5.38,30.01,5.88,18.97,15.21,12.23,13.31,11.0,10.88,18.32,13.97,32.25,2.01,2.37,9.18,5.38,14.18,16.46,23.22,6.62,24.03,8.12,5.03,4.06,23.73,38.43,21.03,13.0,7.11,19.61,24.41,29.84,54.99,22.17,14.1,55.78,68.67,83.2,11.22,30.41,13.35,22.85,11.74,6.55,7.99,122.87,18.48,29.78,28.46,11.76,31.66,45.43,15.36,7.63,16.99,23.88,9.13,4.26,25.91,32.74,13.28,9.44,27.01,13.06,67.72,32.37,56.47,32.35,19.11,6.05,11.2,15.48,7.02],"blink":[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0],"risk":[0.0,85.0,85.0,85.0,0.0,0.0,0.0,0.0,0.0,85.4,85.0,85.0,85.0,85.6,85.0,86.4,85.8,85.7,0.0,0.0,0.0,86.4,87.1,87.1,87.1,87.1,85.9,0.0,0.0,0.0,0.0,0.0,0.0,86.4,0.0,0.0,0.0,0.0,0.0,0.0,87.1,0.0,0.0,0.0,86.9,86.7,86.8,86.4,86.7,0.0,0.0,0.0,0.0,0.0,86.5,86.5,87.0,0.0,0.0,86.8,86.7,86.3,86.1,86.7,86.4,86.8,85.9,86.0,86.9,0.0,0.0,0.0,0.0,85.4,86.0,85.8,0.0,0.0,0.0,86.1,86.4,86.4,86.1,0.0,0.0,0.0,86.1,85.2,85.6,85.7,86.1,0.0,50.0,0.0,50.0,50.0,50.0,0.0,0.0,0.0,0.0,87.1,86.9,86.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,85.9,85.9,86.8,50.0,0.0,0.0,86.0,0.0,0.0,0.0,86.1,86.3,85.9,85.7,0.0,0.0,50.0,50.0,50.0,87.1,87.0,84.5,87.1,0.0,0.0,0.0,0.0,0.0,87.1,86.7,0.0,86.5,86.4,0.0,0.0,86.8,86.7,87.0,87.1,86.8,0.0,0.0,86.7,86.5,85.8,86.1,86.5,87.1,0.0,0.0,87.1,0.0,0.0,0.0,0.0,0.0,0.0,85.7,85.8,87.0,86.5,86.5,0.0,0.0,0.0,0.0,86.7,86.3,86.0,86.5,86.7,86.8,0.0,0.0,0.0,0.0,87.1,86.9,86.4,86.8,0.0,0.0,0.0,0.0,0.0,87.1,0.0,0.0,0.0,85.9,85.8,86.1,86.1,0.0,0.0,0.0,86.7,0.0,0.0,86.1,0.0,0.0,0.0,0.0,0.0,0.0,86.7,85.0,85.0,85.0,85.0,0.0,0.0,0.0,86.4,86.3,86.1,86.1,0.0,0.0,0.0,0.0,86.4,86.4,85.9,85.8,85.8,85.7,86.3,0.0,86.1,86.1,86.0,85.8,0.0,0.0,0.0,86.7,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,85.9,85.8,86.8,87.1,86.3,0.0,86.7,86.9,0.0,0.0,0.0,0.0,0.0,86.4,86.4,86.1,86.3,67.5,50.0,50.0,68.5,68.5,67.5,50.0,56.0,55.9,50.0,50.0,50.0,50.0,65.9,64.9,66.3,50.0,50.0,50.0,66.7,66.7,65.9,67.7,56.7,56.3,50.0,58.1,58.1,52.0,64.9,66.9,69.9,78.0,50.0,50.0,59.2,66.4,68.5,56.2,65.7,82.4,83.9,55.8,66.4,50.0,65.0,65.9,66.3,67.1,50.0,50.5,50.0,67.8,67.8,70.4,74.0,68.9,0.0,86.3,86.3,85.9,0.0,0.0,0.0,0.0,0.0,86.4,86.7,86.7,86.3,0.0,0.0,0.0,0.0,0.0,86.1,86.0,86.0,86.3,86.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,85.8,85.2,85.0,85.2,0.0,0.0,86.3,0.0,0.0,0.0,0.0,86.9,86.8,86.5,86.5,86.0,0.0,0.0,0.0,0.0,0.0,87.0,86.9,0.0,0.0,86.0,85.4,86.4,72.3,85.8,86.4,0.0,86.0,86.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,86.5,87.0,64.9,86.1,86.1,86.0,0.0,0.0,0.0,85.8,86.0,0.0,0.0,0.0,0.0,0.0,86.3,86.5,86.5,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,86.7,86.3,86.4,86.0,86.4,86.3,0.0,0.0,0.0,0.0,0.0,0.0,0.0,86.5,86.7,85.8,85.9,85.8,85.7,86.1,0.0,0.0,0.0,0.0,86.4,86.4,86.4,0.0,0.0,0.0,85.8,85.6,86.0,86.1,0.0,0.0,86.1,85.8,85.7,86.1,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,86.3,86.1,86.4,0.0,0.0,0.0,0.0,86.5,85.9,0.0,0.0,85.9,85.4,85.0,85.7,86.1,86.0,0.0,0.0,0.0,0.0,0.0,0.0,85.6,85.2,85.8,85.8,0.0,0.0,0.0,86.8,86.8,67.5,67.1,50.0,67.5,70.9,73.7,71.8,74.5,79.2,50.0,66.3,64.9,65.5,67.1,65.9,50.0,50.0,50.0,62.4,87.1,87.1,87.1,87.1,75.7,79.0,79.0,87.1,87.1,65.9,87.1,87.1,87.1,70.2,75.8,87.1,87.1,87.1],"alert":[0,2,2,2,0,0,0,0,0,2,2,2,2,2,2,2,2,2,0,0,0,2,2,2,2,2,2,0,0,0,0,0,0,2,0,0,0,0,0,0,2,0,0,0,2,2,2,2,2,0,0,0,0,0,2,2,2,0,0,2,2,2,2,2,2,2,2,2,2,0,0,0,0,2,2,2,0,0,0,2,2,2,2,0,0,0,2,2,2,2,2,0,1,0,1,1,1,0,0,0,0,2,2,2,0,0,0,0,0,0,0,2,2,2,1,0,0,2,0,0,0,2,2,2,2,0,0,1,1,1,2,2,2,2,0,0,0,0,0,2,2,0,2,2,0,0,2,2,2,2,2,0,0,2,2,2,2,2,2,0,0,2,0,0,0,0,0,0,2,2,2,2,2,0,0,0,0,2,2,2,2,2,2,0,0,0,0,2,2,2,2,0,0,0,0,0,2,0,0,0,2,2,2,2,0,0,0,2,0,0,2,0,0,0,0,0,0,2,2,2,2,2,0,0,0,2,2,2,2,0,0,0,0,2,2,2,2,2,2,2,0,2,2,2,2,0,0,0,2,0,0,0,0,0,0,0,0,0,2,2,2,2,2,0,2,2,0,0,0,0,0,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,2,1,1,1,1,1,1,1,2,2,1,1,1,1,1,1,1,1,1,1,1,1,2,2,1,0,2,2,2,0,0,0,0,0,2,2,2,2,0,0,0,0,0,2,2,2,2,2,0,0,0,0,0,0,0,0,2,2,2,2,0,0,2,0,0,0,0,2,2,2,2,2,0,0,0,0,0,2,2,0,0,2,2,2,2,2,2,0,2,2,0,0,0,0,0,0,0,0,0,0,2,2,1,2,2,2,0,0,0,2,2,0,0,0,0,0,2,2,2,0,0,0,0,0,0,0,0,2,2,2,2,2,2,0,0,0,0,0,0,0,2,2,2,2,2,2,2,0,0,0,0,2,2,2,0,0,0,2,2,2,2,0,0,2,2,2,2,0,0,0,0,0,0,0,0,0,2,2,2,0,0,0,0,2,2,0,0,2,2,2,2,2,2,0,0,0,0,0,0,2,2,2,2,0,0,0,2,2,1,1,1,1,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,2,2,2,2,2,2,2,2,2,1,2,2,2,2,2,2,2,2],"hr_min":[[0,86.8],[1,92.2],[2,92.9],[3,87.8],[4,84.5],[5,83.3],[6,88.2],[7,79.1],[8,76.2],[9,77.7]],"hr_slope":-1.591,"hr_intercept":92.03,"stats":{"dur_min":9.4,"rows":552,"hr_mean":85.2,"hr_min":57.0,"hr_max":108.0,"hr_sd":9.25,"contact":100.0,"pitch_med":7.3,"mov_first":14.6,"mov_last":21.1,"hr_first":90.4,"hr_last":80.6,"crit":44.4,"blink_zero":83.0}};
+const NS = "http://www.w3.org/2000/svg";
+const el = (n, a) => { const e = document.createElementNS(NS, n); for (const k in a) e.setAttribute(k, a[k]); return e; };
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+
+/* ── capture parameters ─────────────────────────────────────── */
+const S = D.stats;
+[["Duration", S.dur_min + " min"], ["Rows", S.rows], ["Rate", "1 Hz"],
+ ["Pulse contact", S.contact + "%"], ["HR mean", S.hr_mean + " bpm"],
+ ["HR trend", D.hr_slope + " bpm/min"]].forEach(([k, v]) => {
+  const d = document.createElement("div");
+  d.className = "param";
+  d.innerHTML = "<dt>" + k + "</dt><dd>" + v + "</dd>";
+  document.getElementById("params").appendChild(d);
+});
+
+/* ── chart: four lanes, shared x ─────────────────────────────── */
+const W = 980, H = 566, L = 58, R = 22, T = 10, LANE = 112, GAP = 24;
+const PW = W - L - R;
+const tMax = D.t[D.t.length - 1];
+const x = s => L + (s / tMax) * PW;
+
+const LANES = [
+  { key: "hr",    label: "HEART RATE",    unit: "bpm", color: "--s-hr",    dom: null, trend: true },
+  { key: "pitch", label: "PITCH",         unit: "deg", color: "--s-pitch", dom: null },
+  { key: "mov",   label: "HEAD MOVEMENT", unit: "",    color: "--s-move",  dom: [0, 120], clip: true },
+  { key: "blink", label: "BLINK RATE",    unit: "/min", color: "--s-dead", dom: [0, 2], dead: true }
+];
+
+const svg = document.getElementById("chart");
+
+LANES.forEach((ln, i) => {
+  const y0 = T + i * (LANE + GAP);
+  const vals = D[ln.key];
+  let lo, hi;
+  if (ln.dom) { [lo, hi] = ln.dom; }
+  else {
+    lo = Math.min(...vals); hi = Math.max(...vals);
+    const pad = (hi - lo) * 0.12 || 1; lo -= pad; hi += pad;
+  }
+  ln.lo = lo; ln.hi = hi; ln.y0 = y0;
+  const y = v => y0 + LANE - ((Math.min(Math.max(v, lo), hi) - lo) / (hi - lo)) * LANE;
+  ln.y = y;
+
+  // gridlines at lo / mid / hi, each labelled with a value the lane reaches
+  [lo, (lo + hi) / 2, hi].forEach(v => {
+    svg.appendChild(el("line", { x1: L, x2: L + PW, y1: y(v), y2: y(v),
+      stroke: css("--grid"), "stroke-width": 1 }));
+    const t = el("text", { x: L - 9, y: y(v) + 4, "text-anchor": "end", fill: css("--ink-3"),
+      "font-size": 10, "font-family": "IBM Plex Mono, monospace" });
+    t.textContent = Math.abs(hi - lo) < 6 ? v.toFixed(1) : Math.round(v);
+    svg.appendChild(t);
+  });
+
+  // the trace
+  let d = "";
+  for (let k = 0; k < vals.length; k++) d += (k ? "L" : "M") + x(D.t[k]).toFixed(1) + " " + y(vals[k]).toFixed(1) + " ";
+  svg.appendChild(el("path", { d, fill: "none", stroke: css(ln.color),
+    "stroke-width": ln.dead ? 1.4 : 2, "stroke-linejoin": "round",
+    "stroke-dasharray": ln.dead ? "4 3" : "none", opacity: ln.dead ? 0.85 : 1 }));
+
+  // per-minute trend line on heart rate, the finding this page is about
+  if (ln.trend) {
+    const x1 = 0, x2 = tMax / 60;
+    const v1 = D.hr_intercept + D.hr_slope * x1, v2 = D.hr_intercept + D.hr_slope * x2;
+    svg.appendChild(el("line", { x1: x(0), x2: x(tMax), y1: y(v1), y2: y(v2),
+      stroke: css(ln.color), "stroke-width": 1.5, "stroke-dasharray": "6 4", opacity: .75 }));
+    const tl = el("text", { x: x(tMax) - 6, y: y(v2) - 9, "text-anchor": "end", fill: css("--ink-2"),
+      "font-size": 10.5, "font-weight": 600, "font-family": "IBM Plex Mono, monospace" });
+    tl.textContent = D.hr_slope + " bpm/min";
+    svg.appendChild(tl);
+  }
+
+  // direct label — every lane names its own series, so identity is never colour alone
+  const lab = el("text", { x: L + 4, y: y0 + 13, fill: css(ln.color),
+    "font-size": 11, "font-weight": 600, "letter-spacing": ".08em",
+    "font-family": "IBM Plex Mono, monospace" });
+  lab.textContent = ln.label + (ln.unit ? "  (" + ln.unit + ")" : "");
+  svg.appendChild(lab);
+
+  if (ln.clip) {
+    const n = el("text", { x: L + 172, y: y0 + 13, fill: css("--ink-3"),
+      "font-size": 10.5, "font-family": "IBM Plex Sans, sans-serif" });
+    n.textContent = "scale clipped at 120 — peak reaches 211";
+    svg.appendChild(n);
+  }
+
+  if (ln.dead) {
+    const n = el("text", { x: L + 172, y: y0 + 13, fill: css("--ink-3"),
+      "font-size": 10.5, "font-family": "IBM Plex Sans, sans-serif" });
+    n.textContent = "channel failed — no corneal glint in 97.8% of frames";
+    svg.appendChild(n);
+  }
+
+  svg.appendChild(el("line", { x1: L, x2: L + PW, y1: y0 + LANE, y2: y0 + LANE,
+    stroke: css("--rule"), "stroke-width": 1 }));
+});
+
+// shared x axis
+const axisY = T + 4 * (LANE + GAP) - GAP + 6;
+for (let m = 0; m <= Math.floor(tMax / 60); m++) {
+  const px = x(m * 60);
+  svg.appendChild(el("line", { x1: px, x2: px, y1: axisY - 6, y2: axisY - 1,
+    stroke: css("--ink-3"), "stroke-width": 1 }));
+  const t = el("text", { x: px, y: axisY + 11, "text-anchor": "middle", fill: css("--ink-3"),
+    "font-size": 10, "font-family": "IBM Plex Mono, monospace" });
+  t.textContent = m + "m";
+  svg.appendChild(t);
+}
+
+// crosshair
+const cross = el("line", { y1: T, y2: T + 3 * (LANE + GAP) + LANE, stroke: css("--ink-3"),
+  "stroke-width": 1, "stroke-dasharray": "3 3", opacity: 0 });
+svg.appendChild(cross);
+const dots = LANES.map(ln => {
+  const c = el("circle", { r: 4, fill: css(ln.color), stroke: css("--surface"), "stroke-width": 2, opacity: 0 });
+  svg.appendChild(c); return c;
+});
+
+const ro = document.getElementById("readout");
+function setCursor(i) {
+  const fm = (v, n) => v.toFixed(n);
+  ro.innerHTML =
+    '<div><span class="lbl">t</span><b>' + fm(D.t[i] / 60, 2) + '</b> min</div>' +
+    '<div><span class="lbl">HR</span><b>' + D.hr[i] + '</b> bpm</div>' +
+    '<div><span class="lbl">Pitch</span><b>' + fm(D.pitch[i], 1) + '</b> deg</div>' +
+    '<div><span class="lbl">Move</span><b>' + fm(D.mov[i], 1) + '</b></div>' +
+    '<div><span class="lbl">Blink</span><b>' + fm(D.blink[i], 1) + '</b> /min</div>' +
+    '<div><span class="lbl">Risk</span><b>' + fm(D.risk[i], 0) + '</b> % ' +
+      ["safe", "warning", "critical"][D.alert[i]] + '</div>';
+  const px = x(D.t[i]);
+  cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("opacity", 1);
+  LANES.forEach((ln, k) => {
+    dots[k].setAttribute("cx", px);
+    dots[k].setAttribute("cy", ln.y(D[ln.key][i]));
+    dots[k].setAttribute("opacity", 1);
+  });
+}
+setCursor(Math.floor(D.t.length * 0.62));
+
+svg.addEventListener("pointermove", ev => {
+  const r = svg.getBoundingClientRect();
+  const px = (ev.clientX - r.left) / r.width * W;
+  const frac = Math.max(0, Math.min(1, (px - L) / PW));
+  setCursor(Math.round(frac * (D.t.length - 1)));
+});
+
+/* ── table view (relief for the light-mode contrast warning) ── */
+(function () {
+  const t = document.getElementById("tbl");
+  const head = document.createElement("thead");
+  head.innerHTML = "<tr><th>Minute</th><th>HR (bpm)</th><th>Pitch (deg)</th><th>Move</th><th>Blink (/min)</th><th>Risk (%)</th></tr>";
+  t.appendChild(head);
+  const tb = document.createElement("tbody");
+  const bucket = {};
+  D.t.forEach((s, i) => { (bucket[Math.floor(s / 60)] ||= []).push(i); });
+  Object.keys(bucket).sort((a, b) => a - b).forEach(m => {
+    const idx = bucket[m];
+    const mean = k => (idx.reduce((s, i) => s + D[k][i], 0) / idx.length);
+    const tr = document.createElement("tr");
+    tr.innerHTML = "<td>" + m + "–" + (+m + 1) + "</td>" +
+      "<td>" + mean("hr").toFixed(1) + "</td>" +
+      "<td>" + mean("pitch").toFixed(1) + "</td>" +
+      "<td>" + mean("mov").toFixed(1) + "</td>" +
+      "<td>" + mean("blink").toFixed(2) + "</td>" +
+      "<td>" + mean("risk").toFixed(0) + "</td>";
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+})();
+</script>
+
+</body></html>

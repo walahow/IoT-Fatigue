@@ -1,0 +1,666 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style></head><body>
+<title>Helmet PPG Trace</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap">
+
+<style>
+:root{
+  color-scheme: light;
+  --ground:      #eef1f6;
+  --surface:     #ffffff;
+  --surface-2:   #f6f8fb;
+  --ink:         #111820;
+  --ink-2:       #58626f;
+  --ink-3:       #8b95a3;
+  --rule:        #d7dde6;
+  --rule-soft:   #e7ecf2;
+  --signal:      #2a78d6;
+  --signal-soft: #2a78d61f;
+  --flag:        #eb6834;
+  --flag-soft:   #eb68341f;
+  --chip-bg:     #fdf0e9;
+  --chip-ink:    #a13d13;
+  --grid:        #e3e9f0;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    color-scheme: dark;
+    --ground:      #0d1116;
+    --surface:     #171d24;
+    --surface-2:   #1e252d;
+    --ink:         #eef2f7;
+    --ink-2:       #9aa5b3;
+    --ink-3:       #6b7684;
+    --rule:        #2b333d;
+    --rule-soft:   #232a33;
+    --signal:      #3987e5;
+    --signal-soft: #3987e526;
+    --flag:        #d95926;
+    --flag-soft:   #d9592629;
+    --chip-bg:     #2e1c13;
+    --chip-ink:    #f0996f;
+    --grid:        #232b34;
+  }
+}
+:root[data-theme="dark"]{
+  color-scheme: dark;
+  --ground:      #0d1116;
+  --surface:     #171d24;
+  --surface-2:   #1e252d;
+  --ink:         #eef2f7;
+  --ink-2:       #9aa5b3;
+  --ink-3:       #6b7684;
+  --rule:        #2b333d;
+  --rule-soft:   #232a33;
+  --signal:      #3987e5;
+  --signal-soft: #3987e526;
+  --flag:        #d95926;
+  --flag-soft:   #d9592629;
+  --chip-bg:     #2e1c13;
+  --chip-ink:    #f0996f;
+  --grid:        #232b34;
+}
+
+*{ box-sizing: border-box; }
+
+body{
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap{
+  max-width: 1020px;
+  margin: 0 auto;
+  padding: 40px 22px 72px;
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+}
+
+/* ── masthead ─────────────────────────────────────────────── */
+.eyebrow{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 10px;
+}
+h1{
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-weight: 700;
+  font-size: clamp(30px, 5vw, 42px);
+  line-height: 1.05;
+  letter-spacing: -.022em;
+  margin: 0;
+  text-wrap: balance;
+}
+.standfirst{
+  margin: 14px 0 0;
+  max-width: 64ch;
+  font-size: 16.5px;
+  color: var(--ink-2);
+}
+
+/* ── scope parameter bar ──────────────────────────────────── */
+.params{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  background: var(--surface);
+  overflow: hidden;
+}
+.param{
+  flex: 1 1 auto;
+  min-width: 118px;
+  padding: 10px 14px;
+  border-right: 1px solid var(--rule-soft);
+}
+.param:last-child{ border-right: 0; }
+.param dt{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 3px;
+}
+.param dd{
+  margin: 0;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 14px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+/* ── verdict ──────────────────────────────────────────────── */
+.verdict{
+  display: grid;
+  grid-template-columns: 4px 1fr;
+  gap: 0 18px;
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.verdict-stripe{ background: var(--flag); }
+.verdict-body{ padding: 20px 22px 22px 4px; }
+.chip{
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  background: var(--chip-bg);
+  color: var(--chip-ink);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  padding: 4px 10px;
+  border-radius: 2px;
+}
+.chip svg{ display: block; }
+.verdict h2{
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -.012em;
+  margin: 12px 0 8px;
+  text-wrap: balance;
+}
+.verdict p{ margin: 0 0 10px; max-width: 68ch; color: var(--ink-2); }
+.verdict p:last-child{ margin-bottom: 0; }
+.verdict b{ color: var(--ink); font-weight: 500; }
+
+/* ── panels ───────────────────────────────────────────────── */
+.panel{
+  background: var(--surface);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 18px 20px 16px;
+}
+.panel-head{
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 4px;
+}
+.panel h3{
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -.005em;
+  margin: 0;
+}
+.panel-note{
+  font-size: 13px;
+  color: var(--ink-2);
+  margin: 2px 0 12px;
+  max-width: 70ch;
+}
+
+/* cursor readout — a scope's cursor bar */
+.readout{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0;
+  border: 1px solid var(--rule-soft);
+  border-radius: 2px;
+  background: var(--surface-2);
+  margin: 10px 0 12px;
+}
+.readout div{
+  padding: 7px 13px;
+  border-right: 1px solid var(--rule-soft);
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+.readout div:last-child{ border-right: 0; }
+.readout b{
+  color: var(--ink);
+  font-weight: 600;
+}
+.readout .lbl{
+  color: var(--ink-3);
+  font-size: 10px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  margin-right: 7px;
+}
+
+.chart-scroll{ overflow-x: auto; }
+svg.chart{ display: block; width: 100%; height: auto; min-width: 460px; touch-action: none; }
+
+/* ── window selector ──────────────────────────────────────── */
+.seg{
+  display: inline-flex;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.seg button{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  padding: 5px 11px;
+  border: 0;
+  border-right: 1px solid var(--rule);
+  background: var(--surface);
+  color: var(--ink-2);
+  cursor: pointer;
+}
+.seg button:last-child{ border-right: 0; }
+.seg button[aria-pressed="true"]{
+  background: var(--signal);
+  color: #fff;
+  font-weight: 600;
+}
+.seg button:focus-visible{ outline: 2px solid var(--flag); outline-offset: -2px; }
+
+.two-up{
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 22px;
+}
+@media (max-width: 860px){ .two-up{ grid-template-columns: 1fr; } }
+
+/* ── table ────────────────────────────────────────────────── */
+table{
+  width: 100%;
+  border-collapse: collapse;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+caption{
+  text-align: left;
+  font-family: Archivo, ui-sans-serif, system-ui, sans-serif;
+  font-size: 15px;
+  font-weight: 600;
+  margin-bottom: 4px;
+  color: var(--ink);
+}
+th, td{
+  text-align: right;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--rule-soft);
+  white-space: nowrap;
+}
+th:first-child, td:first-child{ text-align: left; }
+thead th{
+  font-size: 10px;
+  letter-spacing: .09em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  font-weight: 500;
+  border-bottom: 1px solid var(--rule);
+}
+tbody tr:last-child td{ border-bottom: 0; }
+td.bad{ color: var(--flag); }
+
+.closing{
+  border-top: 1px solid var(--rule);
+  padding-top: 22px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 26px;
+}
+@media (max-width: 700px){ .closing{ grid-template-columns: 1fr; } }
+.closing h4{
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  letter-spacing: .11em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin: 0 0 8px;
+  font-weight: 500;
+}
+.closing ul{ margin: 0; padding-left: 17px; color: var(--ink-2); font-size: 14px; }
+.closing li{ margin-bottom: 6px; }
+.closing li b{ color: var(--ink); font-weight: 500; }
+
+@media (prefers-reduced-motion: reduce){
+  *{ animation: none !important; transition: none !important; }
+}
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">Sensor test · 8 Sep 2026 · ESP32-S3 CAM</p>
+    <h1>Helmet PPG Trace</h1>
+    <p class="standfirst">Twenty seconds of unfiltered ADC from the analog pulse sensor, captured with a
+      finger on the pad. The sensor plainly responds to skin contact — but nothing in this signal repeats
+      at a heart rate.</p>
+  </header>
+
+  <dl class="params" id="params"></dl>
+
+  <section class="verdict">
+    <div class="verdict-stripe"></div>
+    <div class="verdict-body">
+      <span class="chip">
+        <svg width="11" height="11" viewBox="0 0 11 11" aria-hidden="true">
+          <path d="M5.5 0.6 L10.6 9.9 L0.4 9.9 Z" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+          <rect x="4.9" y="3.9" width="1.2" height="3.1" fill="currentColor"/>
+          <rect x="4.9" y="7.7" width="1.2" height="1.2" fill="currentColor"/>
+        </svg>
+        No stable periodicity
+      </span>
+      <h2>The sensor is alive. The heartbeat is not in the data.</h2>
+      <p>Peak-to-peak swing rises from <b>262 counts</b> with no finger to <b>854 counts</b> with one, so the
+        optical path and the ADC both work. But autocorrelation across the whole 30–180 bpm band never exceeds
+        <b>r = 0.126</b>, and the strongest lag lands at <b>182 bpm</b> — not a plausible resting rate.</p>
+      <p>The firmware's beat detector reported 20 beats spread over <b>42–120 bpm</b> inside a single 15-second
+        window. A resting adult heart does not do that. Those are threshold crossings on noise, so
+        <b>heart rate should be treated as unvalidated</b> until the trace below shows repeating pulse shapes.</p>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h3>Raw ADC, full capture</h3>
+      <span class="panel-note" style="margin:0">GPIO1 · 100 Hz · 2001 samples</span>
+    </div>
+    <p class="panel-note">Hover the trace to move the cursor. A clean PPG would show a repeating
+      steep-rise / slow-decay beat here, roughly one per second.</p>
+    <div class="readout" id="readout"></div>
+    <div class="chart-scroll"><svg class="chart" id="wave" viewBox="0 0 940 280" role="img"
+      aria-label="Raw ADC waveform over 20 seconds, showing irregular fluctuation with no repeating beat shape."></svg></div>
+  </section>
+
+  <div class="two-up">
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Five-second zoom</h3>
+        <div class="seg" id="seg" role="group" aria-label="Select window"></div>
+      </div>
+      <p class="panel-note">Same vertical scale as the full trace, so shape is comparable rather than
+        exaggerated.</p>
+      <div class="chart-scroll"><svg class="chart" id="zoom" viewBox="0 0 460 250" role="img"
+        aria-label="Five-second zoom of the raw ADC waveform."></svg></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Autocorrelation</h3>
+        <span class="panel-note" style="margin:0">30–180 bpm band</span>
+      </div>
+      <p class="panel-note">How strongly the signal repeats at each candidate heart rate. A usable PPG
+        peaks above the marked floor at one rate.</p>
+      <div class="chart-scroll"><svg class="chart" id="acf" viewBox="0 0 460 250" role="img"
+        aria-label="Autocorrelation across 30 to 180 bpm, staying far below the 0.5 clean-signal floor at every rate."></svg></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <table id="wtable">
+      <caption>Per-window analysis</caption>
+    </table>
+  </section>
+
+  <section class="closing">
+    <div>
+      <h4>What this rules out</h4>
+      <ul>
+        <li><b>A dead sensor.</b> Contact changes p2p by 3.3×.</li>
+        <li><b>A dead ADC pin.</b> Baseline sits at 1945 counts ≈ 1.57 V, a sane mid-rail bias.</li>
+        <li><b>A sample-rate problem.</b> 100 Hz is ~60× the 1–1.7 Hz band of interest.</li>
+      </ul>
+    </div>
+    <div>
+      <h4>What to try next</h4>
+      <ul>
+        <li><b>Mechanical coupling first.</b> Steady, light, unchanging pressure; the sensor must not slide.</li>
+        <li><b>Shield from ambient light</b> — an unshielded photodiode picks up room-light flicker.</li>
+        <li><b>Re-run the dump</b> and look for r &gt; 0.5 before touching the detector thresholds.</li>
+      </ul>
+    </div>
+  </section>
+
+</div>
+
+<script>
+const D = {"fs": 100.0, "n": 2001, "mean": 1944.9, "sd": 62.3, "min": 1551, "max": 2405, "p2p": 854, "mv_per_count": 0.8059, "raw": [1912, 1933, 1925, 1957, 2099, 1964, 1951, 1965, 1955, 1971, 1949, 1963, 1941, 1959, 1919, 1933, 1895, 1916, 1886, 1917, 1893, 1886, 1877, 1829, 1880, 1901, 1893, 1897, 1896, 1913, 1895, 1861, 1903, 1931, 1907, 1960, 1934, 1961, 1950, 1967, 1948, 1967, 1943, 1967, 1933, 1981, 1976, 1996, 1980, 2011, 2003, 2019, 2015, 2031, 2021, 1978, 1979, 2005, 1979, 2003, 1967, 1983, 1972, 2003, 1947, 1977, 1751, 1965, 1946, 1966, 1949, 1972, 1951, 1968, 1962, 1991, 1976, 1993, 1989, 2004, 1975, 1998, 1971, 1959, 1943, 1941, 1907, 1916, 1913, 1904, 1887, 1899, 1885, 2247, 1886, 1904, 1891, 1895, 1897, 1901, 1943, 1915, 1908, 1994, 1931, 1933, 1930, 1943, 1939, 1963, 1938, 1941, 1952, 1937, 1945, 1960, 1996, 1939, 1935, 1951, 1917, 1949, 1947, 1907, 1951, 1965, 2147, 1973, 1977, 1973, 1989, 2003, 2001, 1998, 1973, 2011, 1935, 1983, 1965, 1979, 1949, 1939, 1935, 1919, 1933, 1919, 1931, 1933, 1937, 1935, 1935, 1917, 1911, 1939, 1947, 1958, 1961, 1943, 1960, 1956, 1963, 1933, 1951, 1961, 1962, 1943, 1956, 1945, 1947, 1943, 1961, 2168, 1950, 1949, 1955, 1957, 1960, 1957, 1955, 1951, 1959, 1963, 1967, 1951, 1947, 1955, 1957, 1943, 1947, 1943, 1951, 1931, 1914, 1963, 1914, 1950, 2336, 1882, 1877, 1863, 1879, 1882, 1897, 1893, 1914, 1917, 1913, 1918, 1933, 1912, 2126, 1903, 1929, 1895, 1939, 1939, 1961, 1964, 1991, 1789, 2017, 2013, 2032, 1997, 2029, 2003, 2019, 1991, 2005, 1967, 1995, 1966, 1964, 1955, 1967, 1959, 1981, 1952, 1977, 1949, 1974, 1943, 1960, 1951, 1965, 1944, 1973, 1959, 1977, 1951, 1971, 1960, 1963, 1929, 1945, 1947, 1939, 1913, 1949, 1909, 1957, 1915, 1958, 1895, 1951, 1931, 1959, 1932, 1960, 1941, 1965, 1941, 1880, 1932, 1976, 1943, 1977, 1945, 1973, 1947, 2245, 1942, 1979, 1947, 1992, 1975, 1992, 1967, 2009, 2013, 1999, 1993, 2027, 1964, 2003, 1957, 1975, 1939, 1950, 1907, 1957, 1927, 1947, 1931, 1951, 1931, 1989, 1917, 1957, 1933, 1960, 1943, 1975, 1967, 1980, 1963, 1994, 1957, 1976, 1951, 1961, 1960, 1989, 1963, 1995, 1961, 1983, 1958, 1981, 1963, 1973, 1963, 1977, 1951, 1976, 1963, 1967, 1951, 1964, 1958, 1961, 1927, 1961, 1925, 1965, 1950, 1973, 1939, 1967, 1916, 1951, 1939, 1837, 1933, 1961, 1931, 1973, 1931, 1944, 1901, 1951, 1934, 1971, 1941, 1951, 1965, 1955, 1944, 1963, 1947, 1965, 1939, 2221, 1939, 1949, 1912, 1946, 1935, 1950, 1919, 1943, 1943, 1685, 1930, 1947, 1932, 1945, 1929, 1947, 1925, 1943, 1926, 1940, 1917, 1961, 1930, 1939, 1947, 1951, 1943, 1966, 1956, 1949, 1947, 1962, 1948, 1963, 1962, 1955, 1961, 1966, 2025, 1961, 1948, 1956, 1947, 1947, 1943, 1997, 1929, 1945, 1931, 1943, 1939, 1942, 1817, 1939, 1943, 1948, 1950, 1939, 1933, 1940, 1952, 1949, 1934, 1952, 1961, 1589, 1948, 1964, 2055, 1976, 1967, 1971, 1960, 1979, 1963, 1945, 1961, 1938, 1843, 1919, 1927, 1911, 1910, 1907, 1931, 1917, 1899, 1899, 1924, 1911, 1919, 1903, 1893, 1886, 1881, 1877, 2091, 1865, 1879, 1869, 1927, 1869, 1913, 1915, 1929, 1931, 1917, 1895, 1903, 1887, 1908, 2104, 1903, 1917, 1926, 1926, 1931, 1930, 1929, 1917, 1931, 1955, 1912, 1931, 1931, 1931, 1933, 1904, 1933, 1913, 1927, 1861, 1919, 1911, 1913, 1911, 1943, 1934, 1937, 1947, 1965, 1925, 1947, 1929, 1957, 1933, 1944, 1945, 1973, 1982, 1989, 1957, 1981, 1967, 1994, 1963, 1983, 1946, 1975, 1931, 1956, 1919, 1942, 1912, 1919, 1915, 1934, 1929, 1938, 1926, 1956, 1930, 1981, 1944, 1973, 1967, 2003, 1968, 2003, 1993, 2019, 1981, 1996, 1975, 1965, 1934, 1955, 1933, 1971, 1912, 1929, 1895, 1937, 1901, 1931, 1903, 1946, 1909, 1942, 1880, 1945, 1917, 1956, 1929, 1957, 1939, 1967, 1961, 1979, 1962, 1992, 1959, 1798, 1959, 1967, 1940, 1956, 1939, 1972, 1949, 1975, 1965, 1980, 1959, 1997, 1962, 2005, 1960, 2003, 1981, 2084, 1973, 1983, 1957, 1989, 1823, 1965, 1939, 1947, 1914, 1959, 1907, 1935, 1907, 1929, 1901, 1944, 1913, 1699, 1931, 1965, 1944, 1982, 1955, 1995, 1964, 1989, 2166, 1975, 1961, 1972, 1968, 1965, 1947, 1951, 1941, 1957, 1931, 1942, 1903, 1937, 1905, 1937, 1908, 1945, 1914, 1944, 1929, 1951, 1934, 1963, 1933, 1964, 1933, 2012, 1945, 1957, 1931, 1950, 1935, 1947, 1933, 1959, 1943, 1947, 1929, 1963, 1948, 1963, 1950, 1971, 1944, 1956, 1949, 1981, 1943, 1983, 1861, 1975, 1960, 2153, 1949, 1959, 1943, 1941, 1941, 1959, 1799, 1949, 1939, 1959, 1933, 1959, 1941, 1950, 1948, 1962, 2121, 1959, 1956, 1963, 1964, 1977, 1959, 1972, 1964, 1949, 1960, 1956, 1947, 1791, 1943, 1955, 1947, 1959, 1950, 1967, 1915, 1951, 1948, 1942, 1945, 1959, 1951, 1946, 1951, 1958, 1932, 1948, 1940, 2315, 1942, 1951, 1933, 1931, 1939, 1950, 1940, 1959, 1941, 1958, 1957, 1975, 1976, 1965, 1970, 1963, 1975, 1952, 1943, 1943, 1933, 1940, 1934, 1928, 1939, 1939, 1949, 1930, 1925, 1853, 1929, 1941, 1943, 1938, 1943, 1950, 1957, 1957, 1981, 1989, 1981, 2004, 1983, 1967, 1981, 1956, 1954, 1963, 1963, 1949, 1955, 1962, 1963, 1963, 1979, 1966, 1983, 1976, 1971, 1931, 1967, 1956, 1972, 1933, 1939, 1941, 1929, 1915, 1931, 1919, 1916, 1929, 1924, 1916, 1939, 1919, 1940, 1915, 1965, 1943, 1937, 1951, 1978, 1979, 2004, 1973, 2002, 1821, 1977, 1973, 1982, 1959, 1957, 1942, 1951, 1941, 1955, 1941, 1955, 1934, 1951, 1945, 1966, 1951, 1967, 1951, 1965, 1943, 1971, 1951, 1965, 1949, 1966, 1943, 1967, 1951, 1965, 1951, 1971, 1943, 1941, 1917, 1935, 1769, 1907, 1891, 1917, 1896, 1917, 1901, 1931, 2120, 1934, 1913, 1938, 1885, 1961, 1907, 1927, 1935, 1956, 1951, 1959, 1944, 1972, 1961, 2149, 1945, 1981, 1944, 1979, 1961, 1991, 1949, 1995, 1976, 1996, 1961, 1991, 1955, 1973, 1945, 1971, 1721, 1980, 1957, 1973, 1955, 1979, 1977, 1997, 1965, 1992, 1967, 1991, 1960, 1993, 1945, 1972, 1967, 1947, 1928, 1975, 1880, 1895, 1861, 1870, 1861, 1879, 1871, 1890, 1883, 1915, 1890, 1909, 1897, 1916, 1910, 1929, 1919, 1929, 1909, 1933, 1908, 1943, 1919, 1943, 1916, 1874, 1907, 1934, 1883, 1929, 1903, 1939, 2117, 1928, 1903, 1989, 1908, 1944, 1917, 1917, 1913, 1926, 1899, 1803, 1899, 1934, 1913, 1933, 2136, 1933, 1949, 1948, 1925, 1957, 1930, 1943, 1947, 1971, 1949, 1973, 1951, 1965, 1957, 1963, 1944, 1965, 1942, 1963, 1933, 1947, 1938, 1976, 1927, 1935, 1917, 1983, 1907, 1929, 1959, 1931, 1931, 1943, 1927, 1944, 1932, 1933, 1927, 1941, 1920, 1938, 1928, 1931, 1927, 1947, 1941, 1955, 1965, 1967, 1871, 1980, 1973, 1989, 1991, 1995, 1983, 1998, 1979, 1979, 2057, 1957, 1951, 1957, 1941, 1957, 1927, 1946, 1915, 1932, 1919, 1945, 1934, 2108, 1944, 1947, 1958, 1949, 1964, 1962, 1983, 1945, 1957, 1945, 2195, 1927, 1927, 1927, 1893, 1976, 1918, 1913, 1933, 1959, 1957, 1950, 1967, 1965, 1983, 1991, 1993, 1993, 1991, 1965, 1983, 1981, 1991, 1971, 1977, 1967, 1963, 1944, 1915, 1932, 1943, 1929, 1949, 1959, 1981, 1799, 1975, 1979, 1983, 2063, 1963, 1950, 1960, 1957, 1929, 1910, 1929, 1893, 1907, 1897, 1901, 1779, 1893, 1917, 1918, 1834, 1909, 1896, 1919, 1907, 1931, 1908, 1930, 1909, 1951, 1927, 1947, 1931, 1947, 1941, 1952, 1941, 1965, 1928, 1967, 1948, 1963, 1949, 1977, 1947, 1991, 1965, 1991, 1973, 1999, 1978, 1993, 1963, 1991, 1957, 1983, 1996, 1975, 1961, 1973, 1950, 1991, 1959, 1991, 1966, 2009, 1983, 2027, 2024, 2021, 2023, 2053, 2009, 2059, 2041, 2078, 2065, 2088, 2075, 2103, 2069, 2087, 2063, 2078, 2007, 2035, 2013, 2013, 1987, 1997, 1939, 1951, 1907, 1929, 1901, 1909, 1881, 1911, 1908, 1917, 1897, 1947, 1853, 1957, 1931, 1915, 1944, 1983, 1939, 1975, 1948, 1951, 1928, 1963, 1911, 1883, 1903, 1938, 1871, 1919, 1901, 1913, 2106, 1909, 1889, 1899, 1880, 1891, 1868, 1911, 1863, 1893, 1867, 1898, 1855, 1881, 1854, 1885, 1865, 1887, 1844, 1886, 1875, 1919, 1875, 1911, 1903, 1907, 1925, 1949, 1937, 1980, 1983, 1893, 1990, 2004, 1990, 2013, 1991, 1998, 1979, 2002, 1951, 1975, 1946, 1958, 1913, 1961, 1911, 1829, 1925, 1947, 1947, 1962, 1974, 2011, 2013, 2037, 2027, 2057, 1943, 2009, 1992, 1977, 1949, 1938, 1920, 1876, 1893, 1882, 2006, 1882, 1893, 1919, 1903, 1917, 1931, 1940, 1927, 1959, 1956, 1977, 2005, 1956, 1949, 1965, 1947, 1959, 1957, 1964, 1955, 1939, 1946, 1961, 1944, 1951, 1800, 1951, 1947, 1977, 1928, 1959, 1832, 1943, 1950, 1975, 1976, 2013, 2053, 2063, 2089, 2093, 2077, 2092, 2079, 2075, 2043, 2023, 2011, 1983, 1965, 1965, 1956, 1931, 1941, 2103, 1907, 1914, 1918, 1925, 1927, 1909, 1915, 1931, 1915, 1911, 1863, 1911, 1929, 1850, 1946, 1937, 1960, 1935, 1945, 1948, 1973, 1939, 1964, 1963, 1963, 2056, 1991, 1981, 1994, 1963, 1971, 1972, 1964, 1957, 1955, 1943, 1931, 1903, 1919, 1901, 1891, 1893, 1919, 1911, 1916, 1906, 1915, 1913, 1935, 1939, 1947, 1949, 1965, 1951, 1975, 1948, 1949, 1917, 1927, 1887, 1897, 1895, 1911, 1915, 1965, 1967, 2020, 1991, 2043, 2021, 2040, 2020, 2040, 2019, 2023, 2007, 2015, 1977, 1946, 1907, 1907, 1824, 1867, 1806, 1833, 2155, 1831, 1819, 1941, 1846, 1893, 1659, 1919, 1917, 1963, 1951, 1959, 1997, 1965, 1951, 1980, 1955, 1995, 1955, 1983, 1960, 1997, 2073, 1997, 1963, 2007, 1966, 1995, 1973, 1995, 1966, 1995, 1965, 1973, 1941, 1977, 1929, 1949, 1943, 1976, 1939, 1977, 1949, 2053, 1975, 2008, 1991, 2020, 1995, 2023, 2006, 2030, 2007, 2037, 1997, 2027, 1997, 1999, 1972, 1977, 1959, 1965, 1957, 1975, 1811, 1967, 1959, 1973, 1951, 1963, 1937, 2069, 1928, 1935, 1907, 1914, 1875, 1891, 1901, 1897, 1883, 2222, 1915, 1948, 1932, 1963, 1956, 1977, 1973, 2376, 1960, 1971, 1962, 1967, 1957, 1981, 1963, 2405, 1959, 1973, 1939, 1955, 1927, 1763, 1887, 1907, 1751, 1917, 1911, 1951, 1947, 1975, 1975, 1997, 1995, 2053, 2006, 2063, 2013, 2005, 1974, 2013, 1945, 1943, 1911, 1911, 1864, 1843, 1827, 1833, 1839, 1866, 1867, 1893, 1903, 1770, 1925, 1947, 1945, 1975, 1959, 1963, 1961, 1975, 1971, 1989, 1945, 1989, 1992, 2137, 1991, 2004, 1997, 1989, 1993, 1997, 1961, 1963, 1919, 1911, 1867, 1875, 1835, 1831, 1775, 1773, 1765, 1727, 1647, 1705, 1717, 1661, 1753, 1705, 1790, 1812, 1833, 1879, 1869, 1877, 1875, 1895, 1869, 1877, 1885, 1876, 1880, 1803, 1897, 1887, 1916, 1916, 1989, 1927, 1935, 1919, 1927, 1902, 1917, 1895, 1847, 1877, 1881, 1856, 1875, 1849, 1869, 1861, 1880, 1853, 1847, 1851, 1863, 1847, 1917, 1845, 1861, 1833, 1865, 1833, 1848, 1829, 1841, 1829, 1854, 1851, 1899, 1882, 1933, 1915, 1935, 1939, 1955, 1927, 1963, 1917, 1940, 1941, 1939, 1916, 1932, 1909, 1925, 1896, 1903, 1880, 1927, 1913, 1965, 1941, 1991, 1973, 2024, 1997, 2024, 2005, 2027, 2013, 2056, 2019, 2054, 2031, 2054, 2055, 2019, 1993, 2015, 1949, 1989, 1951, 1989, 1963, 1973, 1932, 2021, 1932, 1957, 1931, 1964, 1939, 1975, 1935, 1983, 1955, 1962, 1866, 1976, 1947, 1961, 1927, 1963, 1947, 1947, 1903, 1917, 1891, 1909, 1877, 1898, 1879, 1898, 1883, 1917, 1887, 1551, 1899, 1941, 1931, 1982, 1975, 2063, 2036, 2106, 2086, 2153, 2127, 2166, 2142, 2168, 2117, 2167, 2139, 2131, 2105, 2110, 2067, 2078, 2019, 2008, 1991, 1995, 1965, 1951, 1939, 1966, 1891, 1957, 1935, 1959, 1935, 1965, 1947, 1973, 1946, 1983, 1962, 1982, 1951, 1997, 1962, 1967, 1950, 1957, 1945, 1941, 1916, 1937, 1901, 1911, 1880, 1901, 1879, 1897, 1775, 1903, 1909, 1929, 1927, 1964, 1943, 2008, 1941, 1973, 1828, 1974, 1965, 2122, 1942, 1960, 1944, 1949, 1931, 1932, 2152, 1933, 1916, 1933, 1910, 1901, 1891, 1902, 1967, 1912, 1897, 1907, 1891, 1901, 1896, 1892, 1895, 1892, 1879, 1901, 1897, 1792, 1903, 1913, 2259, 1929, 1931, 1930, 1909, 1895, 1849, 1821, 1787, 1800, 1801, 1821, 1801, 1845, 1848, 1902, 1898, 1951, 1971, 1998, 2009, 2028, 2041, 2044, 2056, 2018, 2073, 2019, 2010, 2003, 1993, 1959, 1948, 1942, 1805, 1896, 1893, 1892, 1887, 1878, 2014, 1869, 1903, 1915, 1893, 1913, 1943, 1983, 1945, 1929, 2119, 1944, 1942, 1927, 1943, 1942, 1962, 1957, 1975, 1967, 1963, 1950, 1943, 1927, 1931, 1911, 1919, 1900, 1920, 1915, 1944, 1932, 1941, 1944, 1952, 1897, 1915, 1901, 1918, 1909, 1919, 1931, 1950, 1946, 1899, 1951, 1963, 1955, 1972, 1951, 1967, 1965, 1978, 1979, 1999, 1980, 1993, 1977, 1995, 1990, 2013, 1965, 2003, 1967, 1991, 1963, 1967, 1933, 1943, 1907, 1912, 1875, 1880, 1851, 1839, 1823, 1867, 1817, 1839, 1835, 1837, 1834, 1856, 1848, 1864, 2108, 1868, 1846, 1901, 1873, 1897, 1899, 1919, 1895, 1947, 1897, 1931, 1897, 1912, 1877, 1895, 1850, 1893, 1845, 1863, 1814, 1824, 1791, 1815, 1806, 1838, 1831, 1893, 1869, 1917, 1918, 1951, 1919, 1964, 1908, 1950, 1897, 1736, 1895, 1919, 1845, 1903, 1875, 1877, 1855, 1821, 1852, 1885, 1851, 1851, 1914, 1881, 1879, 1961], "autocorr": [{"bpm": 181.82, "r": 0.1257}, {"bpm": 176.47, "r": 0.1207}, {"bpm": 171.43, "r": 0.1132}, {"bpm": 166.67, "r": 0.1076}, {"bpm": 162.16, "r": 0.0989}, {"bpm": 157.89, "r": 0.0925}, {"bpm": 153.85, "r": 0.0846}, {"bpm": 150.0, "r": 0.0781}, {"bpm": 146.34, "r": 0.0693}, {"bpm": 142.86, "r": 0.0639}, {"bpm": 139.53, "r": 0.057}, {"bpm": 136.36, "r": 0.0526}, {"bpm": 133.33, "r": 0.0475}, {"bpm": 130.43, "r": 0.0462}, {"bpm": 127.66, "r": 0.0446}, {"bpm": 125.0, "r": 0.0464}, {"bpm": 122.45, "r": 0.0479}, {"bpm": 120.0, "r": 0.0532}, {"bpm": 117.65, "r": 0.056}, {"bpm": 115.38, "r": 0.0613}, {"bpm": 113.21, "r": 0.0644}, {"bpm": 111.11, "r": 0.0684}, {"bpm": 109.09, "r": 0.0694}, {"bpm": 107.14, "r": 0.0706}, {"bpm": 105.26, "r": 0.0678}, {"bpm": 103.45, "r": 0.065}, {"bpm": 101.69, "r": 0.0586}, {"bpm": 100.0, "r": 0.0531}, {"bpm": 98.36, "r": 0.0452}, {"bpm": 96.77, "r": 0.0395}, {"bpm": 95.24, "r": 0.0319}, {"bpm": 93.75, "r": 0.0253}, {"bpm": 92.31, "r": 0.0167}, {"bpm": 90.91, "r": 0.0107}, {"bpm": 89.55, "r": 0.0035}, {"bpm": 88.24, "r": -0.0019}, {"bpm": 86.96, "r": -0.0086}, {"bpm": 85.71, "r": -0.0138}, {"bpm": 84.51, "r": -0.022}, {"bpm": 83.33, "r": -0.0283}, {"bpm": 82.19, "r": -0.034}, {"bpm": 81.08, "r": -0.0377}, {"bpm": 80.0, "r": -0.0433}, {"bpm": 78.95, "r": -0.0463}, {"bpm": 77.92, "r": -0.0503}, {"bpm": 76.92, "r": -0.0523}, {"bpm": 75.95, "r": -0.0572}, {"bpm": 75.0, "r": -0.0598}, {"bpm": 74.07, "r": -0.0642}, {"bpm": 73.17, "r": -0.0701}, {"bpm": 72.29, "r": -0.0791}, {"bpm": 71.43, "r": -0.087}, {"bpm": 70.59, "r": -0.099}, {"bpm": 69.77, "r": -0.111}, {"bpm": 68.97, "r": -0.1258}, {"bpm": 68.18, "r": -0.1379}, {"bpm": 67.42, "r": -0.1501}, {"bpm": 66.67, "r": -0.1619}, {"bpm": 65.93, "r": -0.1728}, {"bpm": 65.22, "r": -0.1791}, {"bpm": 64.52, "r": -0.1853}, {"bpm": 63.83, "r": -0.1877}, {"bpm": 63.16, "r": -0.1884}, {"bpm": 62.5, "r": -0.1852}, {"bpm": 61.86, "r": -0.1813}, {"bpm": 61.22, "r": -0.1762}, {"bpm": 60.61, "r": -0.1686}, {"bpm": 60.0, "r": -0.1581}, {"bpm": 59.41, "r": -0.1477}, {"bpm": 58.82, "r": -0.1342}, {"bpm": 58.25, "r": -0.1194}, {"bpm": 57.69, "r": -0.1031}, {"bpm": 57.14, "r": -0.087}, {"bpm": 56.6, "r": -0.0699}, {"bpm": 56.07, "r": -0.0527}, {"bpm": 55.56, "r": -0.0361}, {"bpm": 55.05, "r": -0.021}, {"bpm": 54.55, "r": -0.0069}, {"bpm": 54.05, "r": 0.0036}, {"bpm": 53.57, "r": 0.0119}, {"bpm": 53.1, "r": 0.0174}, {"bpm": 52.63, "r": 0.0206}, {"bpm": 52.17, "r": 0.0201}, {"bpm": 51.72, "r": 0.0174}, {"bpm": 51.28, "r": 0.0123}, {"bpm": 50.85, "r": 0.0041}, {"bpm": 50.42, "r": -0.0069}, {"bpm": 50.0, "r": -0.0183}, {"bpm": 49.59, "r": -0.0307}, {"bpm": 49.18, "r": -0.0435}, {"bpm": 48.78, "r": -0.0556}, {"bpm": 48.39, "r": -0.0662}, {"bpm": 48.0, "r": -0.0746}, {"bpm": 47.62, "r": -0.0811}, {"bpm": 47.24, "r": -0.0851}, {"bpm": 46.88, "r": -0.0861}, {"bpm": 46.51, "r": -0.0855}, {"bpm": 46.15, "r": -0.0838}, {"bpm": 45.8, "r": -0.0809}, {"bpm": 45.45, "r": -0.0782}, {"bpm": 45.11, "r": -0.076}, {"bpm": 44.78, "r": -0.076}, {"bpm": 44.44, "r": -0.0781}, {"bpm": 44.12, "r": -0.0816}, {"bpm": 43.8, "r": -0.0877}, {"bpm": 43.48, "r": -0.0957}, {"bpm": 43.17, "r": -0.1044}, {"bpm": 42.86, "r": -0.1151}, {"bpm": 42.55, "r": -0.126}, {"bpm": 42.25, "r": -0.1376}, {"bpm": 41.96, "r": -0.1483}, {"bpm": 41.67, "r": -0.1576}, {"bpm": 41.38, "r": -0.1649}, {"bpm": 41.1, "r": -0.1698}, {"bpm": 40.82, "r": -0.1718}, {"bpm": 40.54, "r": -0.1723}, {"bpm": 40.27, "r": -0.1683}, {"bpm": 40.0, "r": -0.1629}, {"bpm": 39.74, "r": -0.154}, {"bpm": 39.47, "r": -0.1427}, {"bpm": 39.22, "r": -0.1286}, {"bpm": 38.96, "r": -0.1133}, {"bpm": 38.71, "r": -0.0965}, {"bpm": 38.46, "r": -0.0796}, {"bpm": 38.22, "r": -0.0611}, {"bpm": 37.97, "r": -0.0438}, {"bpm": 37.74, "r": -0.0246}, {"bpm": 37.5, "r": -0.0061}, {"bpm": 37.27, "r": 0.0124}, {"bpm": 37.04, "r": 0.0294}, {"bpm": 36.81, "r": 0.0459}, {"bpm": 36.59, "r": 0.06}, {"bpm": 36.36, "r": 0.0741}, {"bpm": 36.14, "r": 0.0857}, {"bpm": 35.93, "r": 0.0963}, {"bpm": 35.71, "r": 0.1035}, {"bpm": 35.5, "r": 0.1091}, {"bpm": 35.29, "r": 0.1109}, {"bpm": 35.09, "r": 0.1108}, {"bpm": 34.88, "r": 0.1076}, {"bpm": 34.68, "r": 0.1038}, {"bpm": 34.48, "r": 0.0968}, {"bpm": 34.29, "r": 0.0903}, {"bpm": 34.09, "r": 0.0816}, {"bpm": 33.9, "r": 0.0726}, {"bpm": 33.71, "r": 0.0604}, {"bpm": 33.52, "r": 0.0503}, {"bpm": 33.33, "r": 0.0397}, {"bpm": 33.15, "r": 0.0313}, {"bpm": 32.97, "r": 0.0229}, {"bpm": 32.79, "r": 0.0172}, {"bpm": 32.61, "r": 0.0104}, {"bpm": 32.43, "r": 0.0071}, {"bpm": 32.26, "r": 0.0053}, {"bpm": 32.09, "r": 0.0093}, {"bpm": 31.91, "r": 0.0128}, {"bpm": 31.75, "r": 0.0193}, {"bpm": 31.58, "r": 0.0247}, {"bpm": 31.41, "r": 0.0321}, {"bpm": 31.25, "r": 0.0375}, {"bpm": 31.09, "r": 0.0438}, {"bpm": 30.93, "r": 0.0462}, {"bpm": 30.77, "r": 0.0474}, {"bpm": 30.61, "r": 0.0427}, {"bpm": 30.46, "r": 0.037}, {"bpm": 30.3, "r": 0.0271}, {"bpm": 30.15, "r": 0.0162}, {"bpm": 30.0, "r": 0.0011}], "windows": [{"t0": 0, "t1": 5, "p2p": 747, "sd": 52.6, "r": 0.193, "bpm": 107.1}, {"t0": 5, "t1": 10, "p2p": 616, "sd": 45.3, "r": 0.176, "bpm": 58.3}, {"t0": 10, "t1": 15, "p2p": 563, "sd": 57.5, "r": 0.239, "bpm": 40.0}, {"t0": 15, "t1": 20, "p2p": 854, "sd": 84.0, "r": 0.194, "bpm": 105.3}]};
+const MV = 3300 / 4095;
+const NS = "http://www.w3.org/2000/svg";
+
+function el(name, attrs){
+  const n = document.createElementNS(NS, name);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+function css(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+
+/* ── parameter bar ─────────────────────────────────────────── */
+const params = [
+  ["Pin",        "GPIO1 / ADC1_CH0"],
+  ["Resolution", "12-bit"],
+  ["Sample rate", D.fs.toFixed(0) + " Hz"],
+  ["Samples",    D.n],
+  ["Duration",   (D.n / D.fs).toFixed(1) + " s"],
+  ["Scale",      MV.toFixed(3) + " mV/ct"]
+];
+const pdl = document.getElementById("params");
+for (const [k, v] of params){
+  const d = document.createElement("div");
+  d.className = "param";
+  d.innerHTML = "<dt>" + k + "</dt><dd>" + v + "</dd>";
+  pdl.appendChild(d);
+}
+
+/* ── shared scale for both traces (honest comparison) ──────── */
+const Y0 = 1500, Y1 = 2500;
+const YT = [1500, 1750, 2000, 2250, 2500];
+
+function drawTrace(svg, series, t0, t1, opts){
+  svg.textContent = "";
+  const vb = svg.getAttribute("viewBox").split(" ").map(Number);
+  const W = vb[2], H = vb[3];
+  const L = 48, R = 12, T = 12, B = 30;
+  const pw = W - L - R, ph = H - T - B;
+
+  const x = t => L + (t - t0) / (t1 - t0) * pw;
+  const y = v => T + (Y1 - v) / (Y1 - Y0) * ph;
+
+  // horizontal grid + left axis labels (ADC counts)
+  for (const v of YT){
+    svg.appendChild(el("line", {x1:L, x2:L+pw, y1:y(v), y2:y(v),
+      stroke: css("--grid"), "stroke-width":1}));
+    const tx = el("text", {x:L-9, y:y(v)+4, "text-anchor":"end",
+      fill: css("--ink-3"), "font-size":10, "font-family":"IBM Plex Mono, monospace"});
+    tx.textContent = v;
+    svg.appendChild(tx);
+  }
+  // vertical grid at 1-second (full) or 0.5-second (zoom) marks
+  const step = opts.tick;
+  for (let t = t0; t <= t1 + 1e-9; t += step){
+    const major = Math.abs(t / opts.label - Math.round(t / opts.label)) < 1e-9;
+    svg.appendChild(el("line", {x1:x(t), x2:x(t), y1:T, y2:T+ph,
+      stroke: css("--grid"), "stroke-width":1, "stroke-opacity": major ? 1 : .45}));
+    if (major){
+      const tx = el("text", {x:x(t), y:T+ph+18, "text-anchor":"middle",
+        fill: css("--ink-3"), "font-size":10, "font-family":"IBM Plex Mono, monospace"});
+      tx.textContent = t.toFixed(0) + "s";
+      svg.appendChild(tx);
+    }
+  }
+  // axis frame
+  svg.appendChild(el("line", {x1:L, x2:L, y1:T, y2:T+ph, stroke: css("--rule"), "stroke-width":1}));
+  svg.appendChild(el("line", {x1:L, x2:L+pw, y1:T+ph, y2:T+ph, stroke: css("--rule"), "stroke-width":1}));
+
+  // the trace
+  let d = "";
+  for (let i = 0; i < series.length; i++){
+    const t = t0 + i / D.fs;
+    d += (i ? "L" : "M") + x(t).toFixed(2) + " " + y(series[i]).toFixed(2) + " ";
+  }
+  svg.appendChild(el("path", {d: d, fill:"none", stroke: css("--signal"),
+    "stroke-width": opts.thin ? 1.1 : 1.6, "stroke-linejoin":"round", "stroke-linecap":"round"}));
+
+  // y-axis title
+  const yt = el("text", {x: 12, y: T + ph/2, fill: css("--ink-3"), "font-size":10,
+    "font-family":"IBM Plex Mono, monospace", "text-anchor":"middle",
+    transform: "rotate(-90 12 " + (T + ph/2) + ")"});
+  yt.textContent = "ADC counts";
+  svg.appendChild(yt);
+
+  return {x, y, L, T, pw, ph};
+}
+
+/* ── full trace + cursor ───────────────────────────────────── */
+const wave = document.getElementById("wave");
+const geo = drawTrace(wave, D.raw, 0, D.n / D.fs, {tick: 1, label: 2, thin: true});
+
+const cursor = el("g", {});
+const cline = el("line", {y1: geo.T, y2: geo.T + geo.ph, stroke: css("--flag"),
+  "stroke-width": 1, "stroke-dasharray": "3 3"});
+const cdot = el("circle", {r: 4, fill: css("--flag"), stroke: css("--surface"), "stroke-width": 2});
+cursor.appendChild(cline); cursor.appendChild(cdot);
+wave.appendChild(cursor);
+
+const readout = document.getElementById("readout");
+function setReadout(i){
+  const v = D.raw[i];
+  readout.innerHTML =
+    '<div><span class="lbl">t</span><b>' + (i / D.fs).toFixed(2) + '</b> s</div>' +
+    '<div><span class="lbl">ADC</span><b>' + v + '</b> ct</div>' +
+    '<div><span class="lbl">V</span><b>' + (v * MV).toFixed(1) + '</b> mV</div>' +
+    '<div><span class="lbl">p2p</span><b>' + D.p2p + '</b> ct · ' + (D.p2p * MV).toFixed(0) + ' mV</div>' +
+    '<div><span class="lbl">σ</span><b>' + D.sd.toFixed(1) + '</b> ct</div>';
+  cline.setAttribute("x1", geo.x(i / D.fs));
+  cline.setAttribute("x2", geo.x(i / D.fs));
+  cdot.setAttribute("cx", geo.x(i / D.fs));
+  cdot.setAttribute("cy", geo.y(v));
+}
+setReadout(D.raw.indexOf(D.max));
+
+wave.addEventListener("pointermove", ev => {
+  const r = wave.getBoundingClientRect();
+  const px = (ev.clientX - r.left) / r.width * 940;
+  const frac = (px - geo.L) / geo.pw;
+  const i = Math.max(0, Math.min(D.n - 1, Math.round(frac * (D.n - 1))));
+  setReadout(i);
+});
+
+/* ── zoom panel ────────────────────────────────────────────── */
+const seg = document.getElementById("seg");
+const zoom = document.getElementById("zoom");
+let sel = 2;
+function renderZoom(){
+  const w = D.windows[sel];
+  drawTrace(zoom, D.raw.slice(w.t0 * D.fs, w.t1 * D.fs), w.t0, w.t1, {tick: .5, label: 1, thin: false});
+  [...seg.children].forEach((b, i) => b.setAttribute("aria-pressed", i === sel));
+}
+D.windows.forEach((w, i) => {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.textContent = w.t0 + "–" + w.t1 + "s";
+  b.addEventListener("click", () => { sel = i; renderZoom(); });
+  seg.appendChild(b);
+});
+renderZoom();
+
+/* ── autocorrelation ───────────────────────────────────────── */
+(function(){
+  const svg = document.getElementById("acf");
+  const W = 460, H = 250, L = 44, R = 14, T = 14, B = 32;
+  const pw = W - L - R, ph = H - T - B;
+  const pts = D.autocorr.slice().sort((a, b) => a.bpm - b.bpm);
+  const x = b => L + (b - 30) / 150 * pw;
+  const y = r => T + (1.0 - r) / 1.2 * ph;   // domain −0.2 … 1.0
+
+  // "clean signal" region, r >= 0.5
+  svg.appendChild(el("rect", {x: L, y: y(1.0), width: pw, height: y(0.5) - y(1.0),
+    fill: css("--flag-soft")}));
+
+  for (const r of [1.0, 0.75, 0.5, 0.25, 0, -0.2]){
+    svg.appendChild(el("line", {x1: L, x2: L + pw, y1: y(r), y2: y(r),
+      stroke: css("--grid"), "stroke-width": 1}));
+    const t = el("text", {x: L - 8, y: y(r) + 4, "text-anchor": "end", fill: css("--ink-3"),
+      "font-size": 10, "font-family": "IBM Plex Mono, monospace"});
+    t.textContent = r.toFixed(2);
+    svg.appendChild(t);
+  }
+  for (const b of [30, 60, 90, 120, 150, 180]){
+    const t = el("text", {x: x(b), y: T + ph + 18, "text-anchor": "middle", fill: css("--ink-3"),
+      "font-size": 10, "font-family": "IBM Plex Mono, monospace"});
+    t.textContent = b;
+    svg.appendChild(t);
+  }
+  const xl = el("text", {x: L + pw / 2, y: H - 2, "text-anchor": "middle", fill: css("--ink-3"),
+    "font-size": 10, "font-family": "IBM Plex Mono, monospace"});
+  xl.textContent = "candidate rate (bpm)";
+  svg.appendChild(xl);
+
+  // threshold + its direct label
+  svg.appendChild(el("line", {x1: L, x2: L + pw, y1: y(0.5), y2: y(0.5),
+    stroke: css("--flag"), "stroke-width": 1.5, "stroke-dasharray": "5 3"}));
+  const tl = el("text", {x: L + pw - 4, y: y(0.5) - 7, "text-anchor": "end", fill: css("--flag"),
+    "font-size": 10.5, "font-weight": 600, "font-family": "IBM Plex Mono, monospace"});
+  tl.textContent = "r = 0.50  clean-PPG floor";
+  svg.appendChild(tl);
+
+  svg.appendChild(el("line", {x1: L, x2: L + pw, y1: y(0), y2: y(0),
+    stroke: css("--rule"), "stroke-width": 1}));
+
+  let d = "";
+  pts.forEach((p, i) => { d += (i ? "L" : "M") + x(p.bpm).toFixed(2) + " " + y(p.r).toFixed(2) + " "; });
+  svg.appendChild(el("path", {d: d, fill: "none", stroke: css("--signal"), "stroke-width": 2,
+    "stroke-linejoin": "round"}));
+
+  // peak marker, direct-labelled
+  const peak = pts.reduce((a, b) => (b.r > a.r ? b : a));
+  svg.appendChild(el("circle", {cx: x(peak.bpm), cy: y(peak.r), r: 4.5, fill: css("--signal"),
+    stroke: css("--surface"), "stroke-width": 2}));
+  const pl = el("text", {x: x(peak.bpm) - 8, y: y(peak.r) + 4, "text-anchor": "end",
+    fill: css("--ink"), "font-size": 10.5, "font-weight": 600,
+    "font-family": "IBM Plex Mono, monospace"});
+  pl.textContent = "peak r = " + peak.r.toFixed(3);
+  svg.appendChild(pl);
+
+  const yl = el("text", {x: 11, y: T + ph / 2, fill: css("--ink-3"), "font-size": 10,
+    "font-family": "IBM Plex Mono, monospace", "text-anchor": "middle",
+    transform: "rotate(-90 11 " + (T + ph / 2) + ")"});
+  yl.textContent = "correlation r";
+  svg.appendChild(yl);
+})();
+
+/* ── per-window table ──────────────────────────────────────── */
+(function(){
+  const t = document.getElementById("wtable");
+  const head = document.createElement("thead");
+  head.innerHTML = "<tr><th>Window</th><th>p2p (ct)</th><th>σ (ct)</th><th>best r</th>" +
+                   "<th>implied rate</th><th>Reading</th></tr>";
+  t.appendChild(head);
+  const tb = document.createElement("tbody");
+  for (const w of D.windows){
+    const tr = document.createElement("tr");
+    tr.innerHTML =
+      "<td>" + w.t0 + "–" + w.t1 + " s</td>" +
+      "<td>" + w.p2p + "</td>" +
+      "<td>" + w.sd.toFixed(1) + "</td>" +
+      '<td class="bad">' + w.r.toFixed(3) + "</td>" +
+      "<td>" + w.bpm.toFixed(1) + " bpm</td>" +
+      '<td style="text-align:left;color:var(--ink-2)">no lock</td>';
+    tb.appendChild(tr);
+  }
+  t.appendChild(tb);
+})();
+</script>
+
+</body></html>

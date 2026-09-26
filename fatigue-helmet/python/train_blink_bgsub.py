@@ -74,6 +74,7 @@ def main():
         X = [f[k][Ds[i]["usable"]] for i in idx for f in [F[i]] for k in ("Xa", "Xd")]
         y = [Ds[i]["y"][Ds[i]["usable"]] for i in idx for _ in (0, 1)]
         return np.vstack(X), np.concatenate(y)
+    loso = "not measured (--no-loso)"
     if not a.no_loso:
         cur = []
         for i, te in enumerate(Ds):
@@ -82,11 +83,12 @@ def main():
         for t in (a.threshold - 0.25, a.threshold, a.threshold + 0.25):
             print(f"leave-one-session-out at threshold {t:+.2f}: F1 {[round(c[float(t)][0], 2) for c in cur]} mean {np.mean([c[float(t)][0] for c in cur]):.3f}; "
                   f"detected/true rate {[round(c[float(t)][1] / c[float(t)][2], 1) for c in cur]}", flush=True)
+        loso = f"mean F1 {np.mean([c[float(a.threshold)][0] for c in cur]):.3f} at threshold {a.threshold:+.2f}"
     w, b = DLK.train(*stack(range(len(Ds))), 1)
     w1, w2 = w[:HOG], w[HOG:]; wa = (w1 + w2).astype(np.float32); wb = w2.astype(np.float32)
     write_header(a.header, wa, wb, float(b), a.threshold, a.alpha,
                  [f"Pooled {', '.join(s.rstrip('/').split('/')[-1] for s in a.sessions)}: [frame, frame - running template], alpha {a.alpha}, class weight 1.",
-                  "Leave-one-session-out on fixed-ROI crops: mean F1 ~0.69 at threshold -0.25 (0.64 without the template)."])
+                  f"Leave-one-session-out on fixed-ROI crops: {loso}."])
     if a.model: write_model(a.model, wa, wb, float(b), a.threshold, a.alpha)
     print(f"final model -> {a.header}" + (f", {a.model}" if a.model else ""))
 

@@ -11,9 +11,14 @@ SP=sys.argv[1]; S=sys.argv[2] if len(sys.argv)>2 else '122'; d=f'sessions/sessio
 
 # the model that is on the helmet
 t=open(os.path.join(os.path.dirname(os.path.abspath(__file__)),'..','firmware','src','BlinkWeights.h')).read()
-w=np.array([float(x) for x in re.findall(r'(-?\d[\d.eE+-]*)f',t.split('WEIGHTS[]')[1])],dtype=np.float32)
-b=float(re.search(r'BIAS\s*=\s*([-\d.eE+]+)f',t).group(1)); th=float(re.search(r'THRESHOLD\s*=\s*([-\d.eE+]+)f',t).group(1))
-T.write_model(SP+'/simm.bin',w,b,th)
+arr=lambda name: np.array([float(x) for x in re.findall(r'(-?\d[\d.eE+-]*)f',t.split(name+'[] = {')[1].split('};')[0])],dtype=np.float32)
+num=lambda name: float(re.search(name+r'\s*=\s*([-\d.eE+]+)f',t).group(1))
+b=num('BIAS'); th=num('THRESHOLD')
+if 'BLINK_HOG_BGSUB' in t:   # running open-eye template model: two weight vectors + alpha (train_blink_bgsub.py)
+    import train_blink_bgsub as B
+    B.write_model(SP+'/simm.bin',arr('BLINK_HOG_WEIGHTS'),arr('BLINK_HOG_WEIGHTS_BG'),b,th,num('BG_ALPHA'))
+else:
+    T.write_model(SP+'/simm.bin',arr('BLINK_HOG_WEIGHTS'),b,th)
 # device-like: ROI pinned at the stored tap from this session's metadata (no tracking, no drift correction)
 meta=dict(l.strip().split('=',1) for l in open(d+'/metadata.txt') if '=' in l)
 cx,cy=int(meta['roi_x'])+int(meta['roi_size'])//2,int(meta['roi_y'])+int(meta['roi_size'])//2

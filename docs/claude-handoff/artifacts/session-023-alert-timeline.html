@@ -1,0 +1,248 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1"><style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}</style></head><body>
+<title>Session 023 Alert Timeline</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<style>
+:root{
+  --bg:#eef1f5; --surface:#ffffff; --sunk:#e4e9ef;
+  --ink:#161b22; --muted:#5c6773; --line:#d3dae3;
+  --accent:#2f5d8a;
+  --safe:#3f7d6a; --warn:#b8791f; --crit:#b3402f; --void:#c2cad4;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0f1319; --surface:#161c24; --sunk:#1c2430;
+    --ink:#e6ebf1; --muted:#8d9aa8; --line:#28323e;
+    --accent:#74a7d8;
+    --safe:#5fa88f; --warn:#d9a03f; --crit:#e06854; --void:#333e4b;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0f1319; --surface:#161c24; --sunk:#1c2430;
+  --ink:#e6ebf1; --muted:#8d9aa8; --line:#28323e;
+  --accent:#74a7d8;
+  --safe:#5fa88f; --warn:#d9a03f; --crit:#e06854; --void:#333e4b;
+}
+*{box-sizing:border-box}
+body{
+  background:var(--bg); color:var(--ink);
+  font-family:"Source Serif 4",Georgia,serif; font-size:17px; line-height:1.6;
+  margin:0; padding:clamp(20px,4vw,56px) clamp(16px,4vw,40px) 72px;
+}
+.wrap{max-width:960px; margin:0 auto; display:flex; flex-direction:column; gap:44px}
+h1,h2,h3,.eyebrow,.lbl,th,.key,.rule .st,.rule .id{font-family:Archivo,"Helvetica Neue",Arial,sans-serif}
+.m,.num{font-family:"IBM Plex Mono",ui-monospace,monospace; font-variant-numeric:tabular-nums}
+.eyebrow{
+  font-size:12px; font-weight:600; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--accent); margin:0 0 10px;
+}
+h1{font-size:clamp(29px,5vw,44px); font-weight:700; line-height:1.1; margin:0 0 12px; text-wrap:balance; letter-spacing:-.015em}
+.sub{color:var(--muted); font-size:18px; margin:0; max-width:64ch}
+h2{font-size:13px; font-weight:600; letter-spacing:.13em; text-transform:uppercase; color:var(--muted);
+   margin:0 0 18px; padding-bottom:9px; border-bottom:1px solid var(--line)}
+h3{font-size:16px; font-weight:600; margin:22px 0 12px; color:var(--ink)}
+p{margin:0 0 14px; max-width:68ch}
+p:last-child{margin-bottom:0}
+section{display:flex; flex-direction:column}
+.figs{display:grid; grid-template-columns:repeat(auto-fit,minmax(158px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line)}
+.fig{background:var(--surface); padding:16px 18px}
+.fig .lbl{display:block; font-size:11px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--muted); margin-bottom:7px}
+.fig .v{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:26px; font-weight:600; font-variant-numeric:tabular-nums; line-height:1.1}
+.fig .v small{font-size:14px; font-weight:400; color:var(--muted); margin-left:3px}
+.fig.c-crit .v{color:var(--crit)}
+.fig.c-warn .v{color:var(--warn)}
+.strip-box{border:1px solid var(--line); background:var(--surface); padding:18px}
+.strip{display:grid; grid-auto-flow:column; grid-auto-columns:1fr; height:58px; width:100%}
+.strip i{display:block}
+.s0{background:var(--safe)} .s1{background:var(--warn)} .s2{background:var(--crit)} .sx{background:var(--void)}
+.imustrip{display:grid; grid-auto-flow:column; grid-auto-columns:1fr; height:9px; margin-top:5px; width:100%}
+.imustrip i{display:block; background:transparent}
+.imustrip i.bad{background:var(--void)}
+.strip-axis{display:flex; justify-content:space-between; margin-top:7px; font-size:11px; color:var(--muted);
+            font-family:"IBM Plex Mono",ui-monospace,monospace}
+.key{display:flex; flex-wrap:wrap; gap:8px 20px; margin-top:16px; font-size:13px; color:var(--muted)}
+.key span{display:flex; align-items:center; gap:7px}
+.key b{width:11px; height:11px; display:block; border-radius:1px; flex:none}
+.tbl-scroll{overflow-x:auto; border:1px solid var(--line); background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-size:14px}
+th{text-align:left; font-size:10.5px; font-weight:600; letter-spacing:.1em; text-transform:uppercase;
+   color:var(--muted); padding:11px 14px; border-bottom:1px solid var(--line); white-space:nowrap; background:var(--sunk)}
+th.r{text-align:right}
+td{padding:9px 14px; border-bottom:1px solid var(--line); white-space:nowrap}
+tr:last-child td{border-bottom:0}
+td.n{color:var(--muted); width:1%}
+td.num{text-align:right}
+td:last-child{width:34%}
+.bar{display:block; height:7px; width:var(--w); min-width:3px; background:var(--crit); opacity:.75; border-radius:1px}
+.rules{display:flex; flex-direction:column; gap:1px; background:var(--line); border:1px solid var(--line); margin-top:14px}
+.rule{background:var(--surface); padding:13px 16px; display:flex; gap:16px; align-items:baseline; flex-wrap:wrap}
+.rule .id{font-family:"IBM Plex Mono",ui-monospace,monospace; font-weight:600; font-size:14px; min-width:26px; color:var(--muted)}
+.rule .desc{flex:1; min-width:220px; font-size:15px; color:var(--ink)}
+.rule .st{font-size:10.5px; font-weight:600; letter-spacing:.09em; text-transform:uppercase;
+          padding:3px 9px; border:1px solid currentColor; border-radius:2px}
+.dead .st{color:var(--crit)}
+.live .st{color:var(--safe)}
+.note{border-left:3px solid var(--accent); background:var(--surface); padding:16px 20px}
+.note p{margin-bottom:10px}
+code{font-family:"IBM Plex Mono",ui-monospace,monospace; font-size:.88em; background:var(--sunk); padding:1.5px 5px; border-radius:2px}
+ul{margin:12px 0 0; padding-left:20px; max-width:68ch}
+li{margin-bottom:9px}
+li:last-child{margin-bottom:0}
+li::marker{color:var(--accent)}
+.foot{border-top:1px solid var(--line); padding-top:18px; font-size:13.5px; color:var(--muted); max-width:none}
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Session 023 &middot; production_sd &middot; 8&thinsp;min 58&thinsp;s</p>
+  <h1>When the system flagged Warning and Critical</h1>
+  <p class="sub">Alert states recorded on-device during the session, and the three conditions that
+  bound what those states can be said to mean.</p>
+</header>
+
+<section>
+  <h2>The answer</h2>
+  <div class="figs">
+    <div class="fig c-warn"><span class="lbl">First Warning</span><div class="v">0:00</div></div>
+    <div class="fig c-crit"><span class="lbl">First Critical</span><div class="v">0:35</div></div>
+    <div class="fig c-crit"><span class="lbl">First sustained Critical</span><div class="v">0:43<small>&nbsp;29s</small></div></div>
+    <div class="fig"><span class="lbl">Sustained Critical episodes</span><div class="v">14</div></div>
+  </div>
+  <p style="margin-top:18px">The very first logged sample, at <code>t=0:00</code>, was already Warning &mdash; the device
+  had not yet formed a heart-rate baseline. The first Critical sample, at <code>0:35</code>, was a single isolated second.
+  The first Critical state that held for three seconds or more began at <code>0:43</code> and ran 29 seconds.</p>
+</section>
+
+<section>
+  <h2>Full session, one cell per second</h2>
+  <div class="strip-box">
+    <div class="strip" id="strip"></div>
+    <div class="imustrip" id="imustrip"></div>
+    <div class="strip-axis"><span>0:00</span><span>2:14</span><span>4:29</span><span>6:43</span><span>8:58</span></div>
+    <div class="key">
+      <span><b class="s0"></b>Safe &mdash; 240&thinsp;s (48%)</span>
+      <span><b class="s1"></b>Warning &mdash; 142&thinsp;s (28%)</span>
+      <span><b class="s2"></b>Critical &mdash; 117&thinsp;s (23%)</span>
+      <span><b class="sx"></b>No sample logged &mdash; 40&thinsp;s</span>
+      <span><b class="sx"></b>Lower rule: IMU read failed</span>
+    </div>
+  </div>
+  <p style="margin-top:16px">Raw, the device entered Critical <strong>58 separate times</strong> in nine minutes, and
+  most of those lasted a single second. That is the output oscillating across the threshold, not 58 fatigue events.
+  <code>risk_pct</code> has a median of 50% and a 75th percentile of 85%, sitting directly on the Critical
+  membership function, which opens at 70%. There is no hysteresis or debounce in the alert path.</p>
+</section>
+
+<section>
+  <h2>Sustained Critical episodes</h2>
+  <p style="margin-bottom:18px">Gaps under 5&thinsp;s merged, runs under 3&thinsp;s dropped. This is the version worth
+  reporting: 14 episodes spanning 173&thinsp;s.</p>
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>#</th><th>Start</th><th>End</th><th class="r">Duration</th><th class="r">Peak risk</th><th>&nbsp;</th></tr></thead>
+      <tbody>
+<tr><td class="n">1</td><td class="m">0:43</td><td class="m">1:12</td><td class="m num">29</td><td class="m num">87.1%</td><td><span class="bar" style="--w:62%"></span></td></tr>
+<tr><td class="n">2</td><td class="m">1:51</td><td class="m">1:55</td><td class="m num">4</td><td class="m num">86.6%</td><td><span class="bar" style="--w:9%"></span></td></tr>
+<tr><td class="n">3</td><td class="m">2:18</td><td class="m">2:21</td><td class="m num">3</td><td class="m num">87.1%</td><td><span class="bar" style="--w:6%"></span></td></tr>
+<tr><td class="n">4</td><td class="m">2:41</td><td class="m">2:50</td><td class="m num">9</td><td class="m num">85.5%</td><td><span class="bar" style="--w:19%"></span></td></tr>
+<tr><td class="n">5</td><td class="m">3:03</td><td class="m">3:13</td><td class="m num">10</td><td class="m num">87.1%</td><td><span class="bar" style="--w:21%"></span></td></tr>
+<tr><td class="n">6</td><td class="m">3:32</td><td class="m">3:35</td><td class="m num">3</td><td class="m num">87.1%</td><td><span class="bar" style="--w:6%"></span></td></tr>
+<tr><td class="n">7</td><td class="m">3:48</td><td class="m">3:54</td><td class="m num">6</td><td class="m num">86.3%</td><td><span class="bar" style="--w:13%"></span></td></tr>
+<tr><td class="n">8</td><td class="m">4:33</td><td class="m">4:42</td><td class="m num">9</td><td class="m num">87.1%</td><td><span class="bar" style="--w:19%"></span></td></tr>
+<tr><td class="n">9</td><td class="m">5:08</td><td class="m">5:16</td><td class="m num">8</td><td class="m num">85.8%</td><td><span class="bar" style="--w:17%"></span></td></tr>
+<tr><td class="n">10</td><td class="m">5:22</td><td class="m">5:31</td><td class="m num">9</td><td class="m num">86.5%</td><td><span class="bar" style="--w:19%"></span></td></tr>
+<tr><td class="n">11</td><td class="m">6:13</td><td class="m">6:33</td><td class="m num">20</td><td class="m num">87.1%</td><td><span class="bar" style="--w:43%"></span></td></tr>
+<tr><td class="n">12</td><td class="m">6:49</td><td class="m">7:36</td><td class="m num">47</td><td class="m num">86.3%</td><td><span class="bar" style="--w:100%"></span></td></tr>
+<tr><td class="n">13</td><td class="m">7:49</td><td class="m">7:55</td><td class="m num">6</td><td class="m num">85.9%</td><td><span class="bar" style="--w:13%"></span></td></tr>
+<tr><td class="n">14</td><td class="m">8:25</td><td class="m">8:35</td><td class="m num">10</td><td class="m num">87.1%</td><td><span class="bar" style="--w:21%"></span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <h2>What limits the claim</h2>
+  <p>Three findings materially change how these alerts should be described. Each was verified against the
+  recorded data, not inferred from the firmware alone.</p>
+
+  <h3>1 &nbsp;Three of the seven fuzzy rules could not fire</h3>
+  <p>In SD-card mode nothing feeds <code>BLINK:</code> lines over serial, so <code>blink_rate</code> held its
+  never-connected default of 13.0 for all 499 rows. At 13.0, <code>blink_Low</code> and <code>blink_High</code>
+  both evaluate to exactly 0, which zeroes every rule depending on them:</p>
+  <div class="rules">
+    <div class="rule dead"><span class="id">R2</span><span class="desc">Drowsiness collapse &rarr; Critical</span><span class="st">Dead all session</span></div>
+    <div class="rule dead"><span class="id">R4</span><span class="desc">Blink low, HR not dropped &rarr; Warning</span><span class="st">Dead all session</span></div>
+    <div class="rule dead"><span class="id">R6</span><span class="desc">Blink high, HR stable &rarr; Warning</span><span class="st">Dead all session</span></div>
+    <div class="rule live"><span class="id">R3</span><span class="desc">Head drop / nodding &rarr; Critical</span><span class="st">Only Critical path</span></div>
+  </div>
+  <p style="margin-top:14px">R2 is the model&rsquo;s primary drowsiness rule, and it was mathematically incapable of
+  firing. Every Critical state in this session came from R3 alone.</p>
+
+  <h3>2 &nbsp;Critical required an elevated heart rate</h3>
+  <p>Re-running the fuzzy model offline against the recorded inputs reproduces the logged <code>risk_pct</code>
+  to within <strong>0.52 percentage points</strong> mean absolute error at a 64&thinsp;BPM baseline, which confirms the
+  reconstruction is faithful. Holding each input at neutral in turn then isolates what drove the output:</p>
+  <ul>
+    <li>Neutralise heart rate &rarr; Critical seconds fall from <strong>118 to 0</strong>.</li>
+    <li>Neutralise nod score &rarr; 118 to 72. Neutralise pitch &rarr; 118 to 103.</li>
+    <li>Neutralise gyro &rarr; Critical <em>rises</em> to 243, because gyro stability is what holds the Safe rules up.</li>
+  </ul>
+  <p style="margin-top:14px">Critical therefore needed head-drop evidence from R3 <em>and</em> an elevated heart rate
+  suppressing the Safe rules. Mean HR on Critical seconds was 83&thinsp;BPM against the 64&thinsp;BPM baseline &mdash; about
+  +30%, fully inside <code>hr_Elevated</code>. Elevated HR indicates exertion or poor sensor contact; classic drowsiness
+  shows heart rate falling, which is what the dead R2 rule existed to catch.</p>
+
+  <h3>3 &nbsp;A third of the session had no live IMU</h3>
+  <p>166 of 499 rows have all six IMU axes and <code>head_movement</code> written as exactly zero &mdash; the old
+  firmware&rsquo;s way of signalling a failed read. Those rows collapse <code>pitch_deg</code> to near zero, which zeroes
+  R3, so <strong>150 of the 166 read as Safe</strong> and none reached Critical. Across that third of the session the
+  device under-reported rather than over-reported. Excluding those rows raises mean <code>head_movement</code> from
+  19.6 to 29.4 and mean <code>pitch_deg</code> from 13.6 to 20.3.</p>
+</section>
+
+<section>
+  <h2>What to hand over</h2>
+  <div class="note">
+    <p><strong>Give the 14 sustained episodes, not the raw 58.</strong> State the debounce rule applied
+    (merge &lt;5&thinsp;s, drop &lt;3&thinsp;s) so the number is reproducible.</p>
+    <p><strong>Say plainly that these are not validated drowsiness detections.</strong> With R2, R4 and R6 dead,
+    the session exercised roughly half the rule base, and Critical reduces to &ldquo;head pitched forward while heart
+    rate was elevated&rdquo;. That is a defensible description of what the device did. &ldquo;The system detected fatigue
+    at 0:43&rdquo; is not.</p>
+    <p style="margin-bottom:0"><strong>Offer the corrected re-run.</strong> Camera data for this session now exists
+    &mdash; 305 timestamped blinks across 10,710 frames &mdash; so a real rolling blinks/min can be substituted and the
+    model re-run offline with all seven rules live. Device output versus corrected output is a stronger result than
+    either number alone.</p>
+  </div>
+</section>
+
+<p class="foot">Derived from <code>sessions/session_023/dataset_merged.csv</code> (499 rows &times; 30 columns).
+Video index verified intact: 10,710 frames, zero CRC failures. Alert states as recorded on-device;
+offline reconstruction via <code>fuzzy_model.py</code>.</p>
+
+</div>
+
+<script>
+const ALERT = [1, 0, 0, 0, 0, -1, 0, 1, -1, 0, 1, -1, 1, 1, -1, 0, 0, -1, 0, 1, -1, 1, 0, -1, 1, 0, -1, 1, 1, -1, 0, 0, -1, 1, 1, 2, 0, 0, -1, 0, 1, -1, 1, 2, 0, 0, 0, -1, 2, 2, 2, 2, 0, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 2, 2, 2, -1, 1, 0, 0, 2, 2, 2, 1, -1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 1, 1, 1, 2, 1, 0, 1, 1, 0, 1, 1, 1, -1, 0, 0, -1, 1, 1, 2, 0, 0, 0, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 2, 2, 1, 2, 0, 0, 0, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, -1, 1, 2, 2, 1, 0, 0, 2, -1, 0, 2, 2, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 2, 2, 2, 0, 0, 0, -1, 2, 2, 2, 2, 0, 0, 0, -1, 1, 2, 0, -1, 0, 0, 1, 1, 0, 1, 1, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 1, 2, 2, 1, 0, 0, 0, 0, 2, 2, -1, 0, 0, 0, 2, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, -1, -1, -1, 0, 1, 2, 1, 0, 0, -1, -1, 1, 2, 2, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 1, 1, 0, 2, 1, 0, 0, 1, 0, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 2, 1, 0, 1, 0, 0, 2, 0, 2, 2, 2, 0, 0, 0, 2, 2, 1, -1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 1, 2, -1, -1, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 2, 2, 2, 2, 2, 0, 0, 0, 2, 2, 2, 0, 2, 0, -1, -1, -1, 2, 2, 0, 2, 0, 0, 0, 0, 1, 2, 1, 2, 0, 1, 1, 0, -1, 1, 1, 2, 0, 0, 0, 2, 0, 2, 2, 2, 0, 0, 0, 0, 2, 2, 0, 2, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 2, 1, 0, 0, 2, 0, 0, 0, 0, 2, 2, 1, 1, 0, 0, 2, 0, 2, 2, 2, 0, 0, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 2, 2, 2, 0, 0, 0, 2, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, -1, 2, 0, 0, 0, 0, 0, 2, 2, 2, 0, 0, 0, 0, 2, 2, 2, 2, 0, 0, 0, 0, 0, 2, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, 1];
+const IMUV = [1, 0, 0, 1, 1, -1, 1, 1, -1, 0, 1, -1, 1, 1, -1, 0, 0, -1, 1, 1, -1, 1, 0, -1, 1, 1, -1, 1, 1, -1, 0, 1, -1, 1, 1, 1, 0, 0, -1, 1, 1, -1, 1, 1, 0, 0, 0, -1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, -1, 1, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, -1, 0, 1, -1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, -1, 1, 1, 1, 1, 0, 0, 1, -1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, -1, 1, 1, 1, 1, 0, 0, 0, -1, 1, 1, 1, -1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, -1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, -1, -1, -1, 1, 1, 1, 1, 0, 0, -1, -1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, -1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, -1, -1, 0, 0, 1, 1, 1, 1, -1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, -1, -1, -1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, -1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, -1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 1, -1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 1, -1, -1, 0];
+const strip = document.getElementById('strip');
+const imus = document.getElementById('imustrip');
+const cls = {0:'s0', 1:'s1', 2:'s2'};
+const names = {0:'Safe', 1:'Warning', 2:'Critical'};
+const fmt = s => Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+ALERT.forEach((v, i) => {
+  const el = document.createElement('i');
+  el.className = cls[v] || 'sx';
+  el.title = fmt(i) + ' — ' + (names[v] || 'no sample logged');
+  strip.appendChild(el);
+});
+IMUV.forEach((v, i) => {
+  const el = document.createElement('i');
+  if (v === 0) { el.className = 'bad'; el.title = fmt(i) + ' — IMU read failed'; }
+  imus.appendChild(el);
+});
+</script>
+
+</body></html>
