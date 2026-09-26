@@ -467,6 +467,33 @@ void test_hog_gated_frame_never_counts(void) {
     TEST_ASSERT_FALSE(d.update(5.0f, true));
 }
 
+void test_hog_background_scalar_matches_the_explicit_vector_template(void) {
+    // The device keeps one float s = B.w2 instead of the 756-float template B. It must give exactly
+    // the score the training script defines: f.w1 + (f - B).w2 + bias, B_i = average of frames < i, B_0 = f_0.
+    const int D = 6, N = 40; const float a = 0.05f, bias = -0.7f;
+    float w1[D], w2[D], f[N][D];
+    for (int k = 0; k < D; k++) { w1[k] = 0.3f * k - 0.5f; w2[k] = 0.2f - 0.11f * k; }
+    for (int i = 0; i < N; i++) for (int k = 0; k < D; k++) f[i][k] = sinf(0.7f * i + k) + 0.05f * i;
+    float B[D]; for (int k = 0; k < D; k++) B[k] = f[0][k];
+    EyeBlinkEAR::HogBackground bg;
+    for (int i = 0; i < N; i++) {
+        float ref = bias, fa = 0, fc = 0;
+        for (int k = 0; k < D; k++) { ref += f[i][k] * w1[k] + (f[i][k] - B[k]) * w2[k]; fa += f[i][k] * (w1[k] + w2[k]); fc += f[i][k] * w2[k]; }
+        float got = fa - bg.update(fc, a) + bias;
+        TEST_ASSERT_FLOAT_WITHIN(1e-4f, ref, got);
+        for (int k = 0; k < D; k++) B[k] = (1.0f - a) * B[k] + a * f[i][k];
+    }
+}
+
+void test_hog_background_holds_detections_off_while_settling(void) {
+    EyeBlinkEAR::HogBackground bg;
+    for (int i = 0; i < 15; i++) { bg.update(1.0f, 0.05f); TEST_ASSERT_TRUE(bg.settling(15)); }
+    bg.update(1.0f, 0.05f);
+    TEST_ASSERT_FALSE(bg.settling(15));   // 16th frame onward may count blinks
+    bg.reset();
+    TEST_ASSERT_TRUE(bg.settling(15));    // a new session/ROI starts settling again
+}
+
 void test_blink_rate_window_counts_the_last_minute(void) {
     EyeBlinkEAR::BlinkRateWindow r;
     r.push(1000); r.push(2000); r.push(3000);
@@ -537,6 +564,8 @@ int main(int argc, char **argv) {
     RUN_TEST(test_hog_blink_recrossing_within_refractory_is_the_same_blink);
     RUN_TEST(test_hog_blinks_separated_by_open_frames_both_count);
     RUN_TEST(test_hog_gated_frame_never_counts);
+    RUN_TEST(test_hog_background_scalar_matches_the_explicit_vector_template);
+    RUN_TEST(test_hog_background_holds_detections_off_while_settling);
     RUN_TEST(test_blink_rate_window_counts_the_last_minute);
     RUN_TEST(test_smoothed_blink_rate_averages_three_minutes);
     RUN_TEST(test_smoothed_blink_rate_uses_elapsed_time_when_young);

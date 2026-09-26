@@ -1408,6 +1408,27 @@ struct HogBlinkDetector {
     }
 };
 
+// Running open-eye template for the classifier (train_blink_bgsub.py). The model scores
+//   f.w1 + (f - B).w2 + bias,   B = running average of recent frames' HOG vectors,
+// which is linear, so the device keeps only the scalar s = B.w2 instead of the 756-float B:
+//   score = f.(w1+w2) - s_prev + bias,   s = (1-alpha) s_prev + alpha (f.w2),   s starts at the first f.w2.
+// Subtracting the template removes what differs between sessions (eye position in the crop, lighting,
+// skin tone) and leaves what changes in a blink. A blink is ~5% of frames so it barely moves B.
+struct HogBackground {
+    float s = 0.0f;
+    int   n = 0;                       // frames seen since reset()
+    void reset() { s = 0.0f; n = 0; }
+    // c = f.w2. Returns s_prev, the template term to subtract from f.(w1+w2); advances the average.
+    float update(float c, float alpha) {
+        float sPrev = (n == 0) ? c : s;
+        s = (1.0f - alpha) * sPrev + alpha * c;
+        if (n < 1000000) n++;
+        return sPrev;
+    }
+    // True until the template has seen warmupFrames frames: detections are held off (the caller passes it as `gated`).
+    bool settling(int warmupFrames) const { return n <= warmupFrames; }
+};
+
 // Rolling blink rate over the timestamps of counted blinks -- the blink_rate the
 // fuzzy model takes. bpm() is the trailing-minute count (the glint detector's
 // rollingRateBpm()); smoothedBpm() is what the device feeds the model.

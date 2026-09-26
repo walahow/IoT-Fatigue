@@ -420,6 +420,7 @@ EyeBlinkEAR::GlintBlinkDetector g_earGlint;   // active blink detector
 // have done can be replayed on the PC (session_replay --hog-model,
 // python/train_blink_classifier.py).
 EyeBlinkEAR::HogBlinkDetector g_earHog;
+EyeBlinkEAR::HogBackground g_earHogBg;   // running open-eye template, used when BlinkWeights.h defines BLINK_HOG_BGSUB
 static EyeBlinkEAR::BlinkRateWindow g_earHogRate;   // g_earHog blinks, 3 min window (smoothedBpm); camera task only
 static uint8_t g_earHogSmall[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];  // 2 KB, off the task stack
 static float   g_earHogFeat[EyeBlinkEAR::HOG_LEN];                     // 3 KB, off the task stack
@@ -845,8 +846,17 @@ void processEarFrame(camera_fb_t *fb, uint32_t timestampMs) {
   EyeBlinkEAR::boxResample(g_earGrayBuf, hw, hh, g_earHogSmall,
                            EyeBlinkEAR::HOG_W, EyeBlinkEAR::HOG_H);
   EyeBlinkEAR::hogFeatures(g_earHogSmall, g_earHogFeat);
+#if defined(BLINK_HOG_BGSUB)
+  // Two dot products and one float of state: see HogBackground / train_blink_bgsub.py.
+  float hogA = EyeBlinkEAR::linearScore(g_earHogFeat, BLINK_HOG_WEIGHTS, 0.0f);
+  float hogC = EyeBlinkEAR::linearScore(g_earHogFeat, BLINK_HOG_WEIGHTS_BG, 0.0f);
+  float hogScore = hogA - g_earHogBg.update(hogC, BLINK_HOG_BG_ALPHA) + BLINK_HOG_BIAS;
+  bool hogGated = g_earHogBg.settling(BLINK_HOG_BG_WARMUP_FRAMES);   // template still forming: hold detections off
+#else
   float hogScore = EyeBlinkEAR::linearScore(g_earHogFeat, BLINK_HOG_WEIGHTS, BLINK_HOG_BIAS);
-  if (g_earHog.update(hogScore, false)) {
+  const bool hogGated = false;
+#endif
+  if (g_earHog.update(hogScore, hogGated)) {
     g_earHogRate.push(timestampMs);
     if (g_earBlinksSinceLock < 255) g_earBlinksSinceLock++;
     g_earHogBlinkTotal++;
@@ -1769,6 +1779,7 @@ void armingBegin() {
   g_eyeCheck        = EYECHECK_PENDING;
   g_earHogRate.n    = 0;   // the previous session's blinks must not count in this one's window
   g_earHog.openRun  = EyeBlinkEAR::HogBlinkDetector::REFRACTORY_FRAMES;
+  g_earHogBg.reset();   // a new session/lock starts a fresh open-eye template
   g_onDeviceBlinkRate = 0.0f;
 #endif
 
@@ -2149,6 +2160,7 @@ void handleCommandLine(const char *line, unsigned long now) {
     // or pass it on blinks seen on the wrong box. Not while recording, where
     // the session's result is latched; USB debug builds sit in RECORDING, so
     // the PC tool's behaviour is unchanged.
+    if (roiSet) g_earHogBg.reset();   // the crop jumps to a different framing, so the old template is wrong for it
     if (roiSet && g_sessionState != SESSION_RECORDING) {
       g_earValidSinceMs = 0;
       g_earBlinksSinceLock = 0;

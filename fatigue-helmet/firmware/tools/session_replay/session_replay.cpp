@@ -169,6 +169,7 @@ int main(int argc, char **argv) {
   std::vector<std::array<float, 3>> roiTrack;
   const char *hogDumpPath = nullptr, *hogModelPath = nullptr, *hogCsvPath = nullptr;
   int jitterN = 0, jitterPx = 0;   // --hog-jitter=N,J -- see the hog-dump block below
+  int augScalePct = 0, augBlurPct = 0, augContrastPct = 0;   // --hog-aug=... on the jittered copies
   for (int i = 3; i < argc; i++) {
     if (strcmp(argv[i], "--lock=dark") == 0) useMotionLock = false;
     else if (strcmp(argv[i], "--lock=motion") == 0) useMotionLock = true;
@@ -215,6 +216,14 @@ int main(int argc, char **argv) {
     // the classifier to tolerate the few pixels of slack a moving ROI
     // (drift correction, a re-tapped eye box) actually has in practice,
     // instead of only the one exact framing session_101 happened to lock.
+    // --hog-aug=SCALE,BLUR,CONTRAST (percent): extra randomisation applied to the jittered copies only --
+    // crop size +-SCALE%, BLUR% of copies box-blurred, contrast +-CONTRAST% about the crop mean.
+    else if (strncmp(argv[i], "--hog-aug=", 10) == 0) {
+      if (sscanf(argv[i] + 10, "%d,%d,%d", &augScalePct, &augBlurPct, &augContrastPct) != 3) {
+        fprintf(stderr, "ERROR: --hog-aug needs SCALE,BLUR,CONTRAST percents (e.g. --hog-aug=8,50,20)\n");
+        return 1;
+      }
+    }
     else if (strncmp(argv[i], "--hog-jitter=", 13) == 0) {
       if (sscanf(argv[i] + 13, "%d,%d", &jitterN, &jitterPx) != 2) {
         fprintf(stderr, "ERROR: --hog-jitter needs N,J (e.g. --hog-jitter=4,16)\n");
@@ -223,22 +232,31 @@ int main(int argc, char **argv) {
     }
   }
   FILE *hogDump = hogDumpPath ? fopen(hogDumpPath, "wb") : nullptr;
-  static float hogModel[EyeBlinkEAR::HOG_LEN + 2];   // weights, bias, threshold
+  // Model file: either {weights[756], bias, threshold} (single-frame), or
+  // {wa[756], wb[756], bias, threshold, alpha} (running open-eye template, train_blink_bgsub.py).
+  static float hogModel[2 * EyeBlinkEAR::HOG_LEN + 3];
+  bool hogBgSub = false;
   FILE *hogCsv = nullptr;
   if (hogModelPath) {
     FILE *mf = fopen(hogModelPath, "rb");
-    size_t got = mf ? fread(hogModel, sizeof(float), EyeBlinkEAR::HOG_LEN + 2, mf) : 0;
+    size_t got = mf ? fread(hogModel, sizeof(float), 2 * EyeBlinkEAR::HOG_LEN + 3, mf) : 0;
     if (mf) fclose(mf);
-    if (got != (size_t)EyeBlinkEAR::HOG_LEN + 2 || !hogCsvPath) {
-      fprintf(stderr, "ERROR: --hog-model needs a %d-float model file and --hog-csv\n",
-              EyeBlinkEAR::HOG_LEN + 2);
+    if (got == (size_t)2 * EyeBlinkEAR::HOG_LEN + 3) hogBgSub = true;
+    else if (got != (size_t)EyeBlinkEAR::HOG_LEN + 2) got = 0;
+    if (got == 0 || !hogCsvPath) {
+      fprintf(stderr, "ERROR: --hog-model needs a %d- or %d-float model file and --hog-csv\n",
+              EyeBlinkEAR::HOG_LEN + 2, 2 * EyeBlinkEAR::HOG_LEN + 3);
       return 1;
     }
     hogCsv = fopen(hogCsvPath, "w");
     fprintf(hogCsv, "timestamp_ms,frame_mean,score,gated,blink\n");
   }
   EyeBlinkEAR::HogBlinkDetector hogDet;
-  hogDet.threshold = hogModel[EyeBlinkEAR::HOG_LEN + 1];
+  EyeBlinkEAR::HogBackground hogBg;
+  const int HOG_BG_WARMUP = 15;   // = BLINK_HOG_BG_WARMUP_FRAMES in the generated header
+  // bias/threshold sit after the weight vector(s); alpha follows them in the two-vector format.
+  const int hogTail = hogBgSub ? 2 * EyeBlinkEAR::HOG_LEN : EyeBlinkEAR::HOG_LEN;
+  hogDet.threshold = hogModel[hogTail + 1];
   int hogBlinks = 0;
   printf("Lock mode: %s\n", useMotionLock ? "motion-energy" : "darkest-blob");
 
@@ -567,6 +585,11 @@ int main(int argc, char **argv) {
           std::uniform_int_distribution<int> jdist(-jitterPx, jitterPx);
           for (int j = 0; j < jitterN; j++) {
             EyeBlinkEAR::RoiLock roiJ = hroi;
+            if (augScalePct > 0) {   // crop size +-S%, same centre: camera distance / eye size differences between sessions
+              std::uniform_real_distribution<float> sd(-augScalePct / 100.0f, augScalePct / 100.0f);
+              int ns = (int)(roiJ.size * (1.0f + sd(jrng)) + 0.5f);
+              roiJ.x += (roiJ.size - ns) / 2; roiJ.y += (roiJ.size - ns) / 2; roiJ.size = ns;
+            }
             roiJ.x += jdist(jrng);
             roiJ.y += jdist(jrng);
             if (roiJ.x + roiJ.size > w) roiJ.x = w - roiJ.size;
@@ -576,6 +599,28 @@ int main(int argc, char **argv) {
             int jcx, jcy, jcw, jch;
             EyeBlinkEAR::hogCropRect(roiJ, jcx, jcy, jcw, jch);
             earExtractGray(rgb, w, h, jcx, jcy, jcw, jch, earGrayBuf);
+            if (augBlurPct > 0 && std::uniform_int_distribution<int>(0, 99)(jrng) < augBlurPct) {
+              // 3x3 box blur: soft focus / motion smear (the OV2640 is a twist-focus lens)
+              std::vector<uint8_t> src(earGrayBuf, earGrayBuf + (size_t)jcw * jch);
+              for (int y = 0; y < jch; y++) for (int x = 0; x < jcw; x++) {
+                int s = 0, n = 0;
+                for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+                  int yy = y + dy, xx = x + dx;
+                  if (yy >= 0 && yy < jch && xx >= 0 && xx < jcw) { s += src[(size_t)yy * jcw + xx]; n++; }
+                }
+                earGrayBuf[(size_t)y * jcw + x] = (uint8_t)(s / n);
+              }
+            }
+            if (augContrastPct > 0) {   // contrast about the crop mean, +-C%: dim / washed-out exposure
+              std::uniform_real_distribution<float> cd(-augContrastPct / 100.0f, augContrastPct / 100.0f);
+              float k = 1.0f + cd(jrng); long sum = 0;
+              for (int i = 0; i < jcw * jch; i++) sum += earGrayBuf[i];
+              float mean = (float)sum / (jcw * jch);
+              for (int i = 0; i < jcw * jch; i++) {
+                float v = mean + (earGrayBuf[i] - mean) * k;
+                earGrayBuf[i] = (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v + 0.5f);
+              }
+            }
             uint8_t jsmall[EyeBlinkEAR::HOG_W * EyeBlinkEAR::HOG_H];
             float jfeat[EyeBlinkEAR::HOG_LEN];
             EyeBlinkEAR::boxResample(earGrayBuf, jcw, jch, jsmall, EyeBlinkEAR::HOG_W, EyeBlinkEAR::HOG_H);
@@ -586,8 +631,16 @@ int main(int argc, char **argv) {
           }
         }
         if (hogCsv) {
-          float score = EyeBlinkEAR::linearScore(feat, hogModel, hogModel[EyeBlinkEAR::HOG_LEN]);
-          bool gated = false;
+          float score; bool gated = false;
+          if (hogBgSub) {
+            // exactly the firmware's path: main.cpp, BLINK_HOG_BGSUB
+            float a = EyeBlinkEAR::linearScore(feat, hogModel, 0.0f);
+            float c = EyeBlinkEAR::linearScore(feat, hogModel + EyeBlinkEAR::HOG_LEN, 0.0f);
+            score = a - hogBg.update(c, hogModel[hogTail + 2]) + hogModel[hogTail];
+            gated = hogBg.settling(HOG_BG_WARMUP);
+          } else {
+            score = EyeBlinkEAR::linearScore(feat, hogModel, hogModel[EyeBlinkEAR::HOG_LEN]);
+          }
           bool ev = hogDet.update(score, gated);
           if (ev) hogBlinks++;
           fprintf(hogCsv, "%u,%.2f,%.4f,%d,%d\n", f.timestampMs, frameMean, score, gated ? 1 : 0, ev ? 1 : 0);
